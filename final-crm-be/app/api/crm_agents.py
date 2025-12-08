@@ -1,0 +1,1093 @@
+"""
+CRM Agents API Endpoints
+
+Provides HTTP endpoints for CRM Agent Management.
+Includes CRUD operations for agents, settings, integrations, and knowledge documents.
+"""
+
+from fastapi import APIRouter, HTTPException, Query, Depends, status, UploadFile
+from typing import Optional, List
+import logging
+from datetime import datetime
+
+from app.models.agent import (
+	Agent, AgentCreate, AgentUpdate, AgentStatusUpdate, AgentListResponse,
+	AgentSettings, AgentSettingsUpdate,
+	AgentIntegration, AgentIntegrationUpdate,
+	KnowledgeDocument,
+	AgentStatus
+)
+from app.auth.dependencies import get_current_user
+from app.models.user import User
+from app.services.organization_service import get_organization_service
+from app.config import settings as app_settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/crm/agents", tags=["crm-agents"])
+
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+async def get_user_organization_id(user: User) -> str:
+	"""Get user's organization ID and validate membership"""
+	org_service = get_organization_service()
+	user_org = await org_service.get_user_organization(user.user_id)
+
+	if not user_org:
+		raise HTTPException(
+			status_code=status.HTTP_400_BAD_REQUEST,
+			detail="User must belong to an organization to access CRM features"
+		)
+
+	return user_org.id
+
+
+def get_supabase_client():
+	"""Get Supabase client from settings"""
+	from supabase import create_client
+
+	if not app_settings.is_supabase_configured:
+		raise HTTPException(
+			status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+			detail="Supabase is not configured"
+		)
+
+	return create_client(app_settings.SUPABASE_URL, app_settings.SUPABASE_SERVICE_KEY)
+
+
+# ============================================
+# AGENT CRUD ENDPOINTS
+# ============================================
+
+@router.get(
+	"/",
+	response_model=AgentListResponse,
+	summary="Get all agents",
+	description="Retrieve all agents for the user's organization with optional filtering"
+)
+async def get_agents(
+		status_filter: Optional[AgentStatus] = Query(None, description="Filter by agent status"),
+		search: Optional[str] = Query(None, description="Search by name or email"),
+		current_user: User = Depends(get_current_user)
+):
+	"""
+	Get all agents for organization.
+
+	Supports filtering by status and searching by name/email.
+	"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Build query
+		query = supabase.table("agents").select("*").eq("organization_id", organization_id)
+
+		# Apply filters
+		if status_filter:
+			query = query.eq("status", status_filter.value)
+
+		if search:
+			# Search in name or email
+			query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
+
+		# Order by created_at descending
+		query = query.order("created_at", desc=True)
+
+		# Execute query
+		response = query.execute()
+
+		agents = [Agent(**agent) for agent in response.data]
+
+		return AgentListResponse(
+			agents=agents,
+			total=len(agents)
+		)
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error fetching agents: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to fetch agents"
+		)
+
+
+@router.get(
+	"/{agent_id}",
+	response_model=Agent,
+	summary="Get agent by ID",
+	description="Retrieve a specific agent by ID"
+)
+async def get_agent(
+		agent_id: str,
+		current_user: User = Depends(get_current_user)
+):
+	"""Get specific agent by ID"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		response = supabase.table("agents").select("*").eq("id", agent_id).eq("organization_id",
+		                                                                      organization_id).execute()
+
+		if not response.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		return Agent(**response.data[0])
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error fetching agent {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to fetch agent"
+		)
+
+
+@router.post(
+	"/",
+	response_model=Agent,
+	status_code=status.HTTP_201_CREATED,
+	summary="Create new agent",
+	description="Create a new agent in the organization"
+)
+async def create_agent(
+		agent: AgentCreate,
+		current_user: User = Depends(get_current_user)
+):
+	"""Create a new agent"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Check if email already exists in organization
+		existing = supabase.table("agents").select("id").eq("organization_id", organization_id).eq("email",
+		                                                                                           agent.email).execute()
+
+		if existing.data:
+			raise HTTPException(
+				status_code=status.HTTP_400_BAD_REQUEST,
+				detail=f"Agent with email {agent.email} already exists in this organization"
+			)
+
+		# Prepare agent data
+		agent_data = {
+			"organization_id": organization_id,
+			"name": agent.name,
+			"email": agent.email,
+			"phone": agent.phone,
+			"status": agent.status.value,
+			"avatar_url": agent.avatar_url,
+			"user_id": agent.user_id,
+			"assigned_chats_count": 0,
+			"resolved_today_count": 0,
+			"avg_response_time_seconds": 0,
+			"last_active_at": datetime.utcnow().isoformat(),
+		}
+
+		# Insert agent
+		response = supabase.table("agents").insert(agent_data).execute()
+
+		if not response.data:
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail="Failed to create agent"
+			)
+
+		created_agent = Agent(**response.data[0])
+
+		# Create default agent settings
+		try:
+			settings_data = {
+				"agent_id": created_agent.id,
+				"persona_config": {},
+				"schedule_config": {},
+				"advanced_config": {},
+				"ticketing_config": {}
+			}
+			supabase.table("agent_settings").insert(settings_data).execute()
+		except Exception as e:
+			logger.warning(f"Failed to create default settings for agent {created_agent.id}: {e}")
+
+		logger.info(f"Agent created: {created_agent.id} by user {current_user.user_id}")
+
+		return created_agent
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error creating agent: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to create agent"
+		)
+
+
+@router.put(
+	"/{agent_id}",
+	response_model=Agent,
+	summary="Update agent",
+	description="Update an existing agent's information"
+)
+async def update_agent(
+		agent_id: str,
+		agent_update: AgentUpdate,
+		current_user: User = Depends(get_current_user)
+):
+	"""Update an existing agent"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Check if agent exists
+		existing = supabase.table("agents").select("*").eq("id", agent_id).eq("organization_id",
+		                                                                      organization_id).execute()
+
+		if not existing.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Prepare update data (only include fields that were provided)
+		update_data = agent_update.model_dump(exclude_unset=True)
+
+		# Convert enum to value if status is being updated
+		if "status" in update_data and update_data["status"]:
+			update_data["status"] = update_data["status"].value
+
+		if not update_data:
+			# No fields to update
+			return Agent(**existing.data[0])
+
+		# Check email uniqueness if email is being updated
+		if "email" in update_data:
+			email_check = supabase.table("agents").select("id").eq("organization_id", organization_id).eq("email",
+			                                                                                              update_data[
+				                                                                                              "email"]).neq(
+				"id", agent_id).execute()
+
+			if email_check.data:
+				raise HTTPException(
+					status_code=status.HTTP_400_BAD_REQUEST,
+					detail=f"Agent with email {update_data['email']} already exists in this organization"
+				)
+
+		# Update agent
+		response = supabase.table("agents").update(update_data).eq("id", agent_id).execute()
+
+		if not response.data:
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail="Failed to update agent"
+			)
+
+		logger.info(f"Agent updated: {agent_id} by user {current_user.user_id}")
+
+		return Agent(**response.data[0])
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error updating agent {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to update agent"
+		)
+
+
+@router.patch(
+	"/{agent_id}/status",
+	response_model=Agent,
+	summary="Update agent status",
+	description="Update only the agent's status"
+)
+async def update_agent_status(
+		agent_id: str,
+		status_update: AgentStatusUpdate,
+		current_user: User = Depends(get_current_user)
+):
+	"""Update agent status only"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Check if agent exists
+		existing = supabase.table("agents").select("*").eq("id", agent_id).eq("organization_id",
+		                                                                      organization_id).execute()
+
+		if not existing.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Update status and last_active_at
+		update_data = {
+			"status": status_update.status.value,
+			"last_active_at": datetime.utcnow().isoformat()
+		}
+
+		response = supabase.table("agents").update(update_data).eq("id", agent_id).execute()
+
+		if not response.data:
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail="Failed to update agent status"
+			)
+
+		logger.info(f"Agent status updated: {agent_id} to {status_update.status.value} by user {current_user.user_id}")
+
+		return Agent(**response.data[0])
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error updating agent status {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to update agent status"
+		)
+
+
+@router.delete(
+	"/{agent_id}",
+	status_code=status.HTTP_204_NO_CONTENT,
+	summary="Delete agent",
+	description="Delete an agent from the organization"
+)
+async def delete_agent(
+		agent_id: str,
+		current_user: User = Depends(get_current_user)
+):
+	"""Delete an agent"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Check if agent exists
+		existing = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                       organization_id).execute()
+
+		if not existing.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Delete agent (cascade will handle related records)
+		supabase.table("agents").delete().eq("id", agent_id).execute()
+
+		logger.info(f"Agent deleted: {agent_id} by user {current_user.user_id}")
+
+		return None
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error deleting agent {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to delete agent"
+		)
+
+
+# ============================================
+# AGENT SETTINGS ENDPOINTS
+# ============================================
+
+@router.get(
+	"/{agent_id}/settings",
+	response_model=AgentSettings,
+	summary="Get agent settings",
+	description="Retrieve settings for a specific agent"
+)
+async def get_agent_settings(
+		agent_id: str,
+		current_user: User = Depends(get_current_user)
+):
+	"""Get agent settings"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Verify agent belongs to organization
+		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                          organization_id).execute()
+
+		if not agent_check.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Get settings
+		response = supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute()
+
+		if not response.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Settings for agent {agent_id} not found"
+			)
+
+		return AgentSettings(**response.data[0])
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error fetching agent settings for {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to fetch agent settings"
+		)
+
+
+@router.put(
+	"/{agent_id}/settings",
+	response_model=AgentSettings,
+	summary="Update agent settings",
+	description="Update settings for a specific agent"
+)
+async def update_agent_settings(
+		agent_id: str,
+		settings_update: AgentSettingsUpdate,
+		current_user: User = Depends(get_current_user)
+):
+	"""Update agent settings"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Verify agent belongs to organization
+		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                          organization_id).execute()
+
+		if not agent_check.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Prepare update data
+		update_data = {}
+
+		if settings_update.persona_config:
+			update_data["persona_config"] = settings_update.persona_config.model_dump()
+
+		if settings_update.schedule_config:
+			dumped_schedule = settings_update.schedule_config.model_dump()
+			logger.info(f"📅 Schedule config being saved for agent {agent_id}:")
+			logger.info(f"  Timezone: {dumped_schedule.get('timezone')}")
+			for idx, wh in enumerate(dumped_schedule.get('workingHours', [])):
+				logger.info(f"  Day {idx}: {wh.get('day')} - enabled: {wh.get('enabled')}")
+			update_data["schedule_config"] = dumped_schedule
+
+		if settings_update.advanced_config:
+			update_data["advanced_config"] = settings_update.advanced_config.model_dump()
+
+		if settings_update.ticketing_config:
+			update_data["ticketing_config"] = settings_update.ticketing_config.model_dump()
+
+		if not update_data:
+			# No fields to update, fetch existing
+			response = supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute()
+			return AgentSettings(**response.data[0])
+
+		# Update settings
+		response = supabase.table("agent_settings").update(update_data).eq("agent_id", agent_id).execute()
+
+		if not response.data:
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail="Failed to update agent settings"
+			)
+
+		logger.info(f"Agent settings updated: {agent_id} by user {current_user.user_id}")
+
+		return AgentSettings(**response.data[0])
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error updating agent settings for {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to update agent settings"
+		)
+
+
+# ============================================
+# KNOWLEDGE DOCUMENTS ENDPOINTS
+# ============================================
+
+@router.get(
+	"/{agent_id}/knowledge-documents",
+	response_model=List[KnowledgeDocument],
+	summary="Get agent knowledge documents",
+	description="Retrieve all knowledge documents for a specific agent"
+)
+async def get_agent_knowledge_documents(
+		agent_id: str,
+		current_user: User = Depends(get_current_user)
+):
+	"""Get all knowledge documents for an agent"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Verify agent belongs to organization
+		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                          organization_id).execute()
+
+		if not agent_check.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Get knowledge documents
+		response = supabase.table("knowledge_documents").select("*").eq("agent_id", agent_id).order("uploaded_at",
+		                                                                                            desc=True).execute()
+
+		documents = [KnowledgeDocument(**doc) for doc in response.data]
+
+		return documents
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error fetching knowledge documents for agent {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to fetch knowledge documents"
+		)
+
+
+@router.post(
+	"/{agent_id}/knowledge-documents",
+	response_model=KnowledgeDocument,
+	status_code=status.HTTP_201_CREATED,
+	summary="Upload knowledge document",
+	description="Upload a new knowledge document for an agent with automatic embedding"
+)
+async def create_knowledge_document(
+		agent_id: str,
+		file: UploadFile,
+		current_user: User = Depends(get_current_user)
+):
+	"""
+	Upload a knowledge document for an agent.
+
+	Process flow:
+	1. Upload file to Supabase Storage (bucket: agent_{agent_id})
+	2. Extract text and generate embeddings
+	3. Store embeddings in ChromaDB (collection: agent_{agent_id})
+	4. Save metadata to database
+	5. Rollback storage if embedding fails
+
+	Args:
+		agent_id: Agent UUID
+		file: File upload (multipart/form-data)
+		current_user: Current authenticated user
+
+	Returns:
+		KnowledgeDocument with metadata
+	"""
+	from uuid import uuid4
+	from app.services.storage_service import StorageService
+	from app.services.document_processor import DocumentProcessor
+	from app.services.chromadb_service import ChromaDBService
+	from app.utils.chunking import split_into_chunks
+
+	file_id = None
+	storage_uploaded = False
+
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Verify agent belongs to organization
+		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                          organization_id).execute()
+
+		if not agent_check.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Read file content
+		file_content = await file.read()
+		filename = file.filename
+		file_size_kb = len(file_content) // 1024
+		file_type = filename.rsplit(".", 1)[-1].upper() if "." in filename else "UNKNOWN"
+
+		# Generate unique file ID
+		file_id = str(uuid4())
+
+		logger.info(f"📤 Uploading knowledge document for agent {agent_id}: {filename} ({file_size_kb} KB)")
+
+		# Step 1: Upload to Supabase Storage with bucket agent_{agent_id}
+		# Using custom bucket name format for agents
+		agent_bucket_name = f"agent_{agent_id}"
+		storage_service = StorageService(supabase)
+
+		# Ensure bucket exists (create if needed)
+		try:
+			buckets = supabase.storage.list_buckets()
+			bucket_exists = any(b.name == agent_bucket_name for b in buckets)
+
+			if not bucket_exists:
+				supabase.storage.create_bucket(
+					agent_bucket_name,
+					options={
+						"public": False,
+						"allowed_mime_types": None
+					}
+				)
+				logger.info(f"✅ Created storage bucket: {agent_bucket_name}")
+		except Exception as e:
+			logger.error(f"Failed to create bucket: {e}")
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail=f"Failed to create storage bucket: {str(e)}"
+			)
+
+		# Upload file to agent-specific bucket
+		try:
+			supabase.storage.from_(agent_bucket_name).upload(
+				path=file_id,
+				file=file_content,
+				file_options={
+					"content-type": file.content_type or "application/octet-stream",
+					"cache-control": "3600",
+					"upsert": "false"
+				}
+			)
+			storage_uploaded = True
+			logger.info(f"✅ Uploaded to storage: {agent_bucket_name}/{file_id}")
+		except Exception as e:
+			logger.error(f"Storage upload failed: {e}")
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail=f"File upload failed: {str(e)}"
+			)
+
+		# Get file URL
+		try:
+			signed_url_response = supabase.storage.from_(agent_bucket_name).create_signed_url(file_id,
+			                                                                                  31536000)  # 1 year
+			file_url = signed_url_response["signedURL"]
+		except:
+			file_url = f"storage://{agent_bucket_name}/{file_id}"
+
+		# Step 2: Process document and extract text
+		logger.info(f"📄 Processing document: {filename}")
+		doc_processor = DocumentProcessor(storage_service)
+
+		try:
+			clean_text, _ = doc_processor.process_document(
+				content=file_content,
+				filename=filename,
+				folder_path=None,
+				organization_id=organization_id,
+				file_id=file_id
+			)
+
+			if not clean_text or len(clean_text.strip()) == 0:
+				raise ValueError("No text extracted from document")
+
+			logger.info(f"✅ Extracted {len(clean_text)} characters from document")
+
+		except Exception as e:
+			logger.error(f"Document processing failed: {e}")
+			# Rollback storage
+			if storage_uploaded:
+				try:
+					supabase.storage.from_(agent_bucket_name).remove([file_id])
+					logger.info(f"🔄 Rolled back storage upload: {agent_bucket_name}/{file_id}")
+				except:
+					pass
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail=f"Document processing failed: {str(e)}"
+			)
+
+		# Step 3: Generate embeddings and store in ChromaDB
+		logger.info(f"🔄 Generating embeddings for: {filename}")
+		chromadb_service = ChromaDBService()
+
+		# Use agent-specific collection name
+		agent_collection_name = f"agent_{agent_id}"
+
+		try:
+			# Split text into chunks
+			chunks = split_into_chunks(
+				text=clean_text,
+				size=512,  # 512 tokens per chunk
+				overlap=50
+			)
+
+			logger.info(f"📦 Split into {len(chunks)} chunks")
+
+			# Get or create agent-specific collection
+			try:
+				collection = chromadb_service.client.get_collection(
+					name=agent_collection_name,
+					embedding_function=chromadb_service.embedding_function
+				)
+			except:
+				# Create collection if doesn't exist
+				collection = chromadb_service.client.create_collection(
+					name=agent_collection_name,
+					embedding_function=chromadb_service.embedding_function,
+					metadata={
+						"hnsw:space": "cosine",
+						"agent_id": agent_id,
+						"organization_id": organization_id
+					}
+				)
+				logger.info(f"✅ Created ChromaDB collection: {agent_collection_name}")
+
+			# Prepare IDs and metadata
+			chunk_ids = [f"{file_id}-{i}" for i in range(len(chunks))]
+			chunk_metas = [
+				{
+					"file_id": file_id,
+					"filename": filename,
+					"chunk_index": i,
+					"agent_id": agent_id,
+					"organization_id": organization_id
+				}
+				for i in range(len(chunks))
+			]
+
+			# Add to ChromaDB
+			collection.add(
+				documents=chunks,
+				ids=chunk_ids,
+				metadatas=chunk_metas
+			)
+
+			logger.info(f"✅ Added {len(chunks)} chunks to ChromaDB collection: {agent_collection_name}")
+
+		except Exception as e:
+			logger.error(f"Embedding generation failed: {e}")
+			# Rollback storage
+			if storage_uploaded:
+				try:
+					supabase.storage.from_(agent_bucket_name).remove([file_id])
+					logger.info(f"🔄 Rolled back storage upload: {agent_bucket_name}/{file_id}")
+				except:
+					pass
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail=f"Embedding generation failed: {str(e)}"
+			)
+
+		# Step 4: Save metadata to database
+		doc_data = {
+			"agent_id": agent_id,
+			"name": filename,
+			"file_url": file_url,
+			"file_type": file_type,
+			"file_size_kb": file_size_kb,
+			"metadata": {
+				"file_id": file_id,
+				"bucket": agent_bucket_name,
+				"chunks_count": len(chunks),
+				"text_length": len(clean_text)
+			}
+		}
+
+		response = supabase.table("knowledge_documents").insert(doc_data).execute()
+
+		if not response.data:
+			# Rollback storage and ChromaDB
+			if storage_uploaded:
+				try:
+					supabase.storage.from_(agent_bucket_name).remove([file_id])
+					logger.info(f"🔄 Rolled back storage upload")
+				except:
+					pass
+			try:
+				collection.delete(where={"file_id": {"$eq": file_id}})
+				logger.info(f"🔄 Rolled back ChromaDB chunks")
+			except:
+				pass
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail="Failed to save document metadata"
+			)
+
+		logger.info(f"✅ Knowledge document created for agent {agent_id}: {filename}")
+
+		return KnowledgeDocument(**response.data[0])
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error creating knowledge document for agent {agent_id}: {e}")
+		# Cleanup on unexpected error
+		if storage_uploaded and file_id:
+			try:
+				agent_bucket_name = f"agent_{agent_id}"
+				supabase = get_supabase_client()
+				supabase.storage.from_(agent_bucket_name).remove([file_id])
+				logger.info(f"🔄 Cleaned up storage on error")
+			except:
+				pass
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail=f"Failed to create knowledge document: {str(e)}"
+		)
+
+
+@router.delete(
+	"/{agent_id}/knowledge-documents/{doc_id}",
+	status_code=status.HTTP_204_NO_CONTENT,
+	summary="Delete knowledge document",
+	description="Delete a knowledge document from an agent, including storage and embeddings"
+)
+async def delete_knowledge_document(
+		agent_id: str,
+		doc_id: str,
+		current_user: User = Depends(get_current_user)
+):
+	"""
+	Delete a knowledge document completely.
+
+	Process flow:
+	1. Retrieve document metadata to get file_id and bucket info
+	2. Delete embeddings from ChromaDB (collection: agent_{agent_id})
+	3. Delete file from Supabase Storage (bucket: agent_{agent_id})
+	4. Delete metadata from database
+
+	Args:
+		agent_id: Agent UUID
+		doc_id: Document UUID
+		current_user: Current authenticated user
+	"""
+	from app.services.chromadb_service import ChromaDBService
+
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Verify agent belongs to organization
+		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                          organization_id).execute()
+
+		if not agent_check.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Get document metadata to retrieve file_id and bucket info
+		doc_response = supabase.table("knowledge_documents").select("*").eq("id", doc_id).eq("agent_id",
+		                                                                                     agent_id).execute()
+
+		if not doc_response.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Knowledge document with ID {doc_id} not found for agent {agent_id}"
+			)
+
+		document = doc_response.data[0]
+		metadata = document.get("metadata", {})
+		file_id = metadata.get("file_id")
+		agent_bucket_name = f"agent_{agent_id}"
+		agent_collection_name = f"agent_{agent_id}"
+
+		logger.info(f"🗑️  Deleting knowledge document {doc_id} for agent {agent_id}")
+
+		# Step 1: Delete embeddings from ChromaDB
+		if file_id:
+			try:
+				chromadb_service = ChromaDBService()
+				collection = chromadb_service.client.get_collection(
+					name=agent_collection_name,
+					embedding_function=chromadb_service.embedding_function
+				)
+
+				# Delete all chunks with matching file_id
+				collection.delete(where={"file_id": {"$eq": file_id}})
+				logger.info(f"✅ Deleted embeddings from ChromaDB collection: {agent_collection_name}")
+			except Exception as e:
+				# Log but don't fail if ChromaDB deletion fails
+				logger.warning(f"Failed to delete from ChromaDB: {e}")
+
+		# Step 2: Delete file from Supabase Storage
+		if file_id:
+			try:
+				supabase.storage.from_(agent_bucket_name).remove([file_id])
+				logger.info(f"✅ Deleted file from storage: {agent_bucket_name}/{file_id}")
+			except Exception as e:
+				# Log but don't fail if storage deletion fails
+				logger.warning(f"Failed to delete from storage: {e}")
+
+		# Step 3: Delete metadata from database
+		supabase.table("knowledge_documents").delete().eq("id", doc_id).execute()
+		logger.info(f"✅ Deleted document metadata from database")
+
+		logger.info(
+			f"✅ Knowledge document {doc_id} completely deleted from agent {agent_id} by user {current_user.user_id}")
+
+		return None
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error deleting knowledge document {doc_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to delete knowledge document"
+		)
+
+
+# ============================================
+# AGENT INTEGRATIONS ENDPOINTS
+# ============================================
+
+@router.get(
+	"/{agent_id}/integrations",
+	response_model=List[AgentIntegration],
+	summary="Get agent integrations",
+	description="Retrieve all integrations for a specific agent"
+)
+async def get_agent_integrations(
+		agent_id: str,
+		current_user: User = Depends(get_current_user)
+):
+	"""Get all integrations for an agent"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Verify agent belongs to organization
+		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                          organization_id).execute()
+
+		if not agent_check.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Get integrations
+		response = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).execute()
+
+		integrations = [AgentIntegration(**integration) for integration in response.data]
+
+		return integrations
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error fetching integrations for agent {agent_id}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to fetch agent integrations"
+		)
+
+
+@router.put(
+	"/{agent_id}/integrations/{channel}",
+	response_model=AgentIntegration,
+	summary="Update agent integration",
+	description="""
+    Update integration configuration for a specific channel.
+    """
+)
+async def update_agent_integration(
+		agent_id: str,
+		channel: str,
+		integration_update: AgentIntegrationUpdate,
+		current_user: User = Depends(get_current_user)
+):
+	"""
+	Update integration for a specific channel.
+
+	Automatically extracts and updates the status field if config.status is provided.
+	"""
+	try:
+		organization_id = await get_user_organization_id(current_user)
+		supabase = get_supabase_client()
+
+		# Verify agent belongs to organization
+		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+		                                                                          organization_id).execute()
+
+		if not agent_check.data:
+			raise HTTPException(
+				status_code=status.HTTP_404_NOT_FOUND,
+				detail=f"Agent with ID {agent_id} not found"
+			)
+
+		# Prepare update data
+		update_data = integration_update.model_dump(exclude_unset=True)
+
+		# Convert enum to value if status is being updated
+		if "status" in update_data and update_data["status"]:
+			update_data["status"] = update_data["status"].value
+
+		# Extract status from config if config is provided
+		if "config" in update_data and update_data["config"]:
+			config = update_data["config"]
+
+			# If config has status field, update the status field in database
+			if isinstance(config, dict) and "status" in config:
+				config_status = config["status"]
+
+				# Validate and set status from config
+				valid_statuses = ["connected", "disconnected", "connecting", "error"]
+				if config_status in valid_statuses:
+					update_data["status"] = config_status
+					logger.info(
+						f"Updating status to '{config_status}' from config.status for agent {agent_id}/{channel}")
+
+		# Update or insert integration
+		existing = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel",
+		                                                                                        channel).execute()
+
+		if existing.data:
+			logger.info(f"UPDATE DATA: {update_data}")
+			# Update existing
+			response = supabase.table("agent_integrations").update(update_data).eq("agent_id", agent_id).eq("channel",
+			                                                                                                channel).execute()
+		else:
+			# Insert new
+			insert_data = {
+				"agent_id": agent_id,
+				"channel": channel,
+				**update_data
+			}
+			response = supabase.table("agent_integrations").insert(insert_data).execute()
+
+		if not response.data:
+			raise HTTPException(
+				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+				detail="Failed to update agent integration"
+			)
+
+		logger.info(f"Agent integration updated: {agent_id}/{channel} by user {current_user.user_id}")
+
+		return AgentIntegration(**response.data[0])
+
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Error updating integration for agent {agent_id}/{channel}: {e}")
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Failed to update agent integration"
+		)

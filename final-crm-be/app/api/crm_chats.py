@@ -1,0 +1,1861 @@
+"""
+CRM Chats & Messages API Endpoints
+
+Provides HTTP endpoints for chat management, customer management, messaging, and ticketing.
+"""
+
+from fastapi import APIRouter, HTTPException, Query, Depends, status
+from typing import Optional, List, Dict, Any
+import logging
+import re
+from datetime import datetime
+
+from app.models.agent import (
+    Customer, CustomerCreate, CustomerUpdate, CustomerListResponse,
+    Chat, ChatCreate, ChatUpdate, ChatAssign, ChatEscalation, ChatListResponse, ChatStatus,
+    Message, MessageCreate, MessageListResponse, SenderType,
+    Ticket, TicketCreate, TicketUpdate, TicketListResponse, TicketStatus, TicketPriority,
+    DashboardMetrics, CommunicationChannel
+)
+from app.models.ticket import TicketActivityResponse, ActorType
+from app.models.user import User
+
+from app.auth.dependencies import get_current_user
+from app.services.organization_service import get_organization_service
+from app.services.whatsapp_service import get_whatsapp_service
+from app.services.websocket_service import get_connection_manager
+from app.config import settings as app_settings
+from app.services.webhook_callback_service import get_webhook_callback_service
+from app.services.ticket_service import get_ticket_service
+from app.models.ticket import ActorType
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/crm", tags=["crm-chats"])
+
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+async def get_user_organization_id(user: User) -> str:
+    """Get user's organization ID and validate membership"""
+    org_service = get_organization_service()
+    user_org = await org_service.get_user_organization(user.user_id)
+
+    if not user_org:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User must belong to an organization to access CRM features"
+        )
+
+    return user_org.id
+
+def get_supabase_client():
+    """Get Supabase client from settings"""
+    from supabase import create_client
+
+    if not app_settings.is_supabase_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Supabase is not configured"
+        )
+
+    return create_client(app_settings.SUPABASE_URL, app_settings.SUPABASE_SERVICE_KEY)
+
+async def get_default_ai_agent(organization_id: str, supabase) -> Optional[str]:
+    """
+    Get default AI agent for organization.
+    AI agents are identified by user_id = NULL.
+    Returns None if no AI agent is found.
+    """
+    try:
+        response = supabase.table("agents") \
+            .select("id") \
+            .eq("organization_id", organization_id) \
+            .eq("status", "active") \
+            .is_("user_id", "null") \
+            .order("created_at", desc=False) \
+            .limit(1) \
+            .execute()
+
+        if response.data:
+            return response.data[0]["id"]
+
+        logger.warning(f"No active AI agent found for organization {organization_id}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching default AI agent for organization {organization_id}: {e}")
+        return None
+
+def format_whatsapp_phone(phone: str) -> str:
+    """
+    Format phone number for WhatsApp API
+
+    Converts various phone number formats to WhatsApp-compatible format (e.g., 628123456789)
+
+    Examples:
+        +62 812-3456-7890 → 628123456789
+        0812-3456-7890 → 628123456789
+        62812-3456-7890 → 628123456789
+        812-3456-7890 → 628123456789
+
+    Args:
+        phone: Phone number in any format
+
+    Returns:
+        Formatted phone number starting with country code (62 for Indonesia)
+    """
+    if not phone:
+        return ""
+
+    # Remove all non-digit characters
+    cleaned = re.sub(r'[^\d]', '', phone)
+
+    # If starts with 0, replace with 62 (Indonesia country code)
+    if cleaned.startswith('0'):
+        cleaned = '62' + cleaned[1:]
+
+    # If doesn't start with 62, prepend it
+    if not cleaned.startswith('62'):
+        cleaned = '62' + cleaned
+
+    return cleaned
+
+async def send_message_via_channel(
+    chat_data: Dict[str, Any],
+    customer_data: Dict[str, Any],
+    message_content: str,
+    supabase
+) -> Dict[str, Any]:
+    """
+    Send message via appropriate communication channel (WhatsApp, Telegram, Email, etc)
+
+    This function routes the message to the correct channel service based on the chat's channel type.
+    Currently implements WhatsApp, with placeholders for other channels.
+
+    Args:
+        chat_data: Chat information including channel, sender_agent_id, and chat id
+        customer_data: Customer information including phone number and email
+        message_content: Message text content to send
+        supabase: Supabase client for database queries
+
+    Returns:
+        Dict with success status and channel-specific response:
+        - success (bool): Whether message was sent successfully
+        - channel (str): Channel used for sending
+        - message (str): Status message
+        - data (dict, optional): Channel-specific response data
+
+    Raises:
+        Does not raise exceptions - returns error details in response dict
+    """
+    try:
+        chat_channel = chat_data.get("channel")
+        sender_agent_id = chat_data.get("sender_agent_id")
+        chat_id = chat_data.get("id")
+
+        logger.info(f"Attempting to send message via {chat_channel} for chat {chat_id}")
+
+        # Route to appropriate channel service
+        if chat_channel == CommunicationChannel.WHATSAPP.value or chat_channel == "whatsapp":
+            # ============================================
+            # WHATSAPP CHANNEL IMPLEMENTATION
+            # ============================================
+
+            # Validate required data
+            if not sender_agent_id:
+                logger.error(f"Cannot send WhatsApp message: sender_agent_id is missing for chat {chat_id}")
+                return {
+                    "success": False,
+                    "channel": "whatsapp",
+                    "message": "Sender agent ID is missing"
+                }
+
+            customer_phone = customer_data.get("phone")
+            if not customer_phone:
+                logger.error(f"Cannot send WhatsApp message: customer phone is missing for chat {chat_id}")
+                return {
+                    "success": False,
+                    "channel": "whatsapp",
+                    "message": "Customer phone number is missing"
+                }
+
+            # Format phone number for WhatsApp
+            formatted_phone = format_whatsapp_phone(customer_phone)
+
+            if not formatted_phone:
+                logger.error(f"Cannot send WhatsApp message: invalid phone format '{customer_phone}' for chat {chat_id}")
+                return {
+                    "success": False,
+                    "channel": "whatsapp",
+                    "message": f"Invalid phone number format: {customer_phone}"
+                }
+
+            # Get WhatsApp service
+            whatsapp_service = get_whatsapp_service()
+
+            # Send message via WhatsApp
+            # session_id = sender_agent_id (agent yang memiliki nomor WhatsApp)
+            try:
+                result = await whatsapp_service.send_text_message(
+                    session_id=sender_agent_id,
+                    phone_number=formatted_phone,
+                    message=message_content
+                )
+
+                logger.info(f"✅ WhatsApp message sent successfully for chat {chat_id} to {formatted_phone}")
+                return {
+                    "success": True,
+                    "channel": "whatsapp",
+                    "message": "Message sent via WhatsApp",
+                    "data": result
+                }
+
+            except Exception as e:
+                logger.error(f"❌ Failed to send WhatsApp message for chat {chat_id}: {e}")
+                return {
+                    "success": False,
+                    "channel": "whatsapp",
+                    "message": f"WhatsApp API error: {str(e)}"
+                }
+
+        elif chat_channel == CommunicationChannel.TELEGRAM.value or chat_channel == "telegram":
+            # ============================================
+            # TELEGRAM CHANNEL IMPLEMENTATION
+            # ============================================
+            try:
+                # Use the WebhookCallbackService we fixed earlier
+                # This handles both Standard Bots AND Userbots automatically
+                callback_service = get_webhook_callback_service()
+                
+                result = await callback_service.send_callback(
+                    chat=chat_data,
+                    message_content=message_content,
+                    supabase=supabase
+                )
+
+                if result.get("success"):
+                    logger.info(f"✅ Telegram message sent successfully for chat {chat_id}")
+                    return {
+                        "success": True,
+                        "channel": "telegram",
+                        "message": "Message sent via Telegram",
+                        "data": result
+                    }
+                else:
+                    logger.warning(f"⚠️ Telegram send failed: {result}")
+                    return {
+                        "success": False,
+                        "channel": "telegram",
+                        "message": f"Telegram error: {result.get('error') or result.get('reason')}"
+                    }
+
+            except Exception as e:
+                logger.error(f"❌ Unexpected error sending Telegram message: {e}")
+                return {
+                    "success": False,
+                    "channel": "telegram",
+                    "message": str(e)
+                }
+                
+        elif chat_channel == CommunicationChannel.EMAIL.value or chat_channel == "email":
+            # ============================================
+            # EMAIL CHANNEL PLACEHOLDER
+            # ============================================
+            logger.warning(f"Email sending not yet implemented for chat {chat_id}")
+            return {
+                "success": False,
+                "channel": "email",
+                "message": "Email channel not yet implemented"
+            }
+
+        elif chat_channel == CommunicationChannel.WEB.value or chat_channel == "web":
+            # ============================================
+            # WEB CHANNEL - NO ACTION NEEDED
+            # ============================================
+            # Web chat messages are delivered via WebSocket/polling, not external service
+            logger.info(f"Web channel for chat {chat_id} - no external sending required")
+            return {
+                "success": True,
+                "channel": "web",
+                "message": "Web channel - message delivered via WebSocket/API"
+            }
+
+        elif chat_channel == CommunicationChannel.MCP.value or chat_channel == "mcp":
+            # ============================================
+            # MCP CHANNEL - NO ACTION NEEDED
+            # ============================================
+            # MCP messages are handled internally, not sent to external service
+            logger.info(f"MCP channel for chat {chat_id} - no external sending required")
+            return {
+                "success": True,
+                "channel": "mcp",
+                "message": "MCP channel - message handled internally"
+            }
+
+        else:
+            # Unknown channel
+            logger.warning(f"Unknown channel '{chat_channel}' for chat {chat_id}")
+            return {
+                "success": False,
+                "channel": chat_channel,
+                "message": f"Unknown channel: {chat_channel}"
+            }
+
+    except Exception as e:
+        logger.error(f"❌ Unexpected error in send_message_via_channel: {e}")
+        return {
+            "success": False,
+            "channel": "unknown",
+            "message": f"Unexpected error: {str(e)}"
+        }
+
+# ============================================
+# CUSTOMER ENDPOINTS
+# ============================================
+
+@router.get(
+    "/customers",
+    response_model=CustomerListResponse,
+    summary="Get all customers",
+    description="Retrieve all customers for the organization"
+)
+async def get_customers(
+    search: Optional[str] = Query(None, description="Search by name, email, or phone"),
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all customers for organization"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Build query
+        query = supabase.table("customers").select("*", count="exact").eq("organization_id", organization_id)
+
+        # Apply search filter
+        if search:
+            query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%,phone.ilike.%{search}%")
+
+        # Apply pagination
+        query = query.range(skip, skip + limit - 1).order("created_at", desc=True)
+
+        # Execute query
+        response = query.execute()
+
+        customers = [Customer(**customer) for customer in response.data]
+
+        return CustomerListResponse(
+            customers=customers,
+            total=response.count if response.count else len(customers)
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching customers: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch customers"
+        )
+
+
+@router.get(
+    "/customers/{customer_id}",
+    response_model=Customer,
+    summary="Get customer by ID",
+    description="Retrieve a specific customer by ID"
+)
+async def get_customer(
+    customer_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get specific customer by ID"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        response = supabase.table("customers").select("*").eq("id", customer_id).eq("organization_id", organization_id).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Customer with ID {customer_id} not found"
+            )
+
+        return Customer(**response.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching customer {customer_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch customer"
+        )
+
+
+@router.post(
+    "/customers",
+    response_model=Customer,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create new customer",
+    description="Create a new customer in the organization"
+)
+async def create_customer(
+    customer: CustomerCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Create a new customer"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Prepare customer data
+        customer_data = {
+            "organization_id": organization_id,
+            "name": customer.name,
+            "email": customer.email,
+            "phone": customer.phone,
+            "avatar_url": customer.avatar_url,
+            "metadata": customer.metadata
+        }
+
+        # Insert customer
+        response = supabase.table("customers").insert(customer_data).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create customer"
+            )
+
+        logger.info(f"Customer created: {response.data[0]['id']} by user {current_user.user_id}")
+
+        return Customer(**response.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating customer: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create customer"
+        )
+
+
+@router.put(
+    "/customers/{customer_id}",
+    response_model=Customer,
+    summary="Update customer",
+    description="Update an existing customer's information"
+)
+async def update_customer(
+    customer_id: str,
+    customer_update: CustomerUpdate,
+    current_user: User = Depends(get_current_user)
+):
+    """Update an existing customer"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Check if customer exists
+        existing = supabase.table("customers").select("*").eq("id", customer_id).eq("organization_id", organization_id).execute()
+
+        if not existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Customer with ID {customer_id} not found"
+            )
+
+        # Prepare update data
+        update_data = customer_update.model_dump(exclude_unset=True)
+
+        if not update_data:
+            return Customer(**existing.data[0])
+
+        # Update customer
+        response = supabase.table("customers").update(update_data).eq("id", customer_id).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update customer"
+            )
+
+        logger.info(f"Customer updated: {customer_id} by user {current_user.user_id}")
+
+        return Customer(**response.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating customer {customer_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update customer"
+        )
+
+
+# ============================================
+# CHAT ENDPOINTS
+# ============================================
+
+@router.get(
+    "/chats",
+    response_model=ChatListResponse,
+    summary="Get all chats",
+    description="Retrieve all chats with optional filtering"
+)
+async def get_chats(
+    status_filter: Optional[ChatStatus] = Query(None, description="Filter by chat status"),
+    channel: Optional[CommunicationChannel] = Query(None, description="Filter by channel"),
+    assigned_to: Optional[str] = Query(None, description="Filter by assigned agent ID (legacy)"),
+    unassigned: Optional[bool] = Query(None, description="Filter unassigned chats"),
+    handled_by: Optional[str] = Query(None, description="Filter by handler: ai, human, or unassigned"),
+    ai_assigned_to: Optional[str] = Query(None, description="Filter by AI agent ID"),
+    human_assigned_to: Optional[str] = Query(None, description="Filter by human agent ID"),
+    escalated: Optional[bool] = Query(None, description="Filter escalated chats only"),
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all chats with filters"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Build query
+        query = supabase.table("chats").select("*", count="exact").eq("organization_id", organization_id)
+
+        # Apply filters
+        if status_filter:
+            query = query.eq("status", status_filter.value)
+
+        if channel:
+            query = query.eq("channel", channel.value)
+
+        # Legacy filter (backward compatibility)
+        if assigned_to:
+            query = query.eq("assigned_agent_id", assigned_to)
+
+        if unassigned is True:
+            query = query.is_("assigned_agent_id", "null")
+
+        # New dual agent filters
+        if handled_by:
+            query = query.eq("handled_by", handled_by)
+
+        if ai_assigned_to:
+            query = query.eq("ai_agent_id", ai_assigned_to)
+
+        if human_assigned_to:
+            query = query.eq("human_agent_id", human_assigned_to)
+
+        if escalated is True:
+            query = query.not_.is_("escalated_at", "null")
+
+        # Apply pagination
+        query = query.range(skip, skip + limit - 1).order("last_message_at", desc=True)
+
+        # Execute query
+        response = query.execute()
+
+        # Fetch last message and customer name for each chat
+        chats_with_messages = []
+
+        for chat_data in response.data:
+            chat_id = chat_data["id"]
+            customer_id = chat_data.get("customer_id")
+
+            # Get last message for this chat
+            last_message_response = supabase.table("messages") \
+                .select("*") \
+                .eq("chat_id", chat_id) \
+                .order("created_at", desc=True) \
+                .limit(1) \
+                .execute()
+
+            # Add last_message to chat data
+            if last_message_response.data:
+                chat_data["last_message"] = last_message_response.data[0]
+            else:
+                chat_data["last_message"] = None
+
+            # Get customer name
+            customer_name = None
+            if customer_id:
+                try:
+                    customer_response = supabase.table("customers") \
+                        .select("name") \
+                        .eq("id", customer_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if customer_response.data:
+                        customer_name = customer_response.data[0].get("name")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch customer name for customer_id {customer_id}: {e}")
+                    customer_name = None
+
+            # Add customer_name to chat data
+            chat_data["customer_name"] = customer_name
+
+            # Get legacy agent name (for backward compatibility)
+            agent_name = None
+            assigned_agent_id = chat_data.get("assigned_agent_id")
+            if assigned_agent_id:
+                try:
+                    agent_response = supabase.table("agents") \
+                        .select("name") \
+                        .eq("id", assigned_agent_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if agent_response.data:
+                        agent_name = agent_response.data[0].get("name")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch agent name for assigned_agent_id {assigned_agent_id}: {e}")
+                    agent_name = None
+
+            # Add agent_name to chat data
+            chat_data["agent_name"] = agent_name
+
+            # Get AI agent name
+            ai_agent_name = None
+            ai_agent_id = chat_data.get("ai_agent_id")
+            if ai_agent_id:
+                try:
+                    ai_agent_response = supabase.table("agents") \
+                        .select("name") \
+                        .eq("id", ai_agent_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if ai_agent_response.data:
+                        ai_agent_name = ai_agent_response.data[0].get("name")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch AI agent name for ai_agent_id {ai_agent_id}: {e}")
+                    ai_agent_name = None
+
+            # Add ai_agent_name to chat data
+            chat_data["ai_agent_name"] = ai_agent_name
+
+            # Get human agent name
+            human_agent_name = None
+            human_id = None
+            human_agent_id = chat_data.get("human_agent_id")
+            if human_agent_id:
+                try:
+                    human_agent_response = supabase.table("agents") \
+                        .select("name","user_id") \
+                        .eq("id", human_agent_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if human_agent_response.data:
+                        human_agent_name = human_agent_response.data[0].get("name")
+                        human_id = human_agent_response.data[0].get("user_id")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch human agent name for human_agent_id {human_agent_id}: {e}")
+                    human_agent_name = None
+
+            # Add human_agent_name to chat data
+            chat_data["human_agent_name"] = human_agent_name
+            chat_data["human_id"] = human_id
+
+            chats_with_messages.append(Chat(**chat_data))
+
+        return ChatListResponse(
+            chats=chats_with_messages,
+            total=response.count if response.count else len(chats_with_messages)
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching chats: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch chats"
+        )
+
+
+@router.get(
+    "/chats/{chat_id}",
+    response_model=Chat,
+    summary="Get chat by ID",
+    description="Retrieve a specific chat by ID"
+)
+async def get_chat(
+    chat_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get specific chat by ID"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        response = supabase.table("chats").select("*").eq("id", chat_id).eq("organization_id", organization_id).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat with ID {chat_id} not found"
+            )
+
+        chat_data = response.data[0]
+
+        # Get last message for this chat
+        last_message_response = supabase.table("messages") \
+            .select("*") \
+            .eq("chat_id", chat_id) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        # Add last_message to chat data
+        if last_message_response.data:
+            chat_data["last_message"] = last_message_response.data[0]
+        else:
+            chat_data["last_message"] = None
+
+        return Chat(**chat_data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching chat {chat_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch chat"
+        )
+
+
+@router.post(
+    "/chats",
+    response_model=Chat,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create new chat",
+    description="Create a new chat conversation"
+)
+async def create_chat(
+    chat: ChatCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Create a new chat"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Step 1: FindOrCreate customer
+        customer_id = chat.customer_id
+
+        # customer check
+        if not customer_id:
+            # Need customer_name and contact for findOrCreate
+            if not chat.customer_name or not chat.contact:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Either customer_id or both customer_name and contact must be provided"
+                )
+
+            # Try to find existing customer by contact (check both phone and email)
+            existing_customer = supabase.table("customers") \
+                .select("id") \
+                .eq("organization_id", organization_id) \
+                .or_(f"phone.eq.{chat.contact},email.eq.{chat.contact}") \
+                .execute()
+
+            if existing_customer.data:
+                # Customer found
+                customer_id = existing_customer.data[0]["id"]
+                logger.info(f"Found existing customer: {customer_id} for contact {chat.contact}")
+            else:
+                # Create new customer
+                customer_data = {
+                    "organization_id": organization_id,
+                    "name": chat.customer_name,
+                    "phone": chat.contact if chat.channel == CommunicationChannel.WHATSAPP else None,
+                    "email": chat.contact if "@" in chat.contact else None,
+                    "metadata": {}
+                }
+
+                new_customer = supabase.table("customers").insert(customer_data).execute()
+
+                if not new_customer.data:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Failed to create customer"
+                    )
+
+                customer_id = new_customer.data[0]["id"]
+                logger.info(f"Created new customer: {customer_id} for {chat.customer_name}")
+        else:
+            # Verify customer exists if customer_id was provided
+            customer_check = supabase.table("customers").select("id").eq("id", customer_id).eq("organization_id", organization_id).execute()
+
+            if not customer_check.data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Customer with ID {customer_id} not found"
+                )
+
+        # Step 2: Determine agent assignment (AI first, then human if specified)
+        ai_agent_id = None
+        human_agent_id = None
+        handled_by = "unassigned"
+        assigned_agent_id = None
+        status_value = "open"
+
+        # Get default AI agent for auto-assignment
+        default_ai_agent = await get_default_ai_agent(organization_id, supabase)
+
+        # Check if assigned_agent_id is provided (legacy behavior)
+        if chat.assigned_agent_id:
+            # Verify agent exists
+            agent_check = supabase.table("agents").select("id", "user_id").eq("id", chat.assigned_agent_id).eq("organization_id", organization_id).execute()
+
+            if not agent_check.data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Agent with ID {chat.assigned_agent_id} not found"
+                )
+
+            agent_data = agent_check.data[0]
+            assigned_agent_id = chat.assigned_agent_id
+
+            # Check if assigned agent is AI or Human
+            if agent_data.get("user_id") is None:
+                # It's an AI agent
+                ai_agent_id = chat.assigned_agent_id
+                handled_by = "ai"
+                status_value = "open"
+            else:
+                # It's a human agent - skip AI and go straight to human
+                human_agent_id = chat.assigned_agent_id
+                handled_by = "human"
+                status_value = "assigned"
+                # Also assign default AI agent to show it was available
+                if default_ai_agent:
+                    ai_agent_id = default_ai_agent
+        else:
+            # No agent specified - auto-assign to AI
+            if default_ai_agent:
+                ai_agent_id = default_ai_agent
+                assigned_agent_id = default_ai_agent
+                handled_by = "ai"
+                status_value = "open"
+                logger.info(f"Auto-assigning chat to AI agent {ai_agent_id}")
+            else:
+                logger.warning(f"No AI agent available for organization {organization_id}, chat will be unassigned")
+                handled_by = "unassigned"
+                status_value = "open"
+
+        # Step 3: Prepare chat data
+        chat_data = {
+            "organization_id": organization_id,
+            "customer_id": customer_id,
+            "channel": chat.channel.value,
+            "assigned_agent_id": assigned_agent_id,  # For backward compatibility
+            "ai_agent_id": ai_agent_id,
+            "human_agent_id": human_agent_id,
+            "handled_by": handled_by,
+            "status": status_value,
+            "unread_count": 0,
+            "last_message_at": datetime.utcnow().isoformat()
+        }
+
+        # Insert chat
+        response = supabase.table("chats").insert(chat_data).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create chat"
+            )
+
+        chat_data = response.data[0]
+        logger.info(f"Chat created: {chat_data['id']} by user {current_user.user_id}")
+
+        # Step 3: Create initial message if provided
+        last_message = None
+        if chat.initial_message:
+            message_data = {
+                "chat_id": chat_data["id"],
+                "sender_type": "agent",  # Initial message is from customer
+                "sender_id": current_user.user_id,
+                "content": chat.initial_message,
+                "metadata": {}
+            }
+
+            message_response = supabase.table("messages").insert(message_data).execute()
+
+            if message_response.data:
+                logger.info(f"Initial message created in chat {chat_data['id']}")
+                last_message = message_response.data[0]
+            else:
+                logger.warning(f"Failed to create initial message in chat {chat_data['id']}")
+
+        # Add last_message to chat data
+        chat_data["last_message"] = last_message
+
+        return Chat(**chat_data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating chat: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create chat"
+        )
+
+
+@router.put(
+    "/chats/{chat_id}/assign",
+    response_model=Chat,
+    summary="Assign chat to agent",
+    description="""
+    Assign a chat to a specific agent (AI or Human).
+
+    **Features:**
+    - Assign to specific agent by providing `assigned_agent_id`
+    - Quick assign to current user by setting `assigned_to_me=true`
+    - Auto-creates agent profile if user doesn't have one yet
+    - Automatically detects if assigned agent is AI or Human and updates `handled_by` field
+    - Updates chat status to 'assigned'
+
+    **Use Cases:**
+    1. **Assign to specific agent**: Provide `assigned_agent_id` with the target agent UUID
+    2. **Assign to me**: Set `assigned_to_me=true` and system will find/create agent for current user
+    3. **Transfer chat**: Reassign already assigned chat to different agent
+
+    **Request Body:**
+    ```json
+    {
+        "assigned_agent_id": "550e8400-e29b-41d4-a716-446655440000",
+        "assigned_to_me": false,
+        "reason": "Customer requested transfer to specialist"
+    }
+    ```
+
+    **Or for self-assignment:**
+    ```json
+    {
+        "assigned_to_me": true,
+        "reason": "Taking over this conversation"
+    }
+    ```
+
+    **Behavior:**
+    - If agent doesn't exist for current user and `assigned_to_me=true`, a new agent will be created automatically
+    - Chat status will be updated to 'assigned'
+    - System automatically determines if agent is AI (user_id is NULL) or Human (user_id is not NULL)
+    - `handled_by` field will be set to 'ai' or 'human' accordingly
+    - Previous assignment will be overwritten
+    """
+)
+async def assign_chat(
+    chat_id: str,
+    assignment: ChatAssign,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Assign chat to an agent.
+
+    This endpoint allows assigning a chat to either:
+    - A specific agent by providing assigned_agent_id
+    - Current user by setting assigned_to_me=true (auto-creates agent if needed)
+
+    The system automatically detects whether the assigned agent is an AI agent or Human agent
+    by checking the user_id field (NULL = AI, not NULL = Human).
+
+    Args:
+        chat_id: UUID of the chat to assign
+        assignment: ChatAssign object containing:
+            - assigned_agent_id: Agent UUID (optional if assigned_to_me=true)
+            - assigned_to_me: Boolean to assign to current user (default: False)
+            - reason: Optional reason for assignment
+        current_user: Authenticated user (from dependency)
+
+    Returns:
+        Chat: Updated chat object with assignment details including last_message
+
+    Raises:
+        404: Chat or agent not found
+        500: Failed to create agent or assign chat
+    """
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        print("CURRENT USER ID: ", str(current_user))
+
+        # Check if chat exists
+        chat_check = supabase.table("chats").select("*").eq("id", chat_id).eq("organization_id", organization_id).execute()
+
+        if not chat_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat with ID {chat_id} not found"
+            )
+
+        #  if assignment.assigned_to_me find agent with user_id current user.user_id
+        if assignment.assigned_to_me:
+            agent_response = supabase.table("agents") \
+				.select("id") \
+				.eq("user_id", current_user.user_id) \
+				.eq("organization_id", organization_id) \
+				.execute()
+
+            #  if not agent with user_id current user.user_id found please create agent with user_id current user.user_id
+            if not agent_response.data:
+                agent_data = {
+					"organization_id": organization_id,
+					"name": current_user.user_metadata.get("full_name") or "Unnamed Agent",
+					"user_id": current_user.user_id,
+                    "email": current_user.user_metadata.get("email") or f"{current_user.user_id}@example.com",
+                    "phone": current_user.user_metadata.get("phone") or f"000",
+					"status": "active",
+				}
+                create_agent_response = supabase.table("agents").insert(agent_data).execute()
+                agent_response = create_agent_response;
+                if not create_agent_response.data:
+                    raise HTTPException(
+						status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+						detail="Failed to create agent for current user")
+
+            assignment.assigned_agent_id = agent_response.data[0]["id"]
+
+        # Verify agent exists
+        agent_check = supabase.table("agents").select("id","user_id").eq("id", assignment.assigned_agent_id).eq("organization_id", organization_id).execute()
+
+        if not agent_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Agent with ID {assignment.assigned_agent_id} not found"
+            )
+
+        handle_by = "ai"
+        human_agent_id = None
+
+        if agent_check.data[0].get("user_id") is not None:
+            handle_by = "human"
+            human_agent_id = agent_check.data[0]["id"]
+
+        # Update chat
+        update_data = {
+            "assigned_agent_id": assignment.assigned_agent_id,
+            "status": "assigned",
+            "human_agent_id": human_agent_id,
+	        "handled_by": handle_by,
+        }
+
+        response = supabase.table("chats").update(update_data).eq("id", chat_id).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to assign chat"
+            )
+
+        logger.info(f"Chat {chat_id} assigned to agent {assignment.assigned_agent_id} by user {current_user.user_id}")
+
+        chat_data = response.data[0]
+
+        # Get last message for this chat
+        last_message_response = supabase.table("messages") \
+            .select("*") \
+            .eq("chat_id", chat_id) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        # Add last_message to chat data
+        if last_message_response.data:
+            chat_data["last_message"] = last_message_response.data[0]
+        else:
+            chat_data["last_message"] = None
+
+        return Chat(**chat_data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error assigning chat {chat_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to assign chat"
+        )
+
+
+@router.put(
+    "/chats/{chat_id}/escalate",
+    response_model=Chat,
+    summary="Escalate chat to human agent",
+    description="Escalate a chat from AI agent to human agent. AI agent info is preserved."
+)
+async def escalate_chat(
+    chat_id: str,
+    escalation: ChatEscalation,
+    current_user: User = Depends(get_current_user)
+):
+    """Escalate chat from AI to human agent"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Check if chat exists and belongs to organization
+        chat_check = supabase.table("chats").select("*").eq("id", chat_id).eq("organization_id", organization_id).execute()
+
+        if not chat_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat with ID {chat_id} not found"
+            )
+
+        existing_chat = chat_check.data[0]
+
+        # Check if chat is already handled by human
+        if existing_chat.get("handled_by") == "human":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Chat is already being handled by a human agent"
+            )
+
+        # Verify human agent exists and is actually a human (user_id NOT NULL)
+        agent_check = supabase.table("agents") \
+            .select("id", "user_id") \
+            .eq("id", escalation.human_agent_id) \
+            .eq("organization_id", organization_id) \
+            .execute()
+
+        if not agent_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Agent with ID {escalation.human_agent_id} not found"
+            )
+
+        agent_data = agent_check.data[0]
+
+        # Ensure it's a human agent (not AI)
+        if agent_data.get("user_id") is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot escalate to an AI agent. Please provide a human agent ID."
+            )
+
+        # Prepare escalation update
+        update_data = {
+            "human_agent_id": escalation.human_agent_id,
+            "handled_by": "human",
+            "status": "assigned",
+            "assigned_agent_id": escalation.human_agent_id,  # Update for backward compatibility
+            "escalated_at": datetime.utcnow().isoformat(),
+            "escalation_reason": escalation.reason
+        }
+
+        # IMPORTANT: ai_agent_id is NOT updated - it's preserved!
+        # IMPORTANT: sender_agent_id is NOT updated - it's preserved!
+        # This ensures replies are sent from the same WhatsApp number/Telegram bot/Email
+
+        # Update chat
+        response = supabase.table("chats").update(update_data).eq("id", chat_id).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to escalate chat"
+            )
+
+        logger.info(
+            f"Chat {chat_id} escalated from AI (preserved: {existing_chat.get('ai_agent_id')}) "
+            f"to human agent {escalation.human_agent_id} by user {current_user.user_id}. "
+            f"Sender agent preserved: {existing_chat.get('sender_agent_id')} "
+            f"(WhatsApp/Telegram/Email will remain same for customer)"
+        )
+
+        chat_data = response.data[0]
+
+        # Get last message for this chat
+        last_message_response = supabase.table("messages") \
+            .select("*") \
+            .eq("chat_id", chat_id) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        # Add last_message to chat data
+        if last_message_response.data:
+            chat_data["last_message"] = last_message_response.data[0]
+        else:
+            chat_data["last_message"] = None
+
+        # Fetch AI agent name (preserved)
+        ai_agent_name = None
+        if chat_data.get("ai_agent_id"):
+            try:
+                ai_agent_response = supabase.table("agents") \
+                    .select("name") \
+                    .eq("id", chat_data["ai_agent_id"]) \
+                    .execute()
+                if ai_agent_response.data:
+                    ai_agent_name = ai_agent_response.data[0].get("name")
+            except Exception as e:
+                logger.warning(f"Failed to fetch AI agent name: {e}")
+
+        chat_data["ai_agent_name"] = ai_agent_name
+
+        # Fetch human agent name
+        human_agent_name = None
+        try:
+            human_agent_response = supabase.table("agents") \
+                .select("name") \
+                .eq("id", escalation.human_agent_id) \
+                .execute()
+            if human_agent_response.data:
+                human_agent_name = human_agent_response.data[0].get("name")
+        except Exception as e:
+            logger.warning(f"Failed to fetch human agent name: {e}")
+
+        chat_data["human_agent_name"] = human_agent_name
+
+        # Fetch customer name
+        customer_name = None
+        if chat_data.get("customer_id"):
+            try:
+                customer_response = supabase.table("customers") \
+                    .select("name") \
+                    .eq("id", chat_data["customer_id"]) \
+                    .execute()
+                if customer_response.data:
+                    customer_name = customer_response.data[0].get("name")
+            except Exception as e:
+                logger.warning(f"Failed to fetch customer name: {e}")
+
+        chat_data["customer_name"] = customer_name
+        chat_data["agent_name"] = human_agent_name  # For backward compatibility
+
+        return Chat(**chat_data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error escalating chat {chat_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to escalate chat"
+        )
+
+
+@router.put(
+    "/chats/{chat_id}/resolve",
+    response_model=Chat,
+    summary="Resolve chat",
+    description="Mark a chat as resolved"
+)
+async def resolve_chat(
+    chat_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Mark chat as resolved"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Check if chat exists
+        chat_check = supabase.table("chats").select("*").eq("id", chat_id).eq("organization_id", organization_id).execute()
+
+        if not chat_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat with ID {chat_id} not found"
+            )
+
+        # Update chat
+        update_data = {
+            "status": "resolved",
+            "resolved_at": datetime.utcnow().isoformat(),
+            "resolved_by_agent_id": chat_check.data[0].get("assigned_agent_id")
+        }
+
+        response = supabase.table("chats").update(update_data).eq("id", chat_id).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to resolve chat"
+            )
+
+        logger.info(f"Chat {chat_id} resolved by user {current_user.user_id}")
+
+        chat_data = response.data[0]
+
+        # Get last message for this chat
+        last_message_response = supabase.table("messages") \
+            .select("*") \
+            .eq("chat_id", chat_id) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        # Add last_message to chat data
+        if last_message_response.data:
+            chat_data["last_message"] = last_message_response.data[0]
+        else:
+            chat_data["last_message"] = None
+
+        return Chat(**chat_data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resolving chat {chat_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to resolve chat"
+        )
+
+
+# ============================================
+# MESSAGE ENDPOINTS
+# ============================================
+
+@router.get(
+    "/chats/{chat_id}/messages",
+    response_model=MessageListResponse,
+    summary="Get chat messages",
+    description="Retrieve all messages in a chat"
+)
+async def get_chat_messages(
+    chat_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all messages in a chat"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Verify chat
+        chat_check = supabase.table("chats").select("id").eq("id", chat_id).eq("organization_id", organization_id).execute()
+        if not chat_check.data: 
+            raise HTTPException(404, f"Chat {chat_id} not found")
+
+        # Get messages
+        response = supabase.table("messages").select("*", count="exact").eq("chat_id", chat_id).range(skip, skip + limit - 1).order("created_at", desc=False).execute()
+
+        # Enrich messages with sender_name
+        messages_with_sender = []
+        for message_data in response.data:
+            sender_name = None
+            sender_id = message_data.get("sender_id")
+            sender_type = message_data.get("sender_type")
+
+            if sender_id and sender_type:
+                if sender_type == "agent":
+                    # [FIX] Fetch Email from Agents table instead of Name
+                    try:
+                        agent_response = supabase.table("agents") \
+                            .select("email") \
+                            .eq("user_id", sender_id) \
+                            .eq("organization_id", organization_id) \
+                            .execute()
+                        
+                        # Use Email if available
+                        if agent_response.data and agent_response.data[0].get("email"):
+                            sender_name = agent_response.data[0].get("email")
+                        else:
+                            # Fallback if email is missing in agents table
+                            sender_name = "Human Agent"
+                            
+                    except Exception:
+                        sender_name = "Human Agent"
+
+                elif sender_type == "ai":
+                    try:
+                        agent_response = supabase.table("agents").select("name").eq("id", sender_id).execute()
+                        sender_name = agent_response.data[0].get("name") if agent_response.data else "AI Assistant"
+                    except:
+                        sender_name = "AI Assistant"
+
+                elif sender_type == "customer":
+                    try:
+                        cust_response = supabase.table("customers").select("name").eq("id", sender_id).execute()
+                        sender_name = cust_response.data[0].get("name") if cust_response.data else "Customer"
+                    except:
+                        sender_name = "Customer"
+
+            message_data["sender_name"] = sender_name
+            messages_with_sender.append(Message(**message_data))
+
+        return MessageListResponse(
+            messages=messages_with_sender,
+            total=response.count if response.count else len(messages_with_sender)
+        )
+
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Error fetching messages: {e}")
+        raise HTTPException(500, "Failed to fetch messages")
+
+@router.post(
+    "/chats/{chat_id}/messages",
+    response_model=Message,
+    status_code=status.HTTP_201_CREATED,
+    summary="Send message",
+    description="Send a new message in a chat"
+)
+async def create_message(
+    chat_id: str,
+    message: MessageCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Send a message in a chat"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+        
+        # Verify chat
+        chat_check = supabase.table("chats").select("id").eq("id", chat_id).eq("organization_id", organization_id).execute()
+        if not chat_check.data: raise HTTPException(404, f"Chat {chat_id} not found")
+
+        # Prepare & Insert Message
+        message_data = {
+            "chat_id": chat_id,
+            "sender_type": message.sender_type.value,
+            "sender_id": message.sender_id,
+            "content": message.content,
+            "ticket_id": message.ticket_id,
+            "metadata": message.metadata
+        }
+        response = supabase.table("messages").insert(message_data).execute()
+        if not response.data: raise HTTPException(500, "Failed to create message")
+        
+        # Update chat timestamp
+        supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
+        
+        logger.info(f"Message created in chat {chat_id} by user {current_user.user_id}")
+
+        # ============================================
+        # SEND MESSAGE VIA CHANNEL (External)
+        # ============================================
+        if message.sender_type in [SenderType.AGENT, SenderType.AI]:
+            try:
+                chat_full = supabase.table("chats").select("*").eq("id", chat_id).single().execute()
+                if chat_full.data:
+                    chat_data = chat_full.data
+                    cust_data = supabase.table("customers").select("*").eq("id", chat_data["customer_id"]).single().execute()
+                    
+                    if cust_data.data:
+                        await send_message_via_channel(
+                            chat_data=chat_data,
+                            customer_data=cust_data.data,
+                            message_content=message.content,
+                            supabase=supabase
+                        )
+            except Exception as e:
+                logger.error(f"❌ Error sending external message: {e}")
+
+        # ============================================
+        # ENRICH & BROADCAST (WebSocket)
+        # ============================================
+        created_message = response.data[0]
+        sender_name = None
+        sender_id = created_message.get("sender_id")
+        
+        # 1. Resolve Sender Name (UPDATED TO MATCH HISTORY LOGIC)
+        if message.sender_type == SenderType.AGENT:
+            # [FIX] Fetch Email from Agents table instead of Name
+            try:
+                agent_res = supabase.table("agents") \
+                    .select("email") \
+                    .eq("user_id", sender_id) \
+                    .eq("organization_id", organization_id) \
+                    .execute()
+                
+                if agent_res.data and agent_res.data[0].get("email"):
+                    sender_name = agent_res.data[0].get("email")
+                else:
+                    sender_name = "Human Agent"
+            except: 
+                sender_name = "Human Agent"
+
+        elif message.sender_type == SenderType.AI:
+            sender_name = "AI Assistant"
+        elif message.sender_type == SenderType.CUSTOMER:
+            sender_name = "Customer"
+            
+        created_message["sender_name"] = sender_name
+
+        # 2. Broadcast via WebSocket
+        if app_settings.WEBSOCKET_ENABLED:
+            try:
+                conn = get_connection_manager()
+                
+                # Fetch minimal data for WS if not available
+                try:
+                    ws_chat = chat_data
+                except:
+                    ws_chat = supabase.table("chats").select("customer_id, channel, handled_by").eq("id", chat_id).single().execute().data
+
+                ws_cust_id = ws_chat.get("customer_id")
+                
+                # Determine name to show in FE bubble
+                if message.sender_type in [SenderType.AGENT, SenderType.AI]:
+                    broadcast_name = sender_name # Now sending the Email!
+                else:
+                    c_res = supabase.table("customers").select("name").eq("id", ws_cust_id).single().execute()
+                    broadcast_name = c_res.data.get("name") if c_res.data else "Unknown Customer"
+
+                await conn.broadcast_new_message(
+                    organization_id=organization_id,
+                    chat_id=chat_id,
+                    message_id=created_message["id"],
+                    customer_id=ws_cust_id,
+                    customer_name=broadcast_name, 
+                    message_content=message.content,
+                    channel=ws_chat.get("channel"),
+                    handled_by=ws_chat.get("handled_by"),
+                    sender_type=message.sender_type.value,
+                    sender_id=message.sender_id
+                )
+            except Exception as e:
+                logger.warning(f"WS Broadcast failed: {e}")
+
+        return Message(**created_message)
+
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Create message error: {e}")
+        raise HTTPException(500, "Failed to create message")
+
+# ============================================
+# TICKET ENDPOINTS
+# ============================================
+
+@router.get(
+    "/tickets",
+    response_model=TicketListResponse,
+    summary="Get all tickets",
+    description="Retrieve all tickets with optional filtering, date ranges, and sorting"
+)
+async def get_tickets(
+    status_filter: Optional[TicketStatus] = Query(None, description="Filter by ticket status"),
+    priority: Optional[TicketPriority] = Query(None, description="Filter by priority"),
+    category: Optional[str] = Query(None, description="Filter by category"),
+    assigned_to: Optional[str] = Query(None, description="Filter by assigned agent ID"),
+    
+    # [NEW] Date Filtering
+    updated_after: Optional[datetime] = Query(None, description="Fetch tickets updated after this timestamp (ISO 8601)"),
+    created_after: Optional[datetime] = Query(None, description="Fetch tickets created after this timestamp (ISO 8601)"),
+    
+    # [NEW] Sorting
+    sort_by: str = Query("updated_at", description="Field to sort by (created_at, updated_at, priority, ticket_number)"),
+    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
+    
+    # Pagination
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
+    
+    current_user: User = Depends(get_current_user)
+):
+    """Get all tickets with filters"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Build query
+        query = supabase.table("tickets").select("*", count="exact").eq("organization_id", organization_id)
+
+        # Apply Standard Filters
+        if status_filter:
+            query = query.eq("status", status_filter.value)
+
+        if priority:
+            query = query.eq("priority", priority.value)
+
+        if category:
+            query = query.eq("category", category)
+
+        if assigned_to:
+            query = query.eq("assigned_agent_id", assigned_to)
+
+        # [NEW] Apply Date Filters
+        if updated_after:
+            query = query.gte("updated_at", updated_after.isoformat())
+        
+        if created_after:
+            query = query.gte("created_at", created_after.isoformat())
+
+        # [NEW] Apply Sorting
+        # Validate sort field to prevent SQL injection or errors
+        valid_sort_fields = ["created_at", "updated_at", "priority", "ticket_number", "status"]
+        if sort_by not in valid_sort_fields:
+            sort_by = "updated_at" # Fallback default
+
+        is_descending = sort_order.lower() == "desc"
+        query = query.order(sort_by, desc=is_descending)
+
+        # Apply Pagination (Must be last before execute)
+        query = query.range(skip, skip + limit - 1)
+
+        # Execute query
+        response = query.execute()
+
+        tickets = [Ticket(**ticket) for ticket in response.data]
+
+        return TicketListResponse(
+            tickets=tickets,
+            total=response.count if response.count else len(tickets)
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching tickets: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch tickets"
+        )
+    
+@router.get(
+    "/tickets/{ticket_id}",
+    response_model=Ticket,
+    summary="Get ticket by ID",
+    description="Retrieve a specific ticket by ID"
+)
+async def get_ticket_by_id(
+    ticket_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get specific ticket by ID"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        response = supabase.table("tickets").select("*").eq("id", ticket_id).eq("organization_id", organization_id).execute()
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Ticket with ID {ticket_id} not found"
+            )
+
+        return Ticket(**response.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching ticket {ticket_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch ticket"
+        )
+
+@router.post(
+    "/tickets",
+    response_model=Ticket,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create new ticket",
+    description="Create a new support ticket (Auto-logs creation activity)"
+)
+async def create_ticket(
+    ticket: TicketCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Create a new ticket using TicketService"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # 1. Validation Logic (Keep this here to protect data integrity)
+        # Verify chat exists
+        chat_check = supabase.table("chats").select("id").eq("id", ticket.chat_id).eq("organization_id", organization_id).execute()
+        if not chat_check.data:
+            raise HTTPException(status_code=404, detail=f"Chat {ticket.chat_id} not found")
+
+        # Verify customer exists
+        customer_check = supabase.table("customers").select("id").eq("id", ticket.customer_id).eq("organization_id", organization_id).execute()
+        if not customer_check.data:
+            raise HTTPException(status_code=404, detail=f"Customer {ticket.customer_id} not found")
+        
+        # Check for existing open tickets (Business Rule)
+        latest_ticket_response = supabase.table("tickets") \
+            .select("status") \
+            .eq("customer_id", ticket.customer_id) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if latest_ticket_response.data:
+            latest_status = latest_ticket_response.data[0]["status"]
+            if latest_status not in ["resolved", "closed"]:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Cannot create new ticket. Active ticket exists with status: {latest_status.title()}."
+                )
+
+        # 2. Execution (Delegate to Service)
+        # This handles: Ticket Number Gen -> DB Insert -> Activity Log
+        ticket_service = get_ticket_service()
+        
+        new_ticket = await ticket_service.create_ticket(
+            data=ticket,
+            organization_id=organization_id,
+            actor_id=current_user.user_id, # Log YOU as the creator
+            actor_type=ActorType.HUMAN
+        )
+
+        logger.info(f"Ticket created: {new_ticket.ticket_number} by user {current_user.user_id}")
+        return new_ticket
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating ticket: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create ticket"
+        )
+    
+@router.put(
+    "/tickets/{ticket_id}",
+    response_model=Ticket,
+    summary="Update ticket",
+    description="Update an existing ticket (Auto-logs status/priority changes)"
+)
+async def update_ticket(
+    ticket_id: str,
+    ticket_update: TicketUpdate,
+    current_user: User = Depends(get_current_user)
+):
+    """Update an existing ticket using TicketService"""
+    try:
+        # Use the Service to handle Update + Logging automatically
+        ticket_service = get_ticket_service()
+        
+        updated_ticket = await ticket_service.update_ticket(
+            ticket_id=ticket_id,
+            update_data=ticket_update,
+            actor_id=current_user.user_id,
+            actor_type=ActorType.HUMAN
+        )
+
+        return updated_ticket
+
+    except Exception as e:
+        logger.error(f"Error updating ticket {ticket_id}: {e}")
+        # Map service errors to HTTP errors
+        if "not found" in str(e).lower():
+             raise HTTPException(status_code=404, detail="Ticket not found")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update ticket: {str(e)}"
+        )
+
+@router.get(
+    "/tickets/{ticket_id}/activities",
+    response_model=List[TicketActivityResponse],
+    summary="Get ticket timeline",
+    description="Retrieve the full history of a ticket (created, updated, status changes)"
+)
+async def get_ticket_activities(
+    ticket_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get ticket history"""
+    try:
+        # Check permission (User must belong to org)
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+        
+        # Verify ticket exists
+        check = supabase.table("tickets").select("id").eq("id", ticket_id).eq("organization_id", organization_id).execute()
+        if not check.data:
+            raise HTTPException(404, "Ticket not found")
+
+        # Fetch History
+        log_service = get_ticket_service()
+        return await log_service.get_ticket_history(ticket_id)
+
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"History error: {e}")
+        raise HTTPException(500, "Failed to fetch ticket history")
+    
+# ============================================
+# ANALYTICS ENDPOINTS
+# ============================================
+
+@router.get(
+    "/analytics/dashboard",
+    response_model=DashboardMetrics,
+    summary="Get dashboard metrics",
+    description="Retrieve CRM dashboard metrics and statistics"
+)
+async def get_dashboard_metrics(
+    current_user: User = Depends(get_current_user)
+):
+    """Get dashboard metrics"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Get total chats
+        total_chats_response = supabase.table("chats").select("id", count="exact").eq("organization_id", organization_id).execute()
+        total_chats = total_chats_response.count if total_chats_response.count else 0
+
+        # Get open chats
+        open_chats_response = supabase.table("chats").select("id", count="exact").eq("organization_id", organization_id).eq("status", "open").execute()
+        open_chats = open_chats_response.count if open_chats_response.count else 0
+
+        # Get resolved today
+        today = datetime.utcnow().date().isoformat()
+        resolved_today_response = supabase.table("chats").select("id", count="exact").eq("organization_id", organization_id).eq("status", "resolved").gte("resolved_at", today).execute()
+        resolved_today = resolved_today_response.count if resolved_today_response.count else 0
+
+        # Get active agents
+        active_agents_response = supabase.table("agents").select("id", count="exact").eq("organization_id", organization_id).eq("status", "active").execute()
+        active_agents = active_agents_response.count if active_agents_response.count else 0
+
+        # Get tickets by status
+        tickets_response = supabase.table("tickets").select("status").eq("organization_id", organization_id).execute()
+
+        tickets_by_status = {
+            "open": 0,
+            "in_progress": 0,
+            "resolved": 0,
+            "closed": 0
+        }
+
+        for ticket in tickets_response.data:
+            status = ticket.get("status", "open")
+            if status in tickets_by_status:
+                tickets_by_status[status] += 1
+
+        # Calculate average response time (simplified)
+        avg_response_time = "2.5 min"  # TODO: Calculate from actual data
+
+        return DashboardMetrics(
+            total_chats=total_chats,
+            open_chats=open_chats,
+            resolved_today=resolved_today,
+            avg_response_time=avg_response_time,
+            active_agents=active_agents,
+            tickets_by_status=tickets_by_status
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching dashboard metrics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch dashboard metrics"
+        )

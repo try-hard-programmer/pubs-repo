@@ -1,0 +1,16 @@
+{
+  "negative_intents": [
+    "hi", "hello", "hey", "test", "p", "ping", "thanks", "thank you",
+    "ok", "okay", "bye", "good morning", "good night", 
+    "halo", "hallo", "pagi", "siang", "sore", "malam", "greeting"
+  ],
+  "positive_intents": [
+    "problem", "error", "help", "refund", "broken", "urgent", "crash",
+    "bug", "fail", "scam", "hack", "support", "assist", "cancel"
+  ],
+  "priority_keywords": {
+    "urgent": ["urgent", "emergency", "hack", "stuck", "critical", "blocked"],
+    "high": ["money", "billing", "payment", "fail", "charged", "refund"],
+    "medium": ["how to", "question", "guide", "info", "settings"]
+  }
+}
