@@ -247,7 +247,7 @@ class PermissionService:
         Returns:
             Tuple of (can_manage: bool, reason: str)
         """
-        return self.check_permission(user_id, file_id, "manage")
+        return self.check_permission(user_id, file_id, "delete")
 
     # =====================================================
     # HELPER METHODS
@@ -321,7 +321,6 @@ class PermissionService:
             "share": ["view", "edit", "delete", "share"],
             "manage": ["view", "edit", "delete", "share", "manage"]
         }
-
         granted_permissions = permission_hierarchy.get(granted_level, [])
         return required_permission in granted_permissions
 

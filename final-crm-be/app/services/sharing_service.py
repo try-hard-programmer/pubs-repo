@@ -32,11 +32,14 @@ class SharingService:
             settings.SUPABASE_URL,
             settings.SUPABASE_SERVICE_KEY  # ← Use service role key
         )
+        
         self.permission_service = get_permission_service(self.client)
+
 
     # =====================================================
     # USER SHARING
     # =====================================================
+
 
     def share_with_user(
         self,
@@ -70,7 +73,14 @@ class SharingService:
             if not can_share:
                 raise Exception(f"No permission to share this file: {reason}")
 
-            # 2. Get file data
+            # 2. Check Email Registered
+            resp = self.client.rpc("get_user_by_email", {"p_email": target_email}).execute()
+            rows = getattr(resp, "data", None) or []
+
+            if not rows:
+                raise Exception(f"Email not registered: {target_email}")
+
+            # 3. Get file data
             file_response = self.client.table("files")\
                 .select("*")\
                 .eq("id", file_id)\
@@ -80,16 +90,19 @@ class SharingService:
                 raise Exception("File not found")
 
             file_data = file_response.data[0]
-
-            # 3. Lookup target user by email
-            user_response = self.client.table("users")\
-                .select("id, email")\
-                .eq("email", target_email)\
+            if file_data["is_starred"]:
+                file_response = self.client.table("files")\
+                .update({"is_starred": False})\
+                .eq("id", file_id)\
                 .execute()
+            
+             # 4. Lookup target user by email
+            resp = self.client.rpc("get_user_by_email", {"p_email": target_email}).execute()
+            rows = getattr(resp, "data", None) or []
+            target_user_id = rows[0]["id"] if rows else None
 
-            target_user_id = user_response.data[0]["id"] if user_response.data else None
 
-            # 4. Check if share already exists
+            # 5. Check if share already exists
             existing_share = self.client.table("file_shares")\
                 .select("*")\
                 .eq("file_id", file_id)\
@@ -114,7 +127,7 @@ class SharingService:
                 logger.info(f"✅ Updated share: {share_id}")
                 return response.data[0]
 
-            # 5. Create new share
+            # 6. Create new share
             share_data = {
                 "id": str(uuid4()),
                 "file_id": file_id,
@@ -555,7 +568,26 @@ class SharingService:
         try:
             # Get shares by user_id or email
             response = self.client.table("file_shares")\
-                .select("*, files(*)")\
+                .select("""
+                id,
+                file_id,
+                shared_by,
+                shared_with_user_id,
+                shared_with_email,
+                share_type,
+                share_token,
+                access_level,
+                expires_at,
+                created_at,
+                updated_at,
+                metadata,
+                file:files (
+                    id, name, organization_id, user_id, folder_id, parent_path, storage_path,
+                    size, mime_type, extension, is_folder, is_trashed, is_starred,
+                    embedding_status, embedded_at, embedding_error, file_version,
+                    created_at, updated_at, created_by, updated_by, metadata
+                )
+                """)\
                 .or_(f"shared_with_user_id.eq.{user_id},shared_with_email.eq.{user_email}")\
                 .order("created_at", desc=True)\
                 .execute()

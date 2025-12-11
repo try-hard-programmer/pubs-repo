@@ -19,6 +19,7 @@ from unstructured.partition.html import partition_html
 from unstructured.partition.text import partition_text
 from unstructured.partition.md import partition_md
 from unstructured.partition.pptx import partition_pptx
+from unstructured.partition.ppt import partition_ppt
 from unstructured.documents.elements import Text, Element
 
 from app.config import settings
@@ -120,8 +121,10 @@ class DocumentProcessor:
                 return partition_md(file=fobj)
             elif ext in ("txt", "log"):
                 return partition_text(file=fobj)
-            elif ext in ("pptx", "ppt"):
+            elif ext == "pptx":
                 return partition_pptx(file=fobj)
+            elif ext == "ppt":
+                return partition_ppt(file=fobj)
             else:
                 # Auto-detect for unknown file types
                 with tempfile.NamedTemporaryFile(delete=True, suffix=f".{ext}") as tmp:

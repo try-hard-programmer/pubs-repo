@@ -386,19 +386,20 @@ class StorageService:
             bucket_name = self._get_bucket_name(organization_id)
             old_path = self._get_storage_path(file_id, old_folder_path)
             new_path = self._get_storage_path(file_id, new_folder_path)
+            # # Download file
+            # file_content = self.download_file(organization_id, file_id, old_folder_path)
 
-            # Download file
-            file_content = self.download_file(organization_id, file_id, old_folder_path)
+            # # Upload to new location
+            # self.client.storage.from_(bucket_name).upload(
+            #     path=new_path,
+            #     file=file_content,
+            #     file_options={"upsert": "true"}
+            # )
 
-            # Upload to new location
-            self.client.storage.from_(bucket_name).upload(
-                path=new_path,
-                file=file_content,
-                file_options={"upsert": "true"}
-            )
+            # # Delete old file
+            # self.client.storage.from_(bucket_name).remove([old_path])
 
-            # Delete old file
-            self.client.storage.from_(bucket_name).remove([old_path])
+            self.client.storage.from_(bucket_name).move(old_path, new_path);
 
             logger.info(f"✅ Moved file in storage: {old_path} → {new_path}")
 

@@ -10,6 +10,7 @@ import logging
 from app.models import DeleteItem, Item
 from app.models.user import User
 from app.services import ChromaDBService, DocumentProcessor, OpenAIService
+from app.services.file_manager_service import get_file_manager_service
 from app.services.storage_service import get_storage_service
 from app.services.organization_service import get_organization_service
 from app.utils import (
@@ -241,8 +242,13 @@ async def query_documents(
 
     # Extract unique file IDs
     file_ids = chromadb_service.extract_unique_file_ids(metadatas)
-
     logger.info(f"Found {len(file_ids)} unique files in org_{organization_id}")
+
+    fm_service = get_file_manager_service()
+    result = fm_service._search_file(item.query, organization_id)
+    
+    file_ids_from_search = [file['id'] for file in result.data]
+    file_ids.update(file_ids_from_search)
 
     return {
         "file_id": list(file_ids),
@@ -262,6 +268,7 @@ def list_collection_items(
     """
     List items from a ChromaDB collection
     """
+    chromadb_service = ChromaDBService()
     return chromadb_service.get_collection_items(
         name=name,
         limit=limit,

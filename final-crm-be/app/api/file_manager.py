@@ -191,12 +191,10 @@ async def get_folder(
         # Get folder
         from supabase import create_client
         from app.config import settings
-        client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-
+        client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
         response = client.table("files")\
             .select("*")\
             .eq("id", folder_id)\
-            .eq("is_folder", True)\
             .execute()
 
         if not response.data:
@@ -204,6 +202,28 @@ async def get_folder(
 
         # Add URL (will be None for folders)
         folder_data = _add_file_url(response.data[0])
+
+        children_response = client.table("files")\
+            .select("*", count="exact")\
+            .eq("folder_id", folder_id)\
+            .eq("is_folder", False)\
+            .execute()
+        # Gunakan response.count bukan len(response.data)
+        children_count = children_response.count if children_response.count is not None else 0
+
+        folder_children_response = client.table("files")\
+            .select("*", count="exact")\
+            .eq("folder_id", folder_id)\
+            .eq("is_folder", True)\
+            .execute()
+        # ✅ PENTING: Gunakan folder_children_response, bukan folder_children_count
+        folder_children_count = folder_children_response.count if folder_children_response.count is not None else 0
+
+        has_subfolders = folder_children_count > 0
+
+        folder_data["children_count"] = children_count
+        folder_data["folder_children_count"] = folder_children_count
+        folder_data["has_subfolders"] = has_subfolders
 
         return FolderResponse(**folder_data)
 
@@ -361,6 +381,57 @@ async def delete_folder(
         raise
     except Exception as e:
         logger.error(f"Failed to delete folder: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/folders/{folder_id}/restore")
+async def restore_folder(
+    folder_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Restore folder from trash (cascade restore all children)
+
+    **Permissions Required:** edit
+
+    **Returns:**
+    - Restore result with statistics (restored_files count)
+    """
+    logger.info(f"Restore folder {folder_id} by {current_user.email}")
+
+    try:
+        # Check permission
+        perm_service = get_permission_service()
+        has_perm, reason = perm_service.check_permission(
+            current_user.user_id,
+            folder_id,
+            "edit"
+        )
+
+        if not has_perm:
+            raise HTTPException(status_code=403, detail=f"Access denied: {reason}")
+
+        # Get organization
+        from app.services.organization_service import get_organization_service
+        org_service = get_organization_service()
+        user_org = await org_service.get_user_organization(current_user.user_id)
+
+        if not user_org:
+            raise HTTPException(status_code=400, detail="User must belong to an organization")
+
+        # Restore folder
+        fm_service = get_file_manager_service()
+        result = fm_service.restore_folder(
+            folder_id=folder_id,
+            user_id=current_user.user_id,
+            organization_id=user_org.id
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to restore folder: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -583,6 +654,62 @@ async def download_file(
         logger.error(f"Failed to download file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.put("/files/{file_id}/favorite")
+async def favorite_file(
+    file_id: str,
+    is_starred: bool = Query(False, description="True to star, False to unstar"),  # Dari query
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Toggle star/favorite status of a file
+    
+    Mark or unmark a file as starred/favorite for quick access.
+    
+    **Permissions Required:** read/write
+    
+    **Args:**
+    - file_id: ID of the file to star/unstar
+    - star: True to mark as favorite, False to remove from favorites
+    
+    **Returns:**
+    - Updated file object with new star status
+    """
+
+    logger.info(f"Update file {file_id} (star ={is_starred}) by {current_user.email}")
+    try:
+        # Check permission
+        perm_service = get_permission_service()
+        has_perm, reason = perm_service.check_permission(
+            current_user.user_id,
+            file_id,
+            "edit"
+        )
+        if not has_perm:
+            raise HTTPException(status_code=403, detail=f"Access denied: {reason}")
+        
+        # Get organization
+        from app.services.organization_service import get_organization_service
+        org_service = get_organization_service()
+        user_org = await org_service.get_user_organization(current_user.user_id)
+
+        if not user_org:
+            raise HTTPException(status_code=400, detail="User must belong to an organization")
+        
+        # Delete file
+        fm_service = get_file_manager_service()
+        result = fm_service.favorite_file(
+            file_id=file_id,
+            user_id=current_user.user_id,
+            is_starred=is_starred
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to star file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.put("/files/{file_id}", response_model=FileResponse)
 async def update_file(
@@ -598,7 +725,6 @@ async def update_file(
     **Note:** Use separate endpoint to update file content
     """
     logger.info(f"Update file {file_id} by {current_user.email}")
-
     try:
         # Check permission
         perm_service = get_permission_service()
@@ -799,56 +925,6 @@ async def restore_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/folders/{folder_id}/restore")
-async def restore_folder(
-    folder_id: str,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Restore folder from trash (cascade restore all children)
-
-    **Permissions Required:** edit
-
-    **Returns:**
-    - Restore result with statistics (restored_files count)
-    """
-    logger.info(f"Restore folder {folder_id} by {current_user.email}")
-
-    try:
-        # Check permission
-        perm_service = get_permission_service()
-        has_perm, reason = perm_service.check_permission(
-            current_user.user_id,
-            folder_id,
-            "edit"
-        )
-
-        if not has_perm:
-            raise HTTPException(status_code=403, detail=f"Access denied: {reason}")
-
-        # Get organization
-        from app.services.organization_service import get_organization_service
-        org_service = get_organization_service()
-        user_org = await org_service.get_user_organization(current_user.user_id)
-
-        if not user_org:
-            raise HTTPException(status_code=400, detail="User must belong to an organization")
-
-        # Restore folder
-        fm_service = get_file_manager_service()
-        result = fm_service.restore_folder(
-            folder_id=folder_id,
-            user_id=current_user.user_id,
-            organization_id=user_org.id
-        )
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to restore folder: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =====================================================
@@ -881,11 +957,10 @@ async def create_share(
     - Created share data
     """
     logger.info(f"Create share by {current_user.email}")
-
     try:
         sharing_service = get_sharing_service()
 
-        if share_data.share_type == "user":
+        if share_data.share_type.value == "user":
             # Share with user
             share = sharing_service.share_with_user(
                 file_id=share_data.file_id,
@@ -1042,8 +1117,27 @@ async def list_shares(
                 current_user.user_id,
                 current_user.email
             )
+        shares_with_urls = []
+        for s in shares:
+            # Pastikan berbentuk dict agar mudah dimodifikasi
+            s_dict = s.copy() if isinstance(s, dict) else s.__dict__.copy()
 
-        return [ShareResponse(**s) for s in shares]
+            # Tambahkan URL ke dalam field file
+            file_data = s_dict.get("file", {})
+            if file_data:
+                url_data = _add_file_url(file_data)
+                # Jika fungsi mengembalikan dict, ambil nilai URL-nya
+                if isinstance(url_data, dict):
+                    file_data["url"] = url_data.get("url")
+                else:
+                    file_data["url"] = url_data
+                s_dict["file"] = file_data
+
+            shares_with_urls.append(s_dict)
+
+        # Konversi hasil ke ShareResponse
+        result = [ShareResponse(**s) for s in shares_with_urls]
+        return result
 
     except Exception as e:
         logger.error(f"Failed to list shares: {e}")
@@ -1064,6 +1158,7 @@ async def update_share(
     **Returns:**
     - Updated share data
     """
+    print(share_id,share_data)
     logger.info(f"Update share {share_id} by {current_user.email}")
 
     try:
@@ -1121,6 +1216,7 @@ async def revoke_share(
 @router.get("/browse", response_model=BrowseResponse)
 async def browse_folder(
     folder_id: Optional[str] = Query(None, description="Folder ID (null for root)"),
+    is_starred: Optional[bool] = Query(None, description="Filter by starred status: false=non-starred, true=starred only, null=all"),
     is_trashed: Optional[bool] = Query(False, description="Filter by trash status: false=non-trash, true=trash only, null=all"),
     sort_by: str = Query("name", description="Sort field"),
     sort_order: str = Query("asc", description="Sort order"),
@@ -1141,7 +1237,6 @@ async def browse_folder(
     - asc, desc
     """
     logger.info(f"Browse folder {folder_id} by {current_user.email}")
-
     try:
         # Get organization
         from app.services.organization_service import get_organization_service
@@ -1159,13 +1254,24 @@ async def browse_folder(
         query = client.table("files")\
             .select("*", count="exact")\
             .eq("organization_id", user_org.id)
-
+            
         # Filter by trash status first
         # is_trashed=False (default): show non-trashed items
         # is_trashed=True: show only trashed items
         # is_trashed=None: show all items (no filter)
         if is_trashed is not None:
             query = query.eq("is_trashed", is_trashed)
+            if folder_id :
+                query = query.eq("folder_id", folder_id)
+            # else:
+            #     query = query.is_("folder_id", "null")
+
+        # Filter by starred status
+        # is_trashed=False (default): show non-trashed items
+        # is_trashed=True: show only trashed items
+        # is_trashed=None: show all items (no filter)
+        if is_starred is not None:
+            query = query.eq("is_starred", is_starred)
 
         # Only apply folder filter when NOT showing trash
         # When showing trash (is_trashed=true), show ALL trashed files regardless of folder
@@ -1189,6 +1295,28 @@ async def browse_folder(
         total_items = response.count if hasattr(response, 'count') else len(response.data)
         total_pages = math.ceil(total_items / page_size)
 
+        # Filter item parent pada list
+        list_ids = {item["id"] for item in response.data}
+
+        filtered_items = []
+        for item in response.data:
+            parent_id = item.get("folder_id")
+
+            # jika tidak punya parent → tampilkan
+            if parent_id is None:
+                filtered_items.append(item)
+                continue
+
+            # jika parent_id ADA di list_ids → jangan tampilkan
+            if parent_id in list_ids:
+                continue
+
+            # jika parent_id tidak ada di list → tampilkan
+            filtered_items.append(item)
+
+        # replace hasil query
+        response.data = filtered_items
+
         # Get folder path
         folder_path = "/"
         if folder_id:
@@ -1205,15 +1333,56 @@ async def browse_folder(
 
         # Add signed URLs to items
         items_with_urls = [_add_file_url(item) for item in response.data]
+         # === Ambil file_id untuk query file_shares ===
+        file_ids = [item["id"] for item in items_with_urls]
 
-        return BrowseResponse(
+        shared_lookup = {}
+        if file_ids:
+            shared_response = (
+                client.table("file_shares")
+                .select("*")
+                .in_("file_id", file_ids)
+                .eq("shared_by", current_user.user_id)
+                .order("share_type", desc=True)
+                .execute()
+            )
+
+            shared_data = shared_response.data or []
+
+            # Grouping berdasarkan file_id
+            for share in shared_data:
+                fid = share["file_id"]
+                if fid not in shared_lookup:
+                    shared_lookup[fid] = []
+                shared_lookup[fid].append(share)
+
+        # === Gabungkan hasil share ke setiap file ===
+        enriched_items = []
+        for item in items_with_urls:
+            fid = item["id"]
+            file_shares = shared_lookup.get(fid, [])
+            item["is_shared"] = len(file_shares) > 0
+            item["shared"] = file_shares if file_shares else None
+            enriched_items.append(item)
+        print(BrowseResponse(
             folder_id=folder_id,
             folder_path=folder_path,
-            items=[FileResponse(**item) for item in items_with_urls],
+            items=[FileResponse(**item) for item in enriched_items],
             total_items=total_items,
             page=page,
             page_size=page_size,
-            total_pages=total_pages
+            total_pages=total_pages,
+        ))
+
+        # === Return final result ===
+        return BrowseResponse(
+            folder_id=folder_id,
+            folder_path=folder_path,
+            items=[FileResponse(**item) for item in enriched_items],
+            total_items=total_items,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
         )
 
     except HTTPException:

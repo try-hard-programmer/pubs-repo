@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone  # Updated import
 from typing import Optional, List, Dict, Any
 
 from supabase import create_client
@@ -15,6 +15,7 @@ from app.models.ticket import (
 )
 from app.agents.agent_registry import AgentRegistry
 from app.agents.ticket_guard_agent import TicketGuardAgent
+from app.services.websocket_service import get_connection_manager
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,8 @@ class TicketService:
             logger.warning(f"⚠️ Could not load ticket rules: {e}")
         return FALLBACK_RULES
 
-    async def evaluate_incoming_message(self, message: str, customer_name: str = "Customer") -> TicketDecision:
+    # [FIX] Added message_count argument to match the caller in webhook.py
+    async def evaluate_incoming_message(self, message: str, customer_name: str = "Customer", message_count: int = 0) -> TicketDecision:
         # --- LAYER 1: FAST GUARD (Local Regex) ---
         clean_msg = message.strip().lower()
         clean_msg_alpha = re.sub(r'[^\w\s]', '', clean_msg)
@@ -55,16 +57,20 @@ class TicketService:
         is_greeting = clean_msg_alpha in negative_keywords
         is_short_spam = len(clean_msg_alpha) < 4 and clean_msg_alpha in ["p", "y", "yo", "tes", "test", "cek", "info"]
 
-        if is_greeting or is_short_spam:
-            logger.info(f"⚠️ Fast Guard detected greeting: '{clean_msg}'. Creating LOW priority ticket.")
-            
-            return TicketDecision(
-                should_create_ticket=True, 
-                reason="Initial Greeting (Fast Guard)",
-                suggested_priority=TicketPriority.LOW,
-                suggested_category="other",
-                auto_reply_hint=f"Hello {customer_name}! 👋\nI have received your message and opened a support ticket for you.\n\nPlease describe your issue in detail so I can assist you better."
-            )
+        # Only trigger greeting guard if it's the start of a conversation (low message count)
+        if (is_greeting or is_short_spam):
+            if message_count > 5:
+                logger.info(f"ℹ️ Greeting detected but message_count is {message_count}. treating as normal.")
+            else:
+                logger.info(f"⚠️ Fast Guard detected greeting: '{clean_msg}'. Creating LOW priority ticket.")
+                
+                return TicketDecision(
+                    should_create_ticket=True, 
+                    reason="Initial Greeting (Fast Guard)",
+                    suggested_priority=TicketPriority.LOW,
+                    suggested_category="other",
+                    auto_reply_hint=f"Hello {customer_name}! 👋\nI have received your message and opened a support ticket for you.\n\nPlease describe your issue in detail so I can assist you better."
+                )
 
         # --- LAYER 2: SMART GUARD (Agent) ---
         try:
@@ -82,9 +88,8 @@ class TicketService:
             return TicketDecision(
                 should_create_ticket=True, 
                 reason="Agent Error (Fallback)", 
-                suggested_priority=TicketPriority.LOW # Forced Low Priority on Error
+                suggested_priority=TicketPriority.LOW 
             )
-
     def _clean_json_string(self, text: str) -> str:
         text = text.strip()
         if text.startswith("```"):
@@ -102,23 +107,26 @@ class TicketService:
                 "human_actor_id": actor_id if actor_type == ActorType.HUMAN else None,
                 "ai_actor_id": actor_id if actor_type == ActorType.AI else None,
                 "metadata": metadata,
-                "created_at": datetime.utcnow().isoformat()
+                # [FIX] Use timezone-aware UTC
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
             self.supabase.table("ticket_activities").insert(data).execute()
         except Exception as e:
             logger.error(f"Failed to log activity: {e}")
 
     async def create_ticket(self, data: TicketCreate, organization_id: str, actor_id: Optional[str], actor_type: ActorType) -> Ticket:
+        # [FIX] Use timezone-aware timestamp
         num_res = self.supabase.rpc("generate_ticket_number", {"prefix": "TKT-"}).execute()
-        ticket_num = num_res.data or f"TKT-{int(datetime.utcnow().timestamp())}"
+        ticket_num = num_res.data or f"TKT-{int(datetime.now(timezone.utc).timestamp())}"
 
         payload = data.model_dump()
         payload.update({
             "organization_id": organization_id,
             "ticket_number": ticket_num,
             "status": TicketStatus.OPEN,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
+            # [FIX] Use timezone-aware UTC
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
         })
 
         res = self.supabase.table("tickets").insert(payload).execute()
@@ -132,6 +140,23 @@ class TicketService:
             actor_id=actor_id, 
             actor_type=actor_type
         )
+
+        try:
+            conn = get_connection_manager()
+            await conn.broadcast_chat_update(
+                organization_id=organization_id,
+                chat_id=new_ticket.chat_id,
+                update_type="ticket_created",  
+                data={
+                    "ticket_id": new_ticket.id,
+                    "ticket_number": new_ticket.ticket_number,
+                    "status": new_ticket.status,
+                    "priority": new_ticket.priority
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to broadcast ticket creation: {e}")
+
         return new_ticket
     
     async def update_ticket(self, ticket_id: str, update_data: TicketUpdate, actor_id: str, actor_type: ActorType = ActorType.HUMAN) -> Ticket:
@@ -143,13 +168,14 @@ class TicketService:
 
         # 2. Prepare Update Payload
         payload = update_data.model_dump(exclude_unset=True)
-        payload["updated_at"] = datetime.utcnow().isoformat()
+        # [FIX] Use timezone-aware UTC
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         
         # Auto-timestamps
         if payload.get("status") == TicketStatus.RESOLVED:
-            payload["resolved_at"] = datetime.utcnow().isoformat()
+            payload["resolved_at"] = datetime.now(timezone.utc).isoformat()
         elif payload.get("status") == TicketStatus.CLOSED:
-            payload["closed_at"] = datetime.utcnow().isoformat()
+            payload["closed_at"] = datetime.now(timezone.utc).isoformat()
 
         # 3. Perform Update
         res = self.supabase.table("tickets").update(payload).eq("id", ticket_id).execute()
@@ -158,7 +184,7 @@ class TicketService:
         
         updated_ticket = res.data[0]
 
-        # 4. 🔥 COMPARE & LOG (The Logic You Were Missing) 🔥
+        # 4. Compare & Log
         
         # Check Status Change
         if payload.get("status") and payload["status"] != old_ticket["status"]:
@@ -207,6 +233,6 @@ class TicketService:
             
         return [TicketActivityResponse(**l) for l in resolved_logs]
 
-# Singleton
+# Singleton instance
 _ticket_service = TicketService()
 def get_ticket_service(): return _ticket_service

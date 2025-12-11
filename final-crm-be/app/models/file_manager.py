@@ -130,6 +130,18 @@ class FolderResponse(BaseModel):
     updated_by: Optional[str]
     metadata: Optional[Dict[str, Any]]
     url: Optional[str] = Field(None, description="URL for folder (null for folders)")
+    children_count: int = Field(
+        default=0,
+        description="Total number of files inside this folder"
+    )
+    folder_children_count: int = Field(
+        default=0,
+        description="Total number of subfolders inside this folder"
+    )
+    has_subfolders: bool = Field(
+        default=False,
+        description="Whether folder contains subfolders"
+    )
 
     class Config:
         from_attributes = True
@@ -165,6 +177,19 @@ class FileMove(BaseModel):
     """Request model for moving a file"""
     new_parent_folder_id: Optional[str] = Field(None, description="New parent folder ID (null for root)")
 
+class FileShare(BaseModel):
+    id: str
+    file_id: str
+    shared_by: str
+    shared_with_user_id: Optional[str]
+    shared_with_email: Optional[str]
+    share_type: str
+    share_token: Optional[str]
+    access_level: str
+    expires_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    metadata: Optional[Dict[str, Any]]
 
 class FileResponse(BaseModel):
     """Response model for file data"""
@@ -180,6 +205,8 @@ class FileResponse(BaseModel):
     extension: Optional[str]
     is_folder: bool = False
     is_trashed: bool
+    is_starred: bool
+    is_shared: bool
     embedding_status: Optional[str]
     embedded_at: Optional[datetime]
     embedding_error: Optional[str]
@@ -190,7 +217,8 @@ class FileResponse(BaseModel):
     updated_by: Optional[str]
     metadata: Optional[Dict[str, Any]]
     url: Optional[str] = Field(None, description="Signed URL for file download/preview (valid for 1 hour)")
-
+    is_shared: bool = False
+    shared: Optional[List[FileShare]] = None
     class Config:
         from_attributes = True
         populate_by_name = True  # Allow both names
@@ -287,6 +315,17 @@ class ShareUpdate(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(None, description="Updated metadata")
 
 
+class FileMinimal(BaseModel):
+    id: str
+    name: str
+    mime_type: Optional[str] = None
+    size: Optional[int] = None
+    storage_path: Optional[str] = None
+    parent_path: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 class ShareResponse(BaseModel):
     """Response model for share data"""
     id: str
@@ -301,7 +340,11 @@ class ShareResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     metadata: Optional[Dict[str, Any]]
-
+    file: Optional[FileResponse] = Field(
+        default=None,
+        validation_alias="file",         # ambil dari key "file"
+        serialization_alias="file",      # keluarkan sebagai "file"
+    )
     class Config:
         from_attributes = True
 

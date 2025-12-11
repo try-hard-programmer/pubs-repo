@@ -6,6 +6,7 @@ import logging
 import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+from app.services.websocket_service import get_connection_manager
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,28 @@ class AIResponseService:
                 .update({"last_message_at": datetime.utcnow().isoformat()}) \
                 .eq("id", chat_id) \
                 .execute()
+                    
+            # [FIX] BROADCAST TO WEBSOCKET
+            try:
+                from app.services.websocket_service import get_connection_manager
+                conn = get_connection_manager()
+                
+                await conn.broadcast_new_message(
+                    organization_id=chat.get("organization_id"),
+                    chat_id=chat_id,
+                    message_id=ai_message_id,
+                    customer_id=chat.get("customer_id"),
+                    customer_name="AI Agent",
+                    message_content=ai_response,
+                    channel=chat.get("channel"),
+                    handled_by=chat.get("handled_by"),
+                    sender_type="ai",
+                    sender_id=chat.get("ai_agent_id") or "ai_agent",
+                    is_new_chat=False,
+                    was_reopened=False
+                )
+            except Exception as ws_error:
+                logger.warning(f"⚠️ WebSocket broadcast failed: {ws_error}")
 
             # Step 6: Trigger webhook callback (async, non-blocking)
             webhook_triggered = False

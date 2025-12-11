@@ -54,7 +54,7 @@ class TicketGuardAgent(BaseAgent):
         **LOGIC:**
         1. If message is greeting/spam/vague -> should_create_ticket = false.
         2. If message has actionable intent -> should_create_ticket = true.
-        3. Determine priority based on keywords (default: medium).
+        3. Determine priority based on keywords (default: low).  
         4. Categorize the issue (e.g., billing, technical, inquiry).
 
         **OUTPUT FORMAT:**

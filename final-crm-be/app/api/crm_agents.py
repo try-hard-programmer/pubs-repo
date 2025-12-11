@@ -8,7 +8,7 @@ Includes CRUD operations for agents, settings, integrations, and knowledge docum
 from fastapi import APIRouter, HTTPException, Query, Depends, status, UploadFile
 from typing import Optional, List
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.models.agent import (
 	Agent, AgentCreate, AgentUpdate, AgentStatusUpdate, AgentListResponse,
@@ -63,58 +63,44 @@ def get_supabase_client():
 # ============================================
 
 @router.get(
-	"/",
-	response_model=AgentListResponse,
-	summary="Get all agents",
-	description="Retrieve all agents for the user's organization with optional filtering"
+    "/",
+    response_model=AgentListResponse,
+    summary="Get all agents",
+    description="Retrieve agents. Hides 'Deleted' agents (Inactive + No User ID). Shows 'Offline' agents (Inactive + Has User ID)."
 )
 async def get_agents(
-		status_filter: Optional[AgentStatus] = Query(None, description="Filter by agent status"),
-		search: Optional[str] = Query(None, description="Search by name or email"),
-		current_user: User = Depends(get_current_user)
+    status_filter: Optional[AgentStatus] = Query(None, description="Filter by agent status"),
+    search: Optional[str] = Query(None, description="Search by name or email"),
+    show_deleted: bool = Query(False, description="Include deleted agents"),
+    current_user: User = Depends(get_current_user)
 ):
-	"""
-	Get all agents for organization.
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
 
-	Supports filtering by status and searching by name/email.
-	"""
-	try:
-		organization_id = await get_user_organization_id(current_user)
-		supabase = get_supabase_client()
+        query = supabase.table("agents").select("*", count="exact").eq("organization_id", organization_id)
 
-		# Build query
-		query = supabase.table("agents").select("*").eq("organization_id", organization_id)
+        if status_filter:
+            query = query.eq("status", status_filter.value)
+        
+        elif not show_deleted:
+            query = query.or_("status.neq.inactive,user_id.not.is.null")
 
-		# Apply filters
-		if status_filter:
-			query = query.eq("status", status_filter.value)
+        if search:
+            query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
 
-		if search:
-			# Search in name or email
-			query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
+        response = query.order("created_at", desc=True).execute()
 
-		# Order by created_at descending
-		query = query.order("created_at", desc=True)
+        agents = [Agent(**agent) for agent in response.data]
 
-		# Execute query
-		response = query.execute()
+        return AgentListResponse(
+            agents=agents,
+            total=response.count or len(agents)
+        )
 
-		agents = [Agent(**agent) for agent in response.data]
-
-		return AgentListResponse(
-			agents=agents,
-			total=len(agents)
-		)
-
-	except HTTPException:
-		raise
-	except Exception as e:
-		logger.error(f"Error fetching agents: {e}")
-		raise HTTPException(
-			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail="Failed to fetch agents"
-		)
-
+    except Exception as e:
+        logger.error(f"Error fetching agents: {e}")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to fetch agents")
 
 @router.get(
 	"/{agent_id}",
@@ -151,158 +137,219 @@ async def get_agent(
 			detail="Failed to fetch agent"
 		)
 
-
 @router.post(
-	"/",
-	response_model=Agent,
-	status_code=status.HTTP_201_CREATED,
-	summary="Create new agent",
-	description="Create a new agent in the organization"
+    "/",
+    response_model=Agent,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create new agent",
+    description="Create or reactivate an agent. Preserves existing User ID if not provided."
 )
 async def create_agent(
-		agent: AgentCreate,
-		current_user: User = Depends(get_current_user)
+    agent: AgentCreate,
+    current_user: User = Depends(get_current_user)
 ):
-	"""Create a new agent"""
-	try:
-		organization_id = await get_user_organization_id(current_user)
-		supabase = get_supabase_client()
+    """Create a new agent or reactivate an existing inactive one"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
 
-		# Check if email already exists in organization
-		existing = supabase.table("agents").select("id").eq("organization_id", organization_id).eq("email",
-		                                                                                           agent.email).execute()
+        # 1. Fetch potential conflicts (Email OR Phone)
+        conflicts = supabase.table("agents") \
+            .select("id, status, email, phone, user_id") \
+            .eq("organization_id", organization_id) \
+            .or_(f"email.eq.{agent.email},phone.eq.{agent.phone}") \
+            .execute()
 
-		if existing.data:
-			raise HTTPException(
-				status_code=status.HTTP_400_BAD_REQUEST,
-				detail=f"Agent with email {agent.email} already exists in this organization"
-			)
+        existing_by_email = None
+        existing_by_phone = None
 
-		# Prepare agent data
-		agent_data = {
-			"organization_id": organization_id,
-			"name": agent.name,
-			"email": agent.email,
-			"phone": agent.phone,
-			"status": agent.status.value,
-			"avatar_url": agent.avatar_url,
-			"user_id": agent.user_id,
-			"assigned_chats_count": 0,
-			"resolved_today_count": 0,
-			"avg_response_time_seconds": 0,
-			"last_active_at": datetime.utcnow().isoformat(),
-		}
+        if conflicts.data:
+            for record in conflicts.data:
+                if record["email"] == agent.email:
+                    existing_by_email = record
+                if record["phone"] == agent.phone:
+                    existing_by_phone = record
 
-		# Insert agent
-		response = supabase.table("agents").insert(agent_data).execute()
+        # --- VALIDATION LOGIC ---
 
-		if not response.data:
-			raise HTTPException(
-				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-				detail="Failed to create agent"
-			)
+        # Case A: Email Match Found (Reactivation Scenario)
+        if existing_by_email:
+            # 1. If Email holder is ACTIVE -> Block
+            if existing_by_email["status"] != "inactive":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Agent with email {agent.email} is already active."
+                )
+            
+            # 2. Check Phone Conflict (if phone belongs to a DIFFERENT agent)
+            if existing_by_phone and existing_by_phone["id"] != existing_by_email["id"]:
+                if existing_by_phone["status"] != "inactive":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Phone number {agent.phone} is currently used by an ACTIVE agent."
+                    )
+                else:
+                    logger.info(f"♻️ Reclaiming phone {agent.phone} from inactive agent {existing_by_phone['id']}")
 
-		created_agent = Agent(**response.data[0])
+            # 3. Reactivate
+            logger.info(f"♻️ Reactivating inactive agent: {existing_by_email['id']}")
+            
+            # [FIXED LOGIC STARTS HERE]
+            reactivate_data = {
+                "status": "active",
+                "name": agent.name,
+                "phone": agent.phone, 
+                "avatar_url": agent.avatar_url,
+                "last_active_at": datetime.now(timezone.utc).isoformat()
+            }
 
-		# Create default agent settings
-		try:
-			settings_data = {
-				"agent_id": created_agent.id,
-				"persona_config": {},
-				"schedule_config": {},
-				"advanced_config": {},
-				"ticketing_config": {}
-			}
-			supabase.table("agent_settings").insert(settings_data).execute()
-		except Exception as e:
-			logger.warning(f"Failed to create default settings for agent {created_agent.id}: {e}")
+            # Only overwrite user_id if the FE explicitly sent a new one.
+            # If agent.user_id is None, we KEEP the existing link from the DB.
+            if agent.user_id is not None:
+                reactivate_data["user_id"] = agent.user_id
+            
+            response = supabase.table("agents") \
+                .update(reactivate_data) \
+                .eq("id", existing_by_email["id"]) \
+                .execute()
+                
+            if not response.data:
+                raise HTTPException(500, "Failed to reactivate agent")
+            return Agent(**response.data[0])
 
-		logger.info(f"Agent created: {created_agent.id} by user {current_user.user_id}")
+        # Case B: New Email, but Phone Exists (New Agent Scenario)
+        if existing_by_phone:
+            if existing_by_phone["status"] != "inactive":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Phone number {agent.phone} is currently used by an ACTIVE agent."
+                )
+            else:
+                logger.info(f"♻️ Reusing phone {agent.phone} from inactive agent {existing_by_phone['id']}")
 
-		return created_agent
+        # Case C: Clean Slate -> Create New Agent
+        # Note: If creating a NEW agent, user_id MUST be sent by FE if you want it linked.
+        agent_data = {
+            "organization_id": organization_id,
+            "name": agent.name,
+            "email": agent.email,
+            "phone": agent.phone,
+            "status": agent.status.value,
+            "avatar_url": agent.avatar_url,
+            "user_id": agent.user_id, # If None here, it will be NULL in DB (Correct for new agent)
+            "assigned_chats_count": 0,
+            "resolved_today_count": 0,
+            "avg_response_time_seconds": 0,
+            "last_active_at": datetime.now(timezone.utc).isoformat(),
+        }
 
-	except HTTPException:
-		raise
-	except Exception as e:
-		logger.error(f"Error creating agent: {e}")
-		raise HTTPException(
-			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail="Failed to create agent"
-		)
+        response = supabase.table("agents").insert(agent_data).execute()
 
+        if not response.data:
+            raise HTTPException(500, "Failed to create agent")
+
+        created_agent = Agent(**response.data[0])
+
+        # Create default settings
+        try:
+            settings_data = {
+                "agent_id": created_agent.id,
+                "persona_config": {},
+                "schedule_config": {},
+                "advanced_config": {},
+                "ticketing_config": {}
+            }
+            supabase.table("agent_settings").insert(settings_data).execute()
+        except Exception as e:
+            logger.warning(f"Failed to create settings: {e}")
+
+        logger.info(f"Agent created: {created_agent.id}")
+        return created_agent
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating agent: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create agent"
+        )
 
 @router.put(
-	"/{agent_id}",
-	response_model=Agent,
-	summary="Update agent",
-	description="Update an existing agent's information"
+    "/{agent_id}",
+    response_model=Agent,
+    summary="Update agent",
+    description="Update agent. Allows taking Phone/Email from INACTIVE agents."
 )
 async def update_agent(
-		agent_id: str,
-		agent_update: AgentUpdate,
-		current_user: User = Depends(get_current_user)
+    agent_id: str,
+    agent_update: AgentUpdate,
+    current_user: User = Depends(get_current_user)
 ):
-	"""Update an existing agent"""
-	try:
-		organization_id = await get_user_organization_id(current_user)
-		supabase = get_supabase_client()
+    """Update an existing agent"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
 
-		# Check if agent exists
-		existing = supabase.table("agents").select("*").eq("id", agent_id).eq("organization_id",
-		                                                                      organization_id).execute()
+        # 1. Verify agent exists
+        existing = supabase.table("agents").select("*").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not existing.data:
+            raise HTTPException(404, detail="Agent not found")
 
-		if not existing.data:
-			raise HTTPException(
-				status_code=status.HTTP_404_NOT_FOUND,
-				detail=f"Agent with ID {agent_id} not found"
-			)
+        update_data = agent_update.model_dump(exclude_unset=True)
+        if "status" in update_data and update_data["status"]:
+            update_data["status"] = update_data["status"].value
 
-		# Prepare update data (only include fields that were provided)
-		update_data = agent_update.model_dump(exclude_unset=True)
+        if not update_data:
+            return Agent(**existing.data[0])
 
-		# Convert enum to value if status is being updated
-		if "status" in update_data and update_data["status"]:
-			update_data["status"] = update_data["status"].value
+        # 2. UNIQUENESS CHECK (Ignore Inactive Agents)
+        check_email = update_data.get("email")
+        check_phone = update_data.get("phone")
 
-		if not update_data:
-			# No fields to update
-			return Agent(**existing.data[0])
+        if check_email or check_phone:
+            or_conditions = []
+            if check_email: or_conditions.append(f"email.eq.{check_email}")
+            if check_phone: or_conditions.append(f"phone.eq.{check_phone}")
+            
+            conflict_query = ",".join(or_conditions)
+            
+            conflicts = supabase.table("agents") \
+                .select("id, email, phone, status") \
+                .eq("organization_id", organization_id) \
+                .neq("id", agent_id) \
+                .or_(conflict_query) \
+                .execute()
 
-		# Check email uniqueness if email is being updated
-		if "email" in update_data:
-			email_check = supabase.table("agents").select("id").eq("organization_id", organization_id).eq("email",
-			                                                                                              update_data[
-				                                                                                              "email"]).neq(
-				"id", agent_id).execute()
+            if conflicts.data:
+                for conflict in conflicts.data:
+                    # Check Email Conflict
+                    if check_email and conflict["email"] == check_email:
+                        if conflict["status"] != "inactive":
+                            raise HTTPException(400, detail=f"Email {check_email} is used by an ACTIVE agent.")
+                        
+                    # Check Phone Conflict
+                    if check_phone and conflict["phone"] == check_phone:
+                        if conflict["status"] != "inactive":
+                            raise HTTPException(400, detail=f"Phone {check_phone} is used by an ACTIVE agent.")
 
-			if email_check.data:
-				raise HTTPException(
-					status_code=status.HTTP_400_BAD_REQUEST,
-					detail=f"Agent with email {update_data['email']} already exists in this organization"
-				)
+        # 3. Perform Update
+        response = supabase.table("agents").update(update_data).eq("id", agent_id).execute()
 
-		# Update agent
-		response = supabase.table("agents").update(update_data).eq("id", agent_id).execute()
+        if not response.data:
+            raise HTTPException(500, detail="Failed to update agent")
 
-		if not response.data:
-			raise HTTPException(
-				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-				detail="Failed to update agent"
-			)
+        logger.info(f"Agent updated: {agent_id}")
+        return Agent(**response.data[0])
 
-		logger.info(f"Agent updated: {agent_id} by user {current_user.user_id}")
-
-		return Agent(**response.data[0])
-
-	except HTTPException:
-		raise
-	except Exception as e:
-		logger.error(f"Error updating agent {agent_id}: {e}")
-		raise HTTPException(
-			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail="Failed to update agent"
-		)
-
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating agent {agent_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update agent"
+        )
 
 @router.patch(
 	"/{agent_id}/status",
@@ -357,48 +404,71 @@ async def update_agent_status(
 			detail="Failed to update agent status"
 		)
 
-
 @router.delete(
-	"/{agent_id}",
-	status_code=status.HTTP_204_NO_CONTENT,
-	summary="Delete agent",
-	description="Delete an agent from the organization"
+    "/{agent_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete agent (Soft Delete & Unassign)",
+    description="Soft delete agent and unassign them from all active chats."
 )
 async def delete_agent(
-		agent_id: str,
-		current_user: User = Depends(get_current_user)
+    agent_id: str,
+    current_user: User = Depends(get_current_user)
 ):
-	"""Delete an agent"""
-	try:
-		organization_id = await get_user_organization_id(current_user)
-		supabase = get_supabase_client()
+    """Soft delete agent and unassign active chats"""
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
 
-		# Check if agent exists
-		existing = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
-		                                                                       organization_id).execute()
+        # 1. Check if agent exists
+        existing = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not existing.data:
+            raise HTTPException(404, detail="Agent not found")
 
-		if not existing.data:
-			raise HTTPException(
-				status_code=status.HTTP_404_NOT_FOUND,
-				detail=f"Agent with ID {agent_id} not found"
-			)
+        # 2. SOFT DELETE: Mark inactive & unlink user
+        update_data = {
+            "status": "inactive",
+            "user_id": None,
+            "last_active_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Update agent record
+        supabase.table("agents").update(update_data).eq("id", agent_id).execute()
 
-		# Delete agent (cascade will handle related records)
-		supabase.table("agents").delete().eq("id", agent_id).execute()
+        # 3. UNASSIGN ACTIVE CHATS
+        # REMOVED "in_progress" because it is not a valid ChatStatus enum
+        active_statuses = ["open", "assigned", "pending"]
+        
+        # A. Clear from 'assigned_agent_id' (Legacy field)
+        supabase.table("chats") \
+            .update({"assigned_agent_id": None, "status": "open"}) \
+            .eq("assigned_agent_id", agent_id) \
+            .in_("status", active_statuses) \
+            .execute()
+            
+        # B. Clear from 'human_agent_id' & reset handled_by
+        # We set handled_by to 'unassigned' so it appears in the "Unassigned" tab
+        supabase.table("chats") \
+            .update({
+                "human_agent_id": None, 
+                "handled_by": "unassigned", 
+                "status": "open"
+            }) \
+            .eq("human_agent_id", agent_id) \
+            .in_("status", active_statuses) \
+            .execute()
 
-		logger.info(f"Agent deleted: {agent_id} by user {current_user.user_id}")
+        logger.info(f"Agent {agent_id} soft-deleted and unassigned from active chats by {current_user.user_id}")
 
-		return None
+        return None
 
-	except HTTPException:
-		raise
-	except Exception as e:
-		logger.error(f"Error deleting agent {agent_id}: {e}")
-		raise HTTPException(
-			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail="Failed to delete agent"
-		)
-
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting agent {agent_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete agent: {str(e)}"
+        )
 
 # ============================================
 # AGENT SETTINGS ENDPOINTS
@@ -448,7 +518,6 @@ async def get_agent_settings(
 			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
 			detail="Failed to fetch agent settings"
 		)
-
 
 @router.put(
 	"/{agent_id}/settings",
@@ -522,7 +591,6 @@ async def update_agent_settings(
 			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
 			detail="Failed to update agent settings"
 		)
-
 
 # ============================================
 # KNOWLEDGE DOCUMENTS ENDPOINTS

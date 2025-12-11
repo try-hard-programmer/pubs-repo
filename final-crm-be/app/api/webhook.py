@@ -8,7 +8,7 @@ import logging
 import asyncio
 import base64
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone  # Fixed Import
 from typing import Optional, Dict, Any
 
 from app.models.webhook import (
@@ -362,7 +362,7 @@ async def process_webhook_message(
     supabase
 ) -> Dict[str, Any]:
     
-    # 1. Busy Check & 2. Schedule Check (Keep existing code) ...
+    # 1. Busy Check & 2. Schedule Check
     from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
     organization_id = agent["organization_id"]
     agent_is_busy = is_agent_busy(agent)
@@ -385,7 +385,7 @@ async def process_webhook_message(
         customer_metadata=customer_metadata
     )
 
-    # [Customer Phone Update Logic - Keep existing]
+    # [Customer Phone Update Logic]
     if customer_metadata and customer_metadata.get("phone"):
         try:
             phone_num = customer_metadata.get("phone")
@@ -394,34 +394,65 @@ async def process_webhook_message(
                 supabase.table("customers").update({"phone": phone_num}).eq("id", cust_id).execute()
         except: pass
 
+    # =================================================================================
+    # [FIX] BROADCAST USER MESSAGE IMMEDIATELY (Before Guard Logic)
+    # =================================================================================
+    if app_settings.WEBSOCKET_ENABLED:
+        try:
+            connection_manager = get_connection_manager()
+            await connection_manager.broadcast_new_message(
+                organization_id=organization_id,
+                chat_id=result["chat_id"],
+                message_id=result["message_id"],
+                customer_id=result["customer_id"],
+                customer_name=customer_name or "Unknown",
+                message_content=message_content,
+                channel=channel,
+                handled_by=result["handled_by"],
+                sender_type="customer", 
+                sender_id=result["customer_id"],
+                is_new_chat=result["is_new_chat"],
+                was_reopened=result["was_reopened"]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send WebSocket notification: {e}")
+
     # ============================================================
     # STEP 4: TICKET GUARD & LOGIC
     # ============================================================
     ticket_service = get_ticket_service()
+
+    # Calculate message count to pass to guard
+    try:
+        count_res = supabase.table("messages").select("id", count="exact").eq("chat_id", result["chat_id"]).execute()
+        msg_count = count_res.count or 1
+    except:
+        msg_count = 1
     
+    # Pass count to evaluate function
     decision = await ticket_service.evaluate_incoming_message(
         message=message_content, 
-        customer_name=customer_name or "Customer"
+        customer_name=customer_name or "Customer",
+        message_count=msg_count
     )
 
-    should_trigger_ai = True 
+    should_trigger_ai = True
 
     # --- A. HANDLE AUTO-REPLY (Hi / Greetings) ---
     if decision.auto_reply_hint:
         logger.info(f"🤖 Sending Guard Auto-Reply: {decision.auto_reply_hint}")
         
-        # [FIX IS HERE] Added 'customer_id' so the sender knows who to reply to!
         chat_data = {
             "id": result["chat_id"], 
             "channel": channel, 
             "sender_agent_id": agent["id"],
-            "customer_id": result["customer_id"], # <--- CRITICAL FIX
-            "ai_agent_id": agent["id"] # Helpful context
+            "customer_id": result["customer_id"], 
+            "ai_agent_id": agent["id"] 
         }
         
-        # For WhatsApp/Email we pass contact, for Telegram the sender looks up via customer_id
         cust_data = {"phone": contact, "email": contact if "@" in contact else None} 
         
+        # Send via Channel
         await send_message_via_channel(
             chat_data=chat_data,
             customer_data=cust_data,
@@ -429,8 +460,8 @@ async def process_webhook_message(
             supabase=supabase
         )
         
-        # Save Reply to DB History
-        supabase.table("messages").insert({
+        # Save Reply to DB History & Capture Result
+        msg_response = supabase.table("messages").insert({
             "chat_id": result["chat_id"],
             "sender_type": "ai", 
             "sender_id": agent["id"],
@@ -438,7 +469,27 @@ async def process_webhook_message(
             "metadata": {"type": "auto_reply_guard"}
         }).execute()
 
-        should_trigger_ai = False 
+        # [FIX] BROADCAST GUARD AUTO-REPLY TO WEBSOCKET
+        if msg_response.data:
+            new_msg = msg_response.data[0]
+            try:
+                conn = get_connection_manager()
+                await conn.broadcast_new_message(
+                    organization_id=organization_id,
+                    chat_id=result["chat_id"],
+                    message_id=new_msg["id"],
+                    customer_id=result["customer_id"],
+                    customer_name=customer_name or "Customer",
+                    message_content=decision.auto_reply_hint,
+                    channel=channel,
+                    handled_by="ai",
+                    sender_type="ai",
+                    sender_id=agent["id"]
+                )
+            except Exception as e:
+                logger.warning(f"WS Broadcast error: {e}")
+
+        should_trigger_ai = False
 
     # --- B. HANDLE TICKET CREATION ---
     if channel == "telegram" and result["success"] and decision.should_create_ticket:
@@ -460,27 +511,6 @@ async def process_webhook_message(
         await send_out_of_schedule_message(agent, channel, contact, supabase)
         should_trigger_ai = False
 
-    # Step 6: WebSocket
-    if app_settings.WEBSOCKET_ENABLED:
-        try:
-            connection_manager = get_connection_manager()
-            await connection_manager.broadcast_new_message(
-                organization_id=organization_id,
-                chat_id=result["chat_id"],
-                message_id=result["message_id"],
-                customer_id=result["customer_id"],
-                customer_name=customer_name or "Unknown",
-                message_content=message_content,
-                channel=channel,
-                handled_by=result["handled_by"],
-                sender_type="customer", 
-                sender_id=result["customer_id"],
-                is_new_chat=result["is_new_chat"],
-                was_reopened=result["was_reopened"]
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send WebSocket notification: {e}")
-
     # Step 7: AI Agent
     if should_trigger_ai and not agent_is_busy and is_within and result["handled_by"] == "ai":
         asyncio.create_task(
@@ -492,7 +522,6 @@ async def process_webhook_message(
         )
 
     return result
-
 
 def get_supabase_client():
     """Get Supabase client from settings"""

@@ -3,6 +3,7 @@ File Manager Service
 Handles file and folder operations with database + storage synchronization
 Includes embedding integration and rollback mechanisms
 """
+import io
 import re
 from typing import Optional, Dict, Any, List, Tuple
 from uuid import UUID, uuid4
@@ -16,6 +17,8 @@ from app.services.chromadb_service import ChromaDBService
 from app.services.document_processor import DocumentProcessor
 from app.utils import split_into_chunks, to_clean_text_from_strs
 from app.config import settings
+from pdfminer.high_level import extract_text
+import pdfplumber
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +153,20 @@ class FileManagerService:
             }
 
             if name:
+                print("EDIT FOLDER NAME", name)
+                # Check for duplicate file
+                search_file = (
+                    self.client.table("files")
+                    .select("*")
+                    .eq("name", name)
+                    .eq("is_folder", True)
+                    .execute()
+                )
+
+                # If the file exists, raise an error
+                if search_file.data:
+                    raise Exception("Folder name is already in use")
+
                 update_data["name"] = name
 
             if metadata:
@@ -212,8 +229,23 @@ class FileManagerService:
 
             children = children_response.data if children_response.data else []
 
+            # 3. Ambil all file_id
+            children_ids = [child['id'] for child in children]
+
+            # 4. Cek file shared
+            if children_ids:
+                file_share_response = self.client.table("file_shares")\
+                    .select("file_id")\
+                    .in_("file_id", children_ids)\
+                    .execute()
+                
+                if file_share_response.data:
+                    shared_count = len(file_share_response.data)
+                    raise Exception(f"Cannot proceed: {shared_count} file(s) are currently shared")
+
+
             if permanent:
-                # 3a. Permanent deletion with cascade
+                # 5a. Permanent deletion with cascade
                 deleted_files = 0
                 deleted_folders = 0
                 deleted_chunks = 0
@@ -272,7 +304,7 @@ class FileManagerService:
                 }
 
             else:
-                # 3b. Soft delete (move to trash)
+                # 5b. Soft delete (move to trash)
                 update_data = {
                     "is_trashed": True,
                     "updated_by": user_id,
@@ -296,9 +328,15 @@ class FileManagerService:
                                 file_id=child["id"],
                                 metadata_updates={"is_trashed": True}
                             )
+                            
                             trashed_files += 1
                         except Exception as chroma_error:
                             logger.warning(f"⚠️  Failed to update ChromaDB metadata for {child['id']}: {chroma_error}")
+
+                    self.client.table("files")\
+                        .update(update_data)\
+                        .eq("id", child["id"])\
+                        .execute()
 
                 logger.info(f"✅ Moved folder to trash: {folder_id} (updated {trashed_files} file embeddings)")
 
@@ -389,19 +427,42 @@ class FileManagerService:
 
             # Get all children (files and subfolders)
             children_response = self.client.table("files")\
-                .select("id, is_folder")\
+                .select("*")\
                 .eq("folder_id", folder_id)\
                 .execute()
 
             children = children_response.data if children_response.data else []
 
-            # Update folder in database
-            update_data = {
-                "is_trashed": False,
-                "updated_by": user_id,
-                "updated_at": datetime.utcnow().isoformat()
-            }
-
+            if folder_response.data[0]["folder_id"]:
+                folder_parent = self.client.table("files")\
+                    .select("*")\
+                    .eq("id", folder_response.data[0]["folder_id"])\
+                    .execute()
+                
+                folder_data = folder_parent.data[0]
+                if folder_data["is_trashed"] is True:
+                    # Update folder in database
+                    update_data = {
+                        "is_trashed": False,
+                        "folder_id": None,
+                        "updated_by": user_id,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }
+                else:
+                    # Update folder in database
+                    update_data = {
+                        "is_trashed": False,
+                        "updated_by": user_id,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }
+            else:
+                # Update folder in database
+                update_data = {
+                    "is_trashed": False,
+                    "updated_by": user_id,
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+            
             self.client.table("files")\
                 .update(update_data)\
                 .eq("id", folder_id)\
@@ -422,6 +483,11 @@ class FileManagerService:
                         restored_files += 1
                     except Exception as chroma_error:
                         logger.warning(f"⚠️  Failed to update ChromaDB metadata for {child['id']}: {chroma_error}")
+                    
+                self.client.table("files")\
+                    .update(update_data)\
+                    .eq("id", child["id"])\
+                    .execute()
 
             logger.info(f"✅ Restored folder from trash: {folder_id} (restored {restored_files} file embeddings)")
 
@@ -484,11 +550,34 @@ class FileManagerService:
         try:
             file_id = str(uuid4())
 
+            # Check for duplicate file
+            search_file = (
+                self.client.table("files")
+                .select("*")
+                .eq("name", name)
+                .eq("user_id", user_id)
+                .eq("is_folder", False)
+                .execute()
+            )
+            if search_file.data:
+                existing = search_file.data[0]
+
+                # File already in My Drive
+                if existing.get("is_trashed") is False:
+                    raise Exception("File already exists in My Drive.")
+
+                # File already in Trash
+                if existing.get("is_trashed") is True:
+                    raise Exception("File already exists in Trash.")
+
+
             # 1. Get extension
             extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
             # 2. Calculate parent_path
             parent_path = self._get_parent_path(parent_folder_id) if parent_folder_id else "/"
+
+
 
             # 3. Upload to storage first
             try:
@@ -539,7 +628,7 @@ class FileManagerService:
             created_file = response.data[0]
 
             # 5. Process embedding (if enabled and supported file type)
-            if enable_embedding and self._should_embed_file(extension):
+            if enable_embedding and self._should_embed_file(extension, file_content):
                 try:
                     embedding_result = self._embed_file(
                         file_id=file_id,
@@ -656,7 +745,36 @@ class FileManagerService:
             }
 
             if name:
+                # Check for duplicate file
+                search_file = (
+                    self.client.table("files")
+                    .select("*")
+                    .eq("name", name)
+                    .eq("is_folder", False)
+                    .execute()
+                )
+
+                # If the file exists, raise an error
+                if search_file.data:
+                    raise Exception("File name is already in use")
+                
                 update_data["name"] = name
+                # 3) Update metadata 'filename' di ChromaDB untuk semua chunk dengan file_id ini
+                try:
+                    
+                    self.chromadb_service.update_document_metadata_by_file_id(
+                        organization_id=current_file["organization_id"],
+                        file_id=file_id,
+                        metadata_updates={
+                            "filename": name,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+                    logger.info("ChromaDB metadata synced for file_id=%s (filename=%s)", file_id, name)
+                except Exception as e:
+                    # Jangan gagalkan rename jika ChromaDB gagal; log saja untuk observabilitas
+                    logger.warning("Failed to update ChromaDB metadata for file_id=%s: %s", file_id, e)
+
 
             if metadata:
                 update_data["metadata"] = metadata
@@ -705,6 +823,8 @@ class FileManagerService:
             if not response.data:
                 raise Exception("File update failed")
 
+            
+
             logger.info(f"✅ Updated file: {file_id}")
 
             return response.data[0]
@@ -713,6 +833,77 @@ class FileManagerService:
             logger.error(f"Failed to update file: {e}")
             raise
 
+    def favorite_file(
+        self,
+        file_id: str,
+        user_id: str,
+        # organization_id: str,
+        is_starred: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Toggle star/favorite status of a file
+        
+        Mark or unmark a file as starred/favorite for quick access.
+        
+        Args:
+            file_id: File UUID to star/unstar
+            user_id: User UUID performing the action (for audit)
+            organization_id: Organization UUID the file belongs to
+            is_starred: True to mark as favorite, False to unmark
+        
+        Returns:
+            Updated file object with new star status
+        """
+        print("Favorite Service")
+        try:
+            # Get file data
+            file_response = self.client.table("files")\
+                .select("*")\
+                .eq("id", file_id)\
+                .execute()
+                # .eq("is_folder", False)\
+
+
+            if not file_response.data:
+                raise Exception("File not found")
+
+            if is_starred:
+                # Soft delete (move to trash)
+                update_data = {
+                    "is_starred": True,
+                    "updated_by": user_id,
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+                self.client.table("files")\
+                    .update(update_data)\
+                    .eq("id", file_id)\
+                    .execute()
+
+                return {
+                    "file_id": file_id,
+                    "status": "favorite"
+                }
+            else:
+                # Soft delete (move to trash)
+                update_data = {
+                    "is_starred": False,
+                    "updated_by": user_id,
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+                self.client.table("files")\
+                    .update(update_data)\
+                    .eq("id", file_id)\
+                    .execute()
+
+                return {
+                    "file_id": file_id,
+                    "status": "favorite"
+                }
+
+        except Exception as e:
+            logger.error(f"Failed to Favorite file: {e}")
+            raise
+    
     def delete_file(
         self,
         file_id: str,
@@ -847,7 +1038,14 @@ class FileManagerService:
                 raise Exception("File not found")
 
             file_data = file_response.data[0]
-            old_parent_path = file_data.get("parent_path", "/")
+
+            # old_parent_path = file_data.get("parent_path", "/")
+            old_storage_path = file_data.get("storage_path", "/")
+            if "/" in old_storage_path:
+                folder = old_storage_path.rsplit("/", 1)[0]
+                old_parent_path = f"/{folder}/"
+            else:
+                old_parent_path = "/"
 
             # Calculate new parent path
             new_parent_path = self._get_parent_path(new_parent_folder_id) if new_parent_folder_id else "/"
@@ -864,9 +1062,16 @@ class FileManagerService:
                 logger.warning(f"Storage move failed (non-critical): {storage_error}")
 
             # Update database
+            parent = (new_parent_path or "").strip("/")
+            if parent:
+                new_storage_path = f"{parent}/{file_id}"
+            else:
+                new_storage_path = file_id
+
             update_data = {
                 "folder_id": new_parent_folder_id,
-                "parent_path": new_parent_path,
+                # "parent_path": new_parent_path,
+                "storage_path": new_storage_path,
                 "updated_by": user_id,
                 "updated_at": datetime.utcnow().isoformat()
             }
@@ -875,7 +1080,6 @@ class FileManagerService:
                 .update(update_data)\
                 .eq("id", file_id)\
                 .execute()
-
             if not response.data:
                 raise Exception("File move failed")
 
@@ -915,18 +1119,43 @@ class FileManagerService:
 
             if not file_response.data:
                 raise Exception("File not found in trash")
-
-            # Update database to restore file
-            update_data = {
-                "is_trashed": False,
-                "updated_by": user_id,
-                "updated_at": datetime.utcnow().isoformat()
-            }
+            
+            if file_response.data[0]["folder_id"]:
+                # Get Folder parent file
+                folder_parent = self.client.table("files")\
+                    .select("*")\
+                    .eq("id", file_response.data[0]["folder_id"])\
+                    .execute()
+                
+                # If the parent folder is trashed
+                folder_data = folder_parent.data[0]
+                if folder_data["is_trashed"] is True:
+                    # Prepare update data: reset folder_id to None because the parent folder is trashed
+                    update_data = {
+                        "is_trashed": False,
+                        "folder_id": None,
+                        "updated_by": user_id,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }
+                else:
+                    # Parent folder is not trashed, only update 'is_trashed' field
+                    update_data = {
+                        "is_trashed": False,
+                        "updated_by": user_id,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }
+            else:
+                update_data = {
+                    "is_trashed": False,
+                    "updated_by": user_id,
+                    "updated_at": datetime.utcnow().isoformat()
+                }
 
             self.client.table("files")\
-                .update(update_data)\
-                .eq("id", file_id)\
-                .execute()
+                    .update(update_data)\
+                    .eq("id", file_id)\
+                    .execute()
+           
 
             # Update ChromaDB metadata to mark as active (include in agent queries)
             try:
@@ -957,6 +1186,29 @@ class FileManagerService:
     # HELPER METHODS
     # =====================================================
 
+    def _search_file(self, query:str, organization_id:str) -> list:
+        """
+        Retrieve files that match the given query.
+
+        This function searches for files (e.g., by filename or folder name)
+        that are relevant or similar to the provided query string.
+
+        Args:
+            query (str): The search term or keyword to look for in file metadata.
+
+        Returns:
+            list: A list of matching file records or metadata dictionaries.
+        """
+        print("QUERY" , query)
+
+        response = self.client.table("files")\
+            .select("*")\
+            .ilike("name", f"%{query}%")\
+            .eq("organization_id", organization_id)\
+            .execute()
+        return response
+        
+
     def _get_parent_path(self, folder_id: Optional[str]) -> str:
         """Get full path of parent folder"""
         if not folder_id:
@@ -976,15 +1228,34 @@ class FileManagerService:
 
         return "/"
 
-    def _should_embed_file(self, extension: str) -> bool:
+    def _should_embed_file(self, extension: str, file_content: bytes) -> bool:
         """Check if file type should be embedded"""
         embeddable_extensions = {
             "pdf", "docx", "doc", "txt", "md", "markdown", "pptx", "ppt",
             "csv", "xlsx", "xls", "json",
-            "mp3", "wav", "mp4", "mov", "avi", "mkv", "m4a",  # Audio/Video with transcription
+            "mp3", "wav", "m4a",  # Audio/Video with transcription
+            # "mp4", "mov", "avi", "mkv",
             "jpg", "jpeg", "png", "webp", "bmp", "gif"  # Images with OCR
         }
-        return extension.lower() in embeddable_extensions
+        # Cek apakah file pdf
+        if extension != "pdf":
+            return extension.lower() in embeddable_extensions
+        try:
+            pdf_file = io.BytesIO(file_content)
+            with pdfplumber.open(pdf_file) as pdf:
+                if len(pdf.pages) > 0:
+                    # Extract dari halaman pertama
+                    text = pdf.pages[0].extract_text()
+                    
+                    print(f"EXTRACT: {text[:200] if text else 'NONE'}")
+                    print(f"LENGTH: {len(text) if text else 0}")
+                    
+                    # Check apakah ada text
+                    if text and len(text.strip()) > 10:
+                        return extension.lower() in embeddable_extensions
+            return False
+        except Exception as e:
+            return False
 
     def _embed_file(
         self,
