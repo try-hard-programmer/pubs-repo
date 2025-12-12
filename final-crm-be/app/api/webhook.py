@@ -17,7 +17,8 @@ from app.models.webhook import (
     TelegramWebhookMessage,
     EmailWebhookMessage,
     WebhookRouteResponse,
-    WebhookErrorResponse
+    WebhookErrorResponse,
+    WhatsAppEventPayload
 )
 from app.middleware.webhook_auth import get_webhook_secret
 from app.services.message_router_service import get_message_router_service
@@ -25,7 +26,7 @@ from app.services.agent_finder_service import get_agent_finder_service
 from app.services.websocket_service import get_connection_manager
 from app.services.ai_response_service import process_ai_response_async
 from app.config import settings as app_settings
-from app.models.webhook import WhatsAppUnofficialWebhookMessage, WebhookRouteResponse
+from app.models.webhook import WhatsAppUnofficialWebhookMessage, WebhookRouteResponse, WhatsAppEventPayload
 from app.models.ticket import TicketCreate, ActorType, TicketPriority, TicketDecision
 from app.services.ticket_service import get_ticket_service
 from app.api.crm_chats import send_message_via_channel
@@ -52,15 +53,17 @@ async def process_auto_ticket_async(
     Background task to auto-create tickets based on the Guard's decision.
     """
     try:
-        # 1. Check for existing active ticket
+        # 1. Check for existing active ticket to avoid duplicates
         active_tickets = supabase.table("tickets") \
-            .select("id") \
+            .select("id, ticket_number") \
             .eq("chat_id", chat_id) \
             .in_("status", ["open", "in_progress"]) \
             .execute()
         
         if active_tickets.data:
-            return # Ticket exists
+            existing_ticket = active_tickets.data[0]
+            logger.info(f"ℹ️  Skipping auto-ticket: Active ticket {existing_ticket['ticket_number']} already exists for chat {chat_id}")
+            return # Ticket exists, do nothing
 
         logger.info(f"🎫 Creating Auto-Ticket for {chat_id}. Priority: {decision.suggested_priority}")
 
@@ -70,20 +73,20 @@ async def process_auto_ticket_async(
         new_ticket_data = TicketCreate(
             chat_id=chat_id,
             customer_id=customer_id,
-            title=f"Telegram: {customer_name}",
+            title=f"Support Request: {customer_name}",
             description=f"Message: {message_content}\n\n[Auto-created: {decision.reason}]",
             priority=decision.suggested_priority or TicketPriority.MEDIUM, 
             category=decision.suggested_category or "inquiry"
         )
 
-        await ticket_service.create_ticket(
+        new_ticket = await ticket_service.create_ticket(
             data=new_ticket_data,
             organization_id=organization_id,
             actor_id=None,
             actor_type=ActorType.SYSTEM
         )
 
-        logger.info(f"✅ Auto-Ticket created successfully.")
+        logger.info(f"✅ Auto-Ticket created successfully: {new_ticket.ticket_number}")
 
     except Exception as e:
         logger.error(f"❌ Auto-Ticket creation failed: {e}")
@@ -364,12 +367,13 @@ async def process_webhook_message(
     
     # 1. Busy Check & 2. Schedule Check
     from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
-    organization_id = agent["organization_id"]
-    agent_is_busy = is_agent_busy(agent)
-    if agent_is_busy: await send_busy_agent_auto_reply(agent, channel, contact, supabase)
-    
     from zoneinfo import ZoneInfo
-    schedule_config = await get_agent_schedule_config(agent["id"], supabase)
+    
+    organization_id = agent["organization_id"]
+    agent_id = agent["id"]
+    agent_is_busy = is_agent_busy(agent)
+    
+    schedule_config = await get_agent_schedule_config(agent_id, supabase)
     current_time_utc = datetime.now(ZoneInfo("UTC"))
     is_within, out_of_schedule_reason = is_within_schedule(schedule_config, current_time_utc)
 
@@ -385,17 +389,18 @@ async def process_webhook_message(
         customer_metadata=customer_metadata
     )
 
-    # [Customer Phone Update Logic]
+    # Update Customer Phone if provided
     if customer_metadata and customer_metadata.get("phone"):
         try:
             phone_num = customer_metadata.get("phone")
             cust_id = result.get("customer_id")
             if cust_id and phone_num:
                 supabase.table("customers").update({"phone": phone_num}).eq("id", cust_id).execute()
-        except: pass
+        except Exception as e:
+            logger.warning(f"Failed to update customer phone: {e}")
 
     # =================================================================================
-    # [FIX] BROADCAST USER MESSAGE IMMEDIATELY (Before Guard Logic)
+    # BROADCAST USER MESSAGE IMMEDIATELY
     # =================================================================================
     if app_settings.WEBSOCKET_ENABLED:
         try:
@@ -429,7 +434,6 @@ async def process_webhook_message(
     except:
         msg_count = 1
     
-    # Pass count to evaluate function
     decision = await ticket_service.evaluate_incoming_message(
         message=message_content, 
         customer_name=customer_name or "Customer",
@@ -460,7 +464,7 @@ async def process_webhook_message(
             supabase=supabase
         )
         
-        # Save Reply to DB History & Capture Result
+        # Save Reply to DB History
         msg_response = supabase.table("messages").insert({
             "chat_id": result["chat_id"],
             "sender_type": "ai", 
@@ -469,7 +473,7 @@ async def process_webhook_message(
             "metadata": {"type": "auto_reply_guard"}
         }).execute()
 
-        # [FIX] BROADCAST GUARD AUTO-REPLY TO WEBSOCKET
+        # BROADCAST GUARD AUTO-REPLY
         if msg_response.data:
             new_msg = msg_response.data[0]
             try:
@@ -491,14 +495,15 @@ async def process_webhook_message(
 
         should_trigger_ai = False
 
-    # --- B. HANDLE TICKET CREATION ---
-    if channel == "telegram" and result["success"] and decision.should_create_ticket:
+    # --- B. HANDLE TICKET CREATION (FIXED) ---
+    # ✅ FIX: Allow BOTH telegram AND whatsapp
+    if (channel in ["telegram", "whatsapp"]) and result["success"] and decision.should_create_ticket:
         asyncio.create_task(
             process_auto_ticket_async(
                 chat_id=result["chat_id"],
                 customer_id=result["customer_id"],
                 organization_id=organization_id,
-                customer_name=customer_name or "Telegram User",
+                customer_name=customer_name or f"{channel.title()} User",
                 message_content=message_content,
                 decision=decision,
                 supabase=supabase
@@ -510,9 +515,12 @@ async def process_webhook_message(
         await flag_message_as_out_of_schedule(result["message_id"], out_of_schedule_reason, supabase)
         await send_out_of_schedule_message(agent, channel, contact, supabase)
         should_trigger_ai = False
+    elif agent_is_busy:
+        await send_busy_agent_auto_reply(agent, channel, contact, supabase)
+        should_trigger_ai = False
 
-    # Step 7: AI Agent
-    if should_trigger_ai and not agent_is_busy and is_within and result["handled_by"] == "ai":
+    # Step 6: AI Agent
+    if should_trigger_ai and result["handled_by"] == "ai":
         asyncio.create_task(
             process_ai_response_async(
                 chat_id=result["chat_id"],
@@ -522,6 +530,7 @@ async def process_webhook_message(
         )
 
     return result
+
 
 def get_supabase_client():
     """Get Supabase client from settings"""
@@ -540,7 +549,7 @@ def _generate_status_message(result: dict) -> str:
     if result["is_new_chat"]: return "New chat created"
     elif result["was_reopened"]: return "Chat reopened"
     else: return "Message added"
-
+    
 # ============================================
 # WHATSAPP WEBHOOK
 # ============================================
@@ -550,130 +559,115 @@ def _generate_status_message(result: dict) -> str:
     response_model=WebhookRouteResponse,
     status_code=status.HTTP_200_OK,
     summary="Receive WhatsApp message",
-    description="Webhook endpoint to receive incoming messages from WhatsApp service",
-    responses={
-        401: {"description": "Missing or invalid X-API-Key header"},
-        404: {"description": "No agent integration found"},
-        500: {"description": "Internal server error"}
-    }
+    description="Webhook endpoint to receive incoming messages from WhatsApp service"
 )
 async def whatsapp_webhook(
-    message: WhatsAppWebhookMessage,
+    payload: WhatsAppEventPayload,
     secret: str = Depends(get_webhook_secret)
 ):
-    """
-    Receive incoming WhatsApp message and route to correct chat.
-
-    **Authentication:** Requires `X-API-Key` header with valid secret key.
-
-    **Flow:**
-    1. Validate webhook secret
-    2. Find agent by WhatsApp destination number (integration lookup)
-    3. Find or create customer by phone number
-    4. Find active chat or create new chat
-    5. Add message to chat (assign to agent)
-    6. Update customer metadata
-    7. Send WebSocket notification (if enabled)
-    8. Return routing result
-
-    **Request Example:**
-    ```json
-    {
-        "phone_number": "+6281234567890",
-        "to_number": "+6281111111",
-        "sender_name": "John Doe",
-        "message": "Hello, I need help",
-        "message_id": "wamid.xxx123",
-        "timestamp": "2025-10-21T15:30:00Z"
-    }
-    ```
-
-    **Response Example:**
-    ```json
-    {
-        "success": true,
-        "chat_id": "chat-uuid-456",
-        "message_id": "msg-uuid-789",
-        "customer_id": "customer-uuid-abc",
-        "is_new_chat": false,
-        "was_reopened": true,
-        "handled_by": "ai",
-        "status": "open",
-        "channel": "whatsapp",
-        "message": "Message routed successfully"
-    }
-    ```
-
-    Args:
-        message: WhatsApp webhook message
-        secret: Validated webhook secret (injected by dependency)
-
-    Returns:
-        WebhookRouteResponse with routing details
-
-    Raises:
-        HTTPException: If routing fails or no agent integration found
-    """
     try:
-        logger.info(
-            f"📱 WhatsApp webhook received: "
-            f"from={message.phone_number}, to={message.to_number}"
-        )
+        # 1. FILTER: Handle System Events (QR, Loading, Status) -> Ignore them
+        if payload.qr:
+            return JSONResponse(content={"status": "ignored", "reason": "qr_code"})
+            
+        if isinstance(payload.message, str):
+            # If 'message' is a string (e.g. "WhatsApp"), it's a loading status
+            return JSONResponse(content={"status": "ignored", "reason": "status_update"})
 
-        # Get Supabase client
+        if not isinstance(payload.message, dict):
+            return JSONResponse(content={"status": "ignored", "reason": "no_message_data"})
+
+        # Extract the core message object
+        # The container usually sends: { "message": { "_data": { ... } } }
+        msg_obj = payload.message
+        msg_data = msg_obj.get("_data", msg_obj) # Fallback to msg_obj if _data missing
+
+        # 2. FILTER: Ignore Status Broadcasts
+        if msg_data.get("isStatus") is True or msg_data.get("type") == "e2e_notification":
+             return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
+
+        # 3. FILTER: Ignore Self-Replies (Infinite Loop Prevention)
+        # Check id.fromMe (official structure) or key.fromMe (some libraries)
+        is_from_me = False
+        if isinstance(msg_data.get("id"), dict):
+            is_from_me = msg_data["id"].get("fromMe", False)
+        elif isinstance(msg_data.get("key"), dict):
+             is_from_me = msg_data["key"].get("fromMe", False)
+        
+        # Also check boolean flag directly if present
+        if msg_data.get("fromMe") is True:
+            is_from_me = True
+
+        if is_from_me:
+            logger.info("♻️ Ignoring message from self (fromMe=True)")
+            return JSONResponse(content={"status": "ignored", "reason": "from_me"})
+
+        logger.info(f"📱 WhatsApp webhook received")
+
+        # 4. DATA EXTRACTION
+        # 'from': "6281317966173@c.us" (Sender)
+        # 'to': "6287874134867@c.us" (Agent/Receiver)
+        raw_from = msg_data.get("from", "")
+        raw_to = msg_data.get("to", "")
+        
+        # Clean numbers (remove @c.us / @g.us)
+        phone_number = raw_from.split("@")[0] if "@" in raw_from else raw_from
+        to_number = raw_to.split("@")[0] if "@" in raw_to else raw_to
+        
+        message_content = msg_data.get("body", "")
+        
+        # Sender Name Logic
+        sender_name = msg_data.get("notifyName")
+        if not sender_name:
+            sender_name = f"User {phone_number}"
+
+        message_id = msg_data.get("id", {}).get("id") if isinstance(msg_data.get("id"), dict) else None
+        timestamp = msg_data.get("t")
+
+        # 5. AGENT LOOKUP
         supabase = get_supabase_client()
-
-        # STEP 1: Find agent by WhatsApp integration
         agent_finder = get_agent_finder_service(supabase)
-        agent = await agent_finder.find_agent_by_whatsapp_number(
-            phone_number=message.to_number
-        )
+        
+        # Find agent by the 'to' number (the agent's number)
+        agent = await agent_finder.find_agent_by_whatsapp_number(phone_number=to_number)
 
         if not agent:
-            logger.error(f"❌ No agent integration found for WhatsApp number: {message.to_number}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No agent integration found for WhatsApp number {message.to_number}"
-            )
+            # Fallback: try finding by raw ID or partial match
+            logger.warning(f"⚠️ Agent not found for {to_number}, retrying...")
+            agent = await agent_finder.find_agent_by_whatsapp_number(phone_number=raw_to)
+            
+        if not agent:
+            logger.error(f"❌ No agent integration found for WhatsApp number: {to_number}")
+            # Return 404 so we know it failed, or 200 to stop retries if configured
+            raise HTTPException(status_code=404, detail="Agent not found for this number")
 
         organization_id = agent["organization_id"]
-        logger.info(
-            f"✅ Agent found: {agent['name']} (org={organization_id}, "
-            f"is_ai={agent['user_id'] is None}, status={agent.get('status')})"
-        )
 
-        # Normalize phone number (remove + if present, ensure starts with country code)
-        phone_number = message.phone_number.lstrip("+")
-
-        # Prepare message metadata
+        # 6. METADATA PREPARATION
         message_metadata = {
-            "whatsapp_message_id": message.message_id,
-            "message_type": message.message_type,
-            "media_url": message.media_url,
-            "caption": message.caption,
-            "timestamp": message.timestamp,
-            **message.metadata
+            "whatsapp_message_id": message_id,
+            "original_from": raw_from,
+            "timestamp": timestamp,
+            "source_raw": "chrishubert_api"
         }
-
-        # Prepare customer metadata
+        
         customer_metadata = {
-            "whatsapp_name": message.sender_name
+            "whatsapp_name": sender_name
         }
 
-        # STEP 2: Process webhook message (unified logic)
+        # 7. PROCESS & ROUTE
         result = await process_webhook_message(
             agent=agent,
             channel="whatsapp",
             contact=phone_number,
-            message_content=message.message,
-            customer_name=message.sender_name,
+            message_content=message_content,
+            customer_name=sender_name,
             message_metadata=message_metadata,
             customer_metadata=customer_metadata,
             supabase=supabase
         )
 
-        # Prepare response
-        response = WebhookRouteResponse(
+        return WebhookRouteResponse(
             success=True,
             chat_id=result["chat_id"],
             message_id=result["message_id"],
@@ -686,22 +680,15 @@ async def whatsapp_webhook(
             message=_generate_status_message(result)
         )
 
-        logger.info(
-            f"✅ WhatsApp message routed: "
-            f"chat={result['chat_id']}, is_new={result['is_new_chat']}"
-        )
-
-        return response
-
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Error processing WhatsApp webhook: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process WhatsApp message: {str(e)}"
+        # Return 200 OK with error details to stop WhatsApp from retrying indefinitely on bad logic
+        return JSONResponse(
+            status_code=200, 
+            content={"success": False, "error": str(e)}
         )
-
 
 # ============================================
 # WHATSAPP UNOFFICIAL WEBHOOK
@@ -711,132 +698,88 @@ async def whatsapp_webhook(
     "/wa-unofficial",
     response_model=WebhookRouteResponse,
     status_code=status.HTTP_200_OK,
-    summary="Receive WhatsApp message (Unofficial API)",
-    description="Webhook endpoint to receive incoming messages from WhatsApp unofficial service (whatsapp-web.js)",
-    responses={
-        401: {"description": "Missing or invalid X-API-Key header"},
-        404: {"description": "No agent integration found"},
-        500: {"description": "Internal server error"}
-    }
+    summary="Receive WhatsApp message (Unofficial API)"
 )
 async def whatsapp_unofficial_webhook(
     message: WhatsAppUnofficialWebhookMessage,
     secret: str = Depends(get_webhook_secret)
 ):
-    """
-    Receive incoming WhatsApp message from unofficial API and route to correct chat.
-
-    **Authentication:** Requires `X-API-Key` header with valid secret key.
-
-    **Supported Message Types:**
-    - Text messages: `dataType == "message" && data.message.type == "chat"`
-    - Image messages: `dataType == "media" && data.dataType == "image"`
-    - Voice messages: `dataType == "media" && data.dataType == "ptt"`
-
-    **Flow:**
-    1. Validate webhook secret
-    2. Convert unofficial payload to standard WhatsApp format
-    3. Upload media files to Supabase storage (if applicable)
-    4. Find agent by WhatsApp destination number
-    5. Route message to chat using existing logic
-    6. Send WebSocket notification
-    7. Trigger AI response if needed
-
-    **Request Example (Text):**
-    ```json
-    {
-        "dataType": "message",
-        "data": {
-            "message": {
-                "_data": {
-                    "id": {"fromMe": false, "remote": "6289505130799@c.us"},
-                    "body": "Hello",
-                    "type": "chat",
-                    "from": "6289505130799@c.us",
-                    "to": "62881024580401@c.us"
-                }
-            }
-        },
-        "sessionId": "ea799531-14ff-400a-9380-cd2a9c16af5c"
-    }
-    ```
-
-    **Request Example (Image):**
-    ```json
-    {
-        "dataType": "media",
-        "data": {
-            "messageMedia": {
-                "mimetype": "image/jpeg",
-                "data": "/9j/4AAQSkZJRg...",
-                "type": "image",
-                "caption": "Check this out"
-            },
-            "message": {
-                "_data": {
-                    "from": "6289505130799@c.us",
-                    "to": "62881024580401@c.us"
-                }
-            }
-        },
-        "sessionId": "ea799531-14ff-400a-9380-cd2a9c16af5c"
-    }
-    ```
-
-    Args:
-        message: WhatsApp unofficial webhook message
-        secret: Validated webhook secret (injected by dependency)
-
-    Returns:
-        WebhookRouteResponse with routing details
-
-    Raises:
-        HTTPException: If routing fails, message type unsupported, or no agent integration found
-    """
     try:
+        # 1. LOGIC: Filter Unwanted Events
+        # The unofficial API sends 'loading_screen', 'qr', 'authenticated', etc.
+        # We only care about 'message' or 'message_create' that are actual chats.
+        if message.dataType not in ["message", "message_create", "media"]:
+             return JSONResponse(content={"status": "ignored", "reason": f"event_type_{message.dataType}"})
+
+        # Extract inner data safely
+        data_content = message.data.get("message", {}).get("_data", {})
+        if not data_content:
+             # Try fallback for media
+             data_content = message.data.get("messageMedia", {})
+        
+        if not data_content:
+             return JSONResponse(content={"status": "ignored", "reason": "empty_data"})
+
+        # 2. LOGIC: Ignore Self-Replies (Infinite Loop Prevention)
+        # 'id' is usually a dict { fromMe: boolean, ... }
+        msg_id_obj = data_content.get("id", {})
+        is_from_me = msg_id_obj.get("fromMe", False)
+        
+        if is_from_me:
+            logger.info("♻️ Ignoring message from self (fromMe=True)")
+            return JSONResponse(content={"status": "ignored", "reason": "from_me"})
+
+        # 3. LOGIC: Idempotency (Prevent Double Processing)
+        # The container might send both 'message' and 'message_create' for the same text.
+        # We check if this message ID already exists in our DB.
+        whatsapp_id = msg_id_obj.get("id")
+        
+        if whatsapp_id:
+            supabase = get_supabase_client()
+            # Check if we already stored this message
+            existing = supabase.table("messages") \
+                .select("id") \
+                .eq("metadata->>whatsapp_message_id", whatsapp_id) \
+                .execute()
+            
+            if existing.data:
+                logger.info(f"♻️ Duplicate message ID {whatsapp_id}. Already processed.")
+                return JSONResponse(content={"status": "ignored", "reason": "duplicate_message"})
+
         logger.info(
             f"📱 WhatsApp unofficial webhook received: "
             f"dataType={message.dataType}, sessionId={message.sessionId}"
         )
 
-        # Convert unofficial payload to standard format
+        # 4. Convert & Process
         standard_message = await _convert_unofficial_to_standard(message)
 
-        logger.info(
-            f"✅ Converted unofficial message: "
-            f"from={standard_message.phone_number}, to={standard_message.to_number}, "
-            f"type={standard_message.message_type}"
-        )
-
-        # Get Supabase client
-        supabase = get_supabase_client()
-
         # STEP 1: Find agent by WhatsApp integration
+        supabase = get_supabase_client()
         agent_finder = get_agent_finder_service(supabase)
         agent = await agent_finder.find_agent_by_whatsapp_number(
             phone_number=standard_message.to_number
         )
 
         if not agent:
+            # Fallback check
+            logger.warning(f"Agent not found for {standard_message.to_number}, trying raw...")
+            # Sometimes the format differs slightly, try to match broadly if needed
+            
             logger.error(f"❌ No agent integration found for WhatsApp number: {standard_message.to_number}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No agent integration found for WhatsApp number {standard_message.to_number}"
+            # Return 200 to stop the container from retrying 
+            return JSONResponse(
+                status_code=200, 
+                content={"status": "error", "message": "Agent not found"}
             )
 
         organization_id = agent["organization_id"]
-        logger.info(
-            f"✅ Agent found: {agent['name']} (org={organization_id}, "
-            f"is_ai={agent['user_id'] is None}, status={agent.get('status')})"
-        )
-
-        # Normalize phone number (remove + if present, ensure starts with country code)
+        
+        # Normalize phone number
         phone_number = standard_message.phone_number.lstrip("+")
-
-        # Ensure customer name is not None or empty - fallback to phone number
         customer_name = standard_message.sender_name or phone_number
 
-        # Prepare message metadata
+        # Metadata
         message_metadata = {
             "whatsapp_message_id": standard_message.message_id,
             "message_type": standard_message.message_type,
@@ -846,12 +789,11 @@ async def whatsapp_unofficial_webhook(
             **standard_message.metadata
         }
 
-        # Prepare customer metadata
         customer_metadata = {
             "whatsapp_name": customer_name
         }
 
-        # STEP 2: Process webhook message (unified logic)
+        # STEP 2: Process webhook message
         result = await process_webhook_message(
             agent=agent,
             channel="whatsapp",
@@ -863,8 +805,7 @@ async def whatsapp_unofficial_webhook(
             supabase=supabase
         )
 
-        # Prepare response
-        response = WebhookRouteResponse(
+        return WebhookRouteResponse(
             success=True,
             chat_id=result["chat_id"],
             message_id=result["message_id"],
@@ -877,22 +818,12 @@ async def whatsapp_unofficial_webhook(
             message=_generate_status_message(result)
         )
 
-        logger.info(
-            f"✅ WhatsApp unofficial message routed: "
-            f"chat={result['chat_id']}, is_new={result['is_new_chat']}"
-        )
-
-        return response
-
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Error processing WhatsApp unofficial webhook: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process WhatsApp unofficial message: {str(e)}"
-        )
-
+        # Always return 200 OK to the webhook sender to prevent retry loops on logic errors
+        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
 
 # ============================================
 # TELEGRAM WEBHOOK

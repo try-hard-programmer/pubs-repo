@@ -519,6 +519,9 @@ async def get_chats(
     ai_assigned_to: Optional[str] = Query(None, description="Filter by AI agent ID"),
     human_assigned_to: Optional[str] = Query(None, description="Filter by human agent ID"),
     escalated: Optional[bool] = Query(None, description="Filter escalated chats only"),
+    # [NEW] Date Filtering Parameters
+    created_after: Optional[datetime] = Query(None, description="Filter chats created after this timestamp (ISO 8601)"),
+    created_before: Optional[datetime] = Query(None, description="Filter chats created before this timestamp (ISO 8601)"),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
     current_user: User = Depends(get_current_user)
@@ -557,6 +560,13 @@ async def get_chats(
 
         if escalated is True:
             query = query.not_.is_("escalated_at", "null")
+
+        # [NEW] Apply Date Range Filters
+        if created_after:
+            query = query.gte("created_at", created_after.isoformat())
+        
+        if created_before:
+            query = query.lte("created_at", created_before.isoformat())
 
         # Apply pagination
         query = query.range(skip, skip + limit - 1).order("last_message_at", desc=True)
@@ -682,7 +692,6 @@ async def get_chats(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch chats"
         )
-
 
 @router.get(
     "/chats/{chat_id}",

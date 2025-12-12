@@ -3,7 +3,7 @@ Webhook Models
 Pydantic models for incoming webhook messages from external services
 """
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from datetime import datetime
 
 
@@ -135,6 +135,15 @@ class EmailWebhookMessage(IncomingWebhookMessage):
             }
         }
 
+
+class WhatsAppEventPayload(BaseModel):
+    # Flexible payload to handle chrishubert/whatsapp-api webhooks
+    message: Optional[Union[Dict[str, Any], str]] = None
+    qr: Optional[str] = None
+    percent: Optional[int] = None 
+    
+    class Config:
+        extra = "allow"
 
 # ============================================
 # RESPONSE MODELS

@@ -1070,14 +1070,17 @@ async def access_public_share(share_token: str):
         file_content = storage_service.download_file(
             organization_id=file_data["organization_id"],
             file_id=file_data["id"],
-            folder_path=file_data.get("parent_path", "/")
+            folder_path=file_data.get("storage_path", "/")
         )
 
         return StreamingResponse(
             BytesIO(file_content),
             media_type=file_data.get("mime_type", "application/octet-stream"),
             headers={
-                "Content-Disposition": f'attachment; filename="{file_data["name"]}"'
+                # Download
+                # "Content-Disposition": f'attachment; filename="{file_data["name"]}"'
+                # Preview
+                 "Content-Disposition": f'inline; filename="{file_data["name"]}"'
             }
         )
 

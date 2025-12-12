@@ -80,7 +80,19 @@ class FileManagerService:
             # 1. Calculate parent_path
             parent_path = self._get_parent_path(parent_folder_id) if parent_folder_id else "/"
 
-            # 2. Create folder in database
+            # 2. Check for duplicate file
+            search_file = (
+                self.client.table("files")
+                .select("*")
+                .eq("name", name)
+                .eq("is_folder", True)
+                .execute()
+            )
+
+            if search_file.data:
+                raise Exception("File name is already in use")    
+
+            # 3. Create folder in database
             folder_data = {
                 "id": folder_id,
                 "user_id": user_id,
@@ -106,7 +118,7 @@ class FileManagerService:
 
             created_folder = response.data[0]
 
-            # 3. Create folder marker in storage
+            # 4. Create folder marker in storage
             try:
                 self.storage_service.create_folder(
                     organization_id=organization_id,
