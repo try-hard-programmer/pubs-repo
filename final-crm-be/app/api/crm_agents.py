@@ -203,7 +203,7 @@ async def get_agent(
     response_model=Agent,
     status_code=status.HTTP_201_CREATED,
     summary="Create new agent",
-    description="Create agent. Auto-normalizes phone. Reactivates if email exists. Reclaims phone if held by inactive agent."
+    description="Create agent. Auto-links to Auth User if email matches. Reactivates if email exists."
 )
 async def create_agent(
     agent: AgentCreate,
@@ -214,27 +214,46 @@ async def create_agent(
         supabase = get_supabase_client()
 
         # [FIX] Normalize phone BEFORE any checks
-        # This prevents "+62812" and "62812" from being treated as different numbers
         if agent.phone:
             agent.phone = normalize_phone(agent.phone)
 
-        # --- 1. UNIQUENESS CHECK ---
+        # =================================================================
+        # 1. AUTO-LINK LOGIC (Check Auth Users)
+        # =================================================================
+        # If user_id is not provided, try to resolve it from the email.
+        # This prevents creating a "Ghost Agent" (email exists but no user_id).
+        if not agent.user_id:
+            # Check 1: Is it the Current User? (Most common case)
+            current_email = current_user.user_metadata.get("email")
+            if current_email and current_email.lower() == agent.email.lower():
+                agent.user_id = current_user.user_id
+                logger.info(f"🔗 Auto-linked new agent to Current User {current_user.user_id}")
+            
+            # (Optional) Check 2: You could search Supabase Auth here if you have an RPC function,
+            # but checking the current user covers 90% of self-registration cases.
+
+        # =================================================================
+        # 2. UNIQUENESS & CONFLICT CHECK
+        # =================================================================
         existing_email_agent, existing_phone_agent = await check_agent_conflicts(
             supabase, organization_id, agent.email, agent.phone
         )
 
-        # --- 2. HANDLE PHONE RECLAMATION ---
+        # =================================================================
+        # 3. HANDLE PHONE RECLAMATION
+        # =================================================================
         # If phone exists on a DIFFERENT inactive agent, we must "free" it first
         if existing_phone_agent:
             # If the phone holder is NOT the one we are about to reactivate (by email)
             if not existing_email_agent or existing_phone_agent["id"] != existing_email_agent["id"]:
                 logger.info(f"♻️ Reclaiming phone {agent.phone} from inactive agent {existing_phone_agent['id']}")
-                # Nullify phone on the old inactive agent so we can use it
                 supabase.table("agents").update({"phone": None}).eq("id", existing_phone_agent["id"]).execute()
 
-        # --- 3. EXECUTION ---
+        # =================================================================
+        # 4. EXECUTION (Reactivate or Insert)
+        # =================================================================
         
-        # SCENARIO A: Reactivate existing Email
+        # SCENARIO A: Reactivate existing Agent (same email)
         if existing_email_agent:
             logger.info(f"♻️ Reactivating inactive agent: {existing_email_agent['id']}")
             
@@ -246,9 +265,10 @@ async def create_agent(
                 "last_active_at": datetime.now(timezone.utc).isoformat()
             }
             
-            # Update user_id only if provided
-            if agent.user_id is not None:
+            # Link user_id if we have one now (and it wasn't set before)
+            if agent.user_id and not existing_email_agent.get("user_id"):
                 reactivate_data["user_id"] = agent.user_id
+                logger.info(f"🔗 Linking reactivated agent to User ID {agent.user_id}")
 
             response = supabase.table("agents").update(reactivate_data).eq("id", existing_email_agent["id"]).execute()
             return Agent(**response.data[0])
@@ -263,7 +283,7 @@ async def create_agent(
             "phone": agent.phone, # Normalized
             "status": agent.status.value,
             "avatar_url": agent.avatar_url,
-            "user_id": agent.user_id,
+            "user_id": agent.user_id, # Can be None or Linked ID
             "assigned_chats_count": 0,
             "resolved_today_count": 0,
             "avg_response_time_seconds": 0,
@@ -295,6 +315,9 @@ async def create_agent(
         raise
     except Exception as e:
         logger.error(f"Error creating agent: {e}")
+        # Improve error message for duplicates
+        if "unique_agent_email_per_org" in str(e):
+             raise HTTPException(400, "An agent with this email already exists.")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
 
 @router.put(
