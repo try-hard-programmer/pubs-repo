@@ -519,110 +519,179 @@ async def get_chats(
     ai_assigned_to: Optional[str] = Query(None, description="Filter by AI agent ID"),
     human_assigned_to: Optional[str] = Query(None, description="Filter by human agent ID"),
     escalated: Optional[bool] = Query(None, description="Filter escalated chats only"),
+    # [NEW] Date Filtering Parameters
     created_after: Optional[datetime] = Query(None, description="Filter chats created after this timestamp (ISO 8601)"),
     created_before: Optional[datetime] = Query(None, description="Filter chats created before this timestamp (ISO 8601)"),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
     current_user: User = Depends(get_current_user)
 ):
-    """Get all chats with filters (OPTIMIZED)"""
+    """Get all chats with filters"""
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # 1. Build Base Query
+        # Build query
         query = supabase.table("chats").select("*", count="exact").eq("organization_id", organization_id)
 
         # Apply filters
-        if status_filter: query = query.eq("status", status_filter.value)
-        if channel: query = query.eq("channel", channel.value)
-        if assigned_to: query = query.eq("assigned_agent_id", assigned_to)
-        if unassigned is True: query = query.is_("assigned_agent_id", "null")
-        if handled_by: query = query.eq("handled_by", handled_by)
-        if ai_assigned_to: query = query.eq("ai_agent_id", ai_assigned_to)
-        if human_assigned_to: query = query.eq("human_agent_id", human_assigned_to)
-        if escalated is True: query = query.not_.is_("escalated_at", "null")
-        if created_after: query = query.gte("created_at", created_after.isoformat())
-        if created_before: query = query.lte("created_at", created_before.isoformat())
+        if status_filter:
+            query = query.eq("status", status_filter.value)
 
-        # Pagination & Execution
+        if channel:
+            query = query.eq("channel", channel.value)
+
+        # Legacy filter (backward compatibility)
+        if assigned_to:
+            query = query.eq("assigned_agent_id", assigned_to)
+
+        if unassigned is True:
+            query = query.is_("assigned_agent_id", "null")
+
+        # New dual agent filters
+        if handled_by:
+            query = query.eq("handled_by", handled_by)
+
+        if ai_assigned_to:
+            query = query.eq("ai_agent_id", ai_assigned_to)
+
+        if human_assigned_to:
+            query = query.eq("human_agent_id", human_assigned_to)
+
+        if escalated is True:
+            query = query.not_.is_("escalated_at", "null")
+
+        # [NEW] Apply Date Range Filters
+        if created_after:
+            query = query.gte("created_at", created_after.isoformat())
+        
+        if created_before:
+            query = query.lte("created_at", created_before.isoformat())
+
+        # Apply pagination
         query = query.range(skip, skip + limit - 1).order("last_message_at", desc=True)
+
+        # Execute query
         response = query.execute()
-        
-        chats_data = response.data
-        if not chats_data:
-            return ChatListResponse(chats=[], total=0)
 
-        # 2. BULK FETCH PREPARATION
-        # Collect IDs to fetch in batch
-        customer_ids = {c["customer_id"] for c in chats_data if c.get("customer_id")}
-        agent_ids = set()
-        for c in chats_data:
-            if c.get("assigned_agent_id"): agent_ids.add(c["assigned_agent_id"])
-            if c.get("ai_agent_id"): agent_ids.add(c["ai_agent_id"])
-            if c.get("human_agent_id"): agent_ids.add(c["human_agent_id"])
-        
-        chat_ids = [c["id"] for c in chats_data]
-
-        # 3. BULK FETCH EXECUTION
-        # Fetch Customers
-        customers_map = {}
-        if customer_ids:
-            cust_res = supabase.table("customers").select("id, name").in_("id", list(customer_ids)).execute()
-            for cust in cust_res.data:
-                customers_map[cust["id"]] = cust["name"]
-
-        # Fetch Agents
-        agents_map = {}
-        if agent_ids:
-            agent_res = supabase.table("agents").select("id, name, user_id").in_("id", list(agent_ids)).execute()
-            for ag in agent_res.data:
-                agents_map[ag["id"]] = {"name": ag["name"], "user_id": ag["user_id"]}
-
-        # Fetch Last Messages (Using a simplified approach or we'd need a View/RPC for true bulk last_message)
-        # For now, we still fetch per chat or need a complex query. 
-        # To optimize strictly without schema change, we iterate but purely for messages (1 query/chat is better than 5).
-        # A better approach is to rely on client-side realtime or separate message fetch, 
-        # but let's keep it functional. 
-        # PRO TIP: Add a 'last_message_preview' column to your 'chats' table to eliminate this loop entirely.
-        
+        # Fetch last message and customer name for each chat
         chats_with_messages = []
-        for chat in chats_data:
-            # Map Customer Name
-            chat["customer_name"] = customers_map.get(chat.get("customer_id"))
 
-            # Map Agent Names
-            if chat.get("assigned_agent_id"):
-                chat["agent_name"] = agents_map.get(chat["assigned_agent_id"], {}).get("name")
-            
-            if chat.get("ai_agent_id"):
-                chat["ai_agent_name"] = agents_map.get(chat["ai_agent_id"], {}).get("name")
-            
-            if chat.get("human_agent_id"):
-                ag_data = agents_map.get(chat["human_agent_id"], {})
-                chat["human_agent_name"] = ag_data.get("name")
-                chat["human_id"] = ag_data.get("user_id")
+        for chat_data in response.data:
+            chat_id = chat_data["id"]
+            customer_id = chat_data.get("customer_id")
 
-            # Fetch Last Message (Still N+1 but reduced scope - Recommend Schema Change here)
-            last_msg_res = supabase.table("messages") \
+            # Get last message for this chat
+            last_message_response = supabase.table("messages") \
                 .select("*") \
-                .eq("chat_id", chat["id"]) \
+                .eq("chat_id", chat_id) \
                 .order("created_at", desc=True) \
                 .limit(1) \
                 .execute()
-            
-            chat["last_message"] = last_msg_res.data[0] if last_msg_res.data else None
-            
-            chats_with_messages.append(Chat(**chat))
+
+            # Add last_message to chat data
+            if last_message_response.data:
+                chat_data["last_message"] = last_message_response.data[0]
+            else:
+                chat_data["last_message"] = None
+
+            # Get customer name
+            customer_name = None
+            if customer_id:
+                try:
+                    customer_response = supabase.table("customers") \
+                        .select("name") \
+                        .eq("id", customer_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if customer_response.data:
+                        customer_name = customer_response.data[0].get("name")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch customer name for customer_id {customer_id}: {e}")
+                    customer_name = None
+
+            # Add customer_name to chat data
+            chat_data["customer_name"] = customer_name
+
+            # Get legacy agent name (for backward compatibility)
+            agent_name = None
+            assigned_agent_id = chat_data.get("assigned_agent_id")
+            if assigned_agent_id:
+                try:
+                    agent_response = supabase.table("agents") \
+                        .select("name") \
+                        .eq("id", assigned_agent_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if agent_response.data:
+                        agent_name = agent_response.data[0].get("name")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch agent name for assigned_agent_id {assigned_agent_id}: {e}")
+                    agent_name = None
+
+            # Add agent_name to chat data
+            chat_data["agent_name"] = agent_name
+
+            # Get AI agent name
+            ai_agent_name = None
+            ai_agent_id = chat_data.get("ai_agent_id")
+            if ai_agent_id:
+                try:
+                    ai_agent_response = supabase.table("agents") \
+                        .select("name") \
+                        .eq("id", ai_agent_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if ai_agent_response.data:
+                        ai_agent_name = ai_agent_response.data[0].get("name")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch AI agent name for ai_agent_id {ai_agent_id}: {e}")
+                    ai_agent_name = None
+
+            # Add ai_agent_name to chat data
+            chat_data["ai_agent_name"] = ai_agent_name
+
+            # Get human agent name
+            human_agent_name = None
+            human_id = None
+            human_agent_id = chat_data.get("human_agent_id")
+            if human_agent_id:
+                try:
+                    human_agent_response = supabase.table("agents") \
+                        .select("name","user_id") \
+                        .eq("id", human_agent_id) \
+                        .eq("organization_id", organization_id) \
+                        .execute()
+
+                    if human_agent_response.data:
+                        human_agent_name = human_agent_response.data[0].get("name")
+                        human_id = human_agent_response.data[0].get("user_id")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch human agent name for human_agent_id {human_agent_id}: {e}")
+                    human_agent_name = None
+
+            # Add human_agent_name to chat data
+            chat_data["human_agent_name"] = human_agent_name
+            chat_data["human_id"] = human_id
+
+            chats_with_messages.append(Chat(**chat_data))
 
         return ChatListResponse(
             chats=chats_with_messages,
             total=response.count if response.count else len(chats_with_messages)
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching chats: {e}")
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to fetch chats")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch chats"
+        )
 
 @router.get(
     "/chats/{chat_id}",

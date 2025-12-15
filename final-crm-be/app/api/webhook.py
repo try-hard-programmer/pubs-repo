@@ -348,130 +348,7 @@ async def flag_message_as_out_of_schedule(
         return False
 
 
-async def handle_intelligence_background(
-    chat_id: str,
-    message_id: str,
-    message_content: str,
-    customer_name: str,
-    customer_id: str,
-    organization_id: str,
-    agent: Dict,
-    channel: str, 
-    contact: str,
-    is_within_schedule: bool,
-    out_of_schedule_reason: Optional[str],
-    agent_is_busy: bool,
-    handled_by: str,
-    supabase
-):
-    """
-    Background task to handle heavy logic (LLM, Ticketing, AI Response)
-    without blocking the webhook response.
-    """
-    try:
-        # 1. Evaluate Intent (Ticket Guard) - LLM Call
-        # Calculate message count
-        try:
-            count_res = supabase.table("messages").select("id", count="exact").eq("chat_id", chat_id).execute()
-            msg_count = count_res.count or 1
-        except:
-            msg_count = 1
-
-        ticket_service = get_ticket_service()
-        decision = await ticket_service.evaluate_incoming_message(
-            message=message_content, 
-            customer_name=customer_name or "Customer",
-            message_count=msg_count
-        )
-
-        should_trigger_ai = True
-
-        # 2. Handle Guard Auto-Reply (e.g. "Hi, how can I help?")
-        if decision.auto_reply_hint:
-            logger.info(f"🤖 Sending Guard Auto-Reply: {decision.auto_reply_hint}")
-            
-            chat_data = {
-                "id": chat_id, 
-                "channel": channel, 
-                "sender_agent_id": agent["id"],
-                "customer_id": customer_id, 
-                "ai_agent_id": agent["id"] 
-            }
-            
-            cust_data = {"phone": contact, "email": contact if "@" in contact else None} 
-            
-            # Send via Channel
-            await send_message_via_channel(
-                chat_data=chat_data,
-                customer_data=cust_data,
-                message_content=decision.auto_reply_hint,
-                supabase=supabase
-            )
-            
-            # Save Reply to DB History
-            msg_response = supabase.table("messages").insert({
-                "chat_id": chat_id,
-                "sender_type": "ai", 
-                "sender_id": agent["id"],
-                "content": decision.auto_reply_hint,
-                "metadata": {"type": "auto_reply_guard"}
-            }).execute()
-
-            # BROADCAST GUARD AUTO-REPLY
-            if msg_response.data:
-                new_msg = msg_response.data[0]
-                try:
-                    conn = get_connection_manager()
-                    await conn.broadcast_new_message(
-                        organization_id=organization_id,
-                        chat_id=chat_id,
-                        message_id=new_msg["id"],
-                        customer_id=customer_id,
-                        customer_name=customer_name or "Customer",
-                        message_content=decision.auto_reply_hint,
-                        channel=channel,
-                        handled_by="ai",
-                        sender_type="ai",
-                        sender_id=agent["id"]
-                    )
-                except Exception as e:
-                    logger.warning(f"WS Broadcast error: {e}")
-
-            should_trigger_ai = False
-
-        # 3. Handle Auto-Ticket
-        if (channel in ["telegram", "whatsapp"]) and decision.should_create_ticket:
-            await process_auto_ticket_async(
-                chat_id=chat_id,
-                customer_id=customer_id,
-                organization_id=organization_id,
-                customer_name=customer_name,
-                message_content=message_content,
-                decision=decision,
-                supabase=supabase
-            )
-
-        # 4. Handle Out-of-Schedule / Busy Status
-        # Note: If out of schedule/busy, we send specific replies and STOP the generic AI
-        if not is_within_schedule:
-            await flag_message_as_out_of_schedule(message_id, out_of_schedule_reason, supabase)
-            await send_out_of_schedule_message(agent, channel, contact, supabase)
-            should_trigger_ai = False
-        elif agent_is_busy:
-            await send_busy_agent_auto_reply(agent, channel, contact, supabase)
-            should_trigger_ai = False
-
-        # 5. Trigger Conversational AI (RAG Agent)
-        # Only if Guard didn't intercept it AND chat is assigned to AI
-        if should_trigger_ai and handled_by == "ai":
-            await process_ai_response_async(
-                chat_id=chat_id,
-                customer_message_id=message_id,
-                supabase=supabase
-            )
-
-    except Exception as e:
-        logger.error(f"❌ Background Intelligence Failed: {e}")
+# ... existing imports ...
 
 # ============================================
 # MAIN PROCESSOR (FIXED)
@@ -487,8 +364,12 @@ async def process_webhook_message(
     customer_metadata: Optional[Dict[str, Any]],
     supabase
 ) -> Dict[str, Any]:
+    """
+    Unified logic to process incoming messages from ANY channel.
+    Handles: Schedule/Busy checks, Routing, WebSockets, Ticket Guard, and AI.
+    """
     
-    # 1. Busy Check & 2. Schedule Check (Fast operations)
+    # 1. SETUP & CHECKS (Busy/Schedule)
     from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
     from zoneinfo import ZoneInfo
     
@@ -500,7 +381,7 @@ async def process_webhook_message(
     current_time_utc = datetime.now(ZoneInfo("UTC"))
     is_within, out_of_schedule_reason = is_within_schedule(schedule_config, current_time_utc)
 
-    # 3. Route Message (Creates Chat & Message in DB)
+    # 2. ROUTE MESSAGE (Save to DB, Link Customer, Create/Update Chat)
     router_service = get_message_router_service(supabase)
     result = await router_service.route_incoming_message(
         agent=agent,
@@ -512,10 +393,7 @@ async def process_webhook_message(
         customer_metadata=customer_metadata
     )
 
-    if not result.get("success"):
-        return result
-
-    # Update Customer Phone if provided
+    # 3. UPDATE CUSTOMER INFO (If phone provided in metadata)
     if customer_metadata and customer_metadata.get("phone"):
         try:
             phone_num = customer_metadata.get("phone")
@@ -525,9 +403,7 @@ async def process_webhook_message(
         except Exception as e:
             logger.warning(f"Failed to update customer phone: {e}")
 
-    # =================================================================================
-    # BROADCAST USER MESSAGE IMMEDIATELY (WS)
-    # =================================================================================
+    # 4. BROADCAST TO WEBSOCKET (Immediate UI Update)
     if app_settings.WEBSOCKET_ENABLED:
         try:
             connection_manager = get_connection_manager()
@@ -548,32 +424,128 @@ async def process_webhook_message(
         except Exception as e:
             logger.warning(f"Failed to send WebSocket notification: {e}")
 
-    # ============================================================
-    # STEP 4: INTELLIGENCE (GUARD + AI) - MOVED TO BACKGROUND
-    # ============================================================
-    # This ensures we return the HTTP response immediately while AI thinks.
+    # 5. TICKET GUARD EVALUATION
+    # We evaluate every message to see if it implies a support ticket
+    ticket_service = get_ticket_service()
+
+    # Get total message count to help Guard decide (e.g. ignore 'Hi' if it's the 100th message)
+    try:
+        count_res = supabase.table("messages").select("id", count="exact").eq("chat_id", result["chat_id"]).execute()
+        msg_count = count_res.count or 1
+    except:
+        msg_count = 1
     
-    asyncio.create_task(
-        handle_intelligence_background(
-            chat_id=result["chat_id"],
-            message_id=result["message_id"],
-            message_content=message_content,
-            customer_name=customer_name or f"{channel.title()} User",
-            customer_id=result["customer_id"],
-            organization_id=organization_id,
-            agent=agent,
-            channel=channel,
-            contact=contact,
-            is_within_schedule=is_within,
-            out_of_schedule_reason=out_of_schedule_reason,
-            agent_is_busy=agent_is_busy,
-            handled_by=result["handled_by"],
-            supabase=supabase
-        )
+    decision = await ticket_service.evaluate_incoming_message(
+        message=message_content, 
+        customer_name=customer_name or "Customer",
+        message_count=msg_count
     )
 
-    return result
+    # By default, we plan to trigger AI, unless a specific condition stops us
+    should_trigger_ai = True
 
+    # 6. HANDLE GUARD ACTIONS
+    
+    # A. Guard Auto-Reply (e.g. "Ticket Created", "Please wait")
+    if decision.auto_reply_hint:
+        logger.info(f"🤖 Sending Guard Auto-Reply: {decision.auto_reply_hint}")
+        
+        # Prepare chat data for sending
+        chat_data_for_send = {
+            "id": result["chat_id"], 
+            "channel": channel, 
+            "sender_agent_id": agent_id,
+            "customer_id": result["customer_id"], 
+            "ai_agent_id": agent_id 
+        }
+        
+        # Prepare contact data
+        cust_data = {"phone": contact, "email": contact if "@" in contact else None} 
+        
+        # Send External Message
+        await send_message_via_channel(
+            chat_data=chat_data_for_send,
+            customer_data=cust_data,
+            message_content=decision.auto_reply_hint,
+            supabase=supabase
+        )
+        
+        # Save System Reply to DB
+        msg_response = supabase.table("messages").insert({
+            "chat_id": result["chat_id"],
+            "sender_type": "ai", 
+            "sender_id": agent_id,
+            "content": decision.auto_reply_hint,
+            "metadata": {"type": "auto_reply_guard"}
+        }).execute()
+
+        # Broadcast System Reply to Frontend
+        if msg_response.data:
+            new_msg = msg_response.data[0]
+            if app_settings.WEBSOCKET_ENABLED:
+                try:
+                    conn = get_connection_manager()
+                    await conn.broadcast_new_message(
+                        organization_id=organization_id,
+                        chat_id=result["chat_id"],
+                        message_id=new_msg["id"],
+                        customer_id=result["customer_id"],
+                        customer_name=customer_name or "Customer",
+                        message_content=decision.auto_reply_hint,
+                        channel=channel,
+                        handled_by="ai",
+                        sender_type="ai",
+                        sender_id=agent_id
+                    )
+                except Exception as e:
+                    logger.warning(f"WS Broadcast error: {e}")
+
+        # STOP AI: Guard already handled the reply
+        should_trigger_ai = False
+
+    # B. Ticket Creation (Background Task)
+    # [FIX] Supports both Telegram and WhatsApp
+    if (channel in ["telegram", "whatsapp"]) and result["success"] and decision.should_create_ticket:
+        asyncio.create_task(
+            process_auto_ticket_async(
+                chat_id=result["chat_id"],
+                customer_id=result["customer_id"],
+                organization_id=organization_id,
+                customer_name=customer_name or f"{channel.title()} User",
+                message_content=message_content,
+                decision=decision,
+                supabase=supabase
+            )
+        )
+
+    # 7. HANDLE UNAVAILABILITY (Out of Schedule / Busy)
+    # Only run if Guard hasn't already replied (to avoid double messages)
+    
+    if not is_within:
+        # Always flag the message in DB
+        await flag_message_as_out_of_schedule(result["message_id"], out_of_schedule_reason, supabase)
+        
+        if should_trigger_ai: 
+            await send_out_of_schedule_message(agent, channel, contact, supabase)
+            should_trigger_ai = False
+        
+    elif agent_is_busy:
+        if should_trigger_ai:
+            await send_busy_agent_auto_reply(agent, channel, contact, supabase)
+            should_trigger_ai = False
+
+    # 8. AI AGENT RESPONSE (Standard RAG/Chat)
+    # Only runs if: Chat is handled by AI AND No Guard/OOS/Busy reply was sent
+    if should_trigger_ai and result["handled_by"] == "ai":
+        asyncio.create_task(
+            process_ai_response_async(
+                chat_id=result["chat_id"],
+                customer_message_id=result["message_id"],
+                supabase=supabase
+            )
+        )
+
+    return result
 
 def get_supabase_client():
     """Get Supabase client from settings"""
@@ -1414,7 +1386,6 @@ def _generate_status_message(result: dict) -> str:
     else:
         return f"Message added to active chat (handled by {result['handled_by']})"
 
-
 @router.post(
     "/telegram-userbot",
     response_model=WebhookRouteResponse,
@@ -1438,11 +1409,8 @@ async def telegram_userbot_webhook(
         message_id = data_content.get("id", {}).get("id")
         timestamp_unix = data_content.get("t")
         
-        # [FIX] Extract Phone Number Safely
-        # Ensure it's not None and not the string "None"
+        # [NEW] Extract Phone Number
         sender_phone = data_content.get("phone")
-        if sender_phone == "None" or sender_phone is None:
-            sender_phone = None
 
         logger.info(f"🤖 Userbot Message: agent={agent_id} sender={sender_id} phone={sender_phone}")
 
@@ -1461,13 +1429,11 @@ async def telegram_userbot_webhook(
             "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None
         }
         
-        # [FIX] Prepare Customer Metadata
-        # Only add phone key if sender_phone actually exists
+        # [NEW] Add phone to customer metadata
         customer_metadata = {
-            "telegram_id": sender_id
+            "telegram_id": sender_id,
+            "phone": sender_phone # This will be picked up by process_webhook_message
         }
-        if sender_phone:
-            customer_metadata["phone"] = sender_phone
 
         result = await process_webhook_message(
             agent=agent,
@@ -1476,7 +1442,7 @@ async def telegram_userbot_webhook(
             message_content=message_text,
             customer_name=sender_display_name,
             message_metadata=message_metadata,
-            customer_metadata=customer_metadata,
+            customer_metadata=customer_metadata, # Passed here
             supabase=supabase
         )
 
