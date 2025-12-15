@@ -156,8 +156,7 @@ async def send_message_via_channel(
         chat_id = chat_data.get("id")
 
         logger.info(f"Attempting to send message via {chat_channel} for chat {chat_id}")
-        logger.info(f"📤 Sending message via {chat_channel} | Chat: {chat_id} | Agent: {sender_agent_id}")
-        
+
         # Route to appropriate channel service
         if chat_channel == CommunicationChannel.WHATSAPP.value or chat_channel == "whatsapp":
             # ============================================
@@ -681,99 +680,127 @@ async def get_chat(
     response_model=Chat,
     status_code=status.HTTP_201_CREATED,
     summary="Create new chat",
-    description="Create a new chat and send initial message via Assigned Agent"
+    description="Create a new chat conversation"
 )
 async def create_chat(
     chat: ChatCreate,
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Create a new chat. 
-    IF assigned_agent_id is provided, use that Agent to send the initial message.
-    """
+    """Create a new chat"""
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
-        
-        logger.info(f"🆕 Creating chat. Channel: {chat.channel.value}, Assigned To: {chat.assigned_agent_id}")
 
-        # =================================================================
-        # STEP 1: FIND OR CREATE CUSTOMER
-        # =================================================================
+        # Step 1: FindOrCreate customer
         customer_id = chat.customer_id
 
+        # customer check
         if not customer_id:
+            # Need customer_name and contact for findOrCreate
             if not chat.customer_name or not chat.contact:
-                raise HTTPException(400, "Customer details required (name + contact)")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Either customer_id or both customer_name and contact must be provided"
+                )
 
-            # Check existing by phone OR email
-            existing = supabase.table("customers") \
+            # Try to find existing customer by contact (check both phone and email)
+            existing_customer = supabase.table("customers") \
                 .select("id") \
                 .eq("organization_id", organization_id) \
                 .or_(f"phone.eq.{chat.contact},email.eq.{chat.contact}") \
                 .execute()
-            
-            if existing.data:
-                customer_id = existing.data[0]["id"]
+
+            if existing_customer.data:
+                # Customer found
+                customer_id = existing_customer.data[0]["id"]
+                logger.info(f"Found existing customer: {customer_id} for contact {chat.contact}")
             else:
-                # Create New Customer
-                cust_payload = {
+                # Create new customer
+                customer_data = {
                     "organization_id": organization_id,
                     "name": chat.customer_name,
                     "phone": chat.contact if chat.channel == CommunicationChannel.WHATSAPP else None,
                     "email": chat.contact if "@" in chat.contact else None,
                     "metadata": {}
                 }
-                # Store Telegram ID if channel is Telegram
-                if chat.channel == CommunicationChannel.TELEGRAM:
-                    cust_payload["metadata"]["telegram_contact"] = chat.contact
 
-                new_cust = supabase.table("customers").insert(cust_payload).execute()
-                if not new_cust.data:
-                    raise HTTPException(500, "Failed to create customer")
-                customer_id = new_cust.data[0]["id"]
-        
-        # =================================================================
-        # STEP 2: ASSIGNMENT LOGIC (PRIORITIZE REQUEST PAYLOAD)
-        # =================================================================
-        assigned_agent_id = chat.assigned_agent_id  # <--- READ FROM PAYLOAD
-        
+                new_customer = supabase.table("customers").insert(customer_data).execute()
+
+                if not new_customer.data:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Failed to create customer"
+                    )
+
+                customer_id = new_customer.data[0]["id"]
+                logger.info(f"Created new customer: {customer_id} for {chat.customer_name}")
+        else:
+            # Verify customer exists if customer_id was provided
+            customer_check = supabase.table("customers").select("id").eq("id", customer_id).eq("organization_id", organization_id).execute()
+
+            if not customer_check.data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Customer with ID {customer_id} not found"
+                )
+
+        # Step 2: Determine agent assignment (AI first, then human if specified)
         ai_agent_id = None
         human_agent_id = None
         handled_by = "unassigned"
+        assigned_agent_id = None
         status_value = "open"
 
-        default_ai = await get_default_ai_agent(organization_id, supabase)
+        # Get default AI agent for auto-assignment
+        default_ai_agent = await get_default_ai_agent(organization_id, supabase)
 
-        if assigned_agent_id:
-            # 2a. Validate Assigned Agent
-            agent_check = supabase.table("agents").select("id, user_id").eq("id", assigned_agent_id).single().execute()
+        # Check if assigned_agent_id is provided (legacy behavior)
+        if chat.assigned_agent_id:
+            # Verify agent exists
+            agent_check = supabase.table("agents").select("id", "user_id").eq("id", chat.assigned_agent_id).eq("organization_id", organization_id).execute()
+
             if not agent_check.data:
-                 raise HTTPException(404, f"Assigned Agent {assigned_agent_id} not found")
-            
-            # Determine if Human or AI
-            if agent_check.data.get("user_id"):
-                human_agent_id = assigned_agent_id
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Agent with ID {chat.assigned_agent_id} not found"
+                )
+
+            agent_data = agent_check.data[0]
+            assigned_agent_id = chat.assigned_agent_id
+
+            # Check if assigned agent is AI or Human
+            if agent_data.get("user_id") is None:
+                # It's an AI agent
+                ai_agent_id = chat.assigned_agent_id
+                handled_by = "ai"
+                status_value = "open"
+            else:
+                # It's a human agent - skip AI and go straight to human
+                human_agent_id = chat.assigned_agent_id
                 handled_by = "human"
                 status_value = "assigned"
-            else:
-                ai_agent_id = assigned_agent_id
-                handled_by = "ai"
+                # Also assign default AI agent to show it was available
+                if default_ai_agent:
+                    ai_agent_id = default_ai_agent
         else:
-            # 2b. Auto-Assign Fallback (if payload didn't have agent)
-            if default_ai:
-                ai_agent_id = default_ai
-                assigned_agent_id = default_ai
+            # No agent specified - auto-assign to AI
+            if default_ai_agent:
+                ai_agent_id = default_ai_agent
+                assigned_agent_id = default_ai_agent
                 handled_by = "ai"
+                status_value = "open"
+                logger.info(f"Auto-assigning chat to AI agent {ai_agent_id}")
+            else:
+                logger.warning(f"No AI agent available for organization {organization_id}, chat will be unassigned")
+                handled_by = "unassigned"
+                status_value = "open"
 
-        # =================================================================
-        # STEP 3: CREATE CHAT IN DB
-        # =================================================================
-        chat_insert = {
+        # Step 3: Prepare chat data
+        chat_data = {
             "organization_id": organization_id,
             "customer_id": customer_id,
             "channel": chat.channel.value,
-            "assigned_agent_id": assigned_agent_id, # <--- SAVED TO DB
+            "assigned_agent_id": assigned_agent_id,  # For backward compatibility
             "ai_agent_id": ai_agent_id,
             "human_agent_id": human_agent_id,
             "handled_by": handled_by,
@@ -782,66 +809,51 @@ async def create_chat(
             "last_message_at": datetime.utcnow().isoformat()
         }
 
-        response = supabase.table("chats").insert(chat_insert).execute()
-        if not response.data:
-             raise HTTPException(500, "Failed to create chat record")
-             
-        new_chat = response.data[0]
+        # Insert chat
+        response = supabase.table("chats").insert(chat_data).execute()
 
-        # =================================================================
-        # STEP 4: SEND INITIAL MESSAGE VIA ASSIGNED AGENT
-        # =================================================================
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create chat"
+            )
+
+        chat_data = response.data[0]
+        logger.info(f"Chat created: {chat_data['id']} by user {current_user.user_id}")
+
+        # Step 3: Create initial message if provided
         last_message = None
         if chat.initial_message:
-            # 4a. Save Message to DB
-            msg_data = {
-                "chat_id": new_chat["id"],
-                "sender_type": "agent",
+            message_data = {
+                "chat_id": chat_data["id"],
+                "sender_type": "agent",  # Initial message is from customer
                 "sender_id": current_user.user_id,
                 "content": chat.initial_message,
                 "metadata": {}
             }
-            msg_res = supabase.table("messages").insert(msg_data).execute()
-            
-            if msg_res.data:
-                last_message = msg_res.data[0]
-                
-                # 4b. TRIGGER EXTERNAL SEND (TELEGRAM/WHATSAPP)
-                try:
-                    # Get Customer Info
-                    cust_res = supabase.table("customers").select("*").eq("id", customer_id).single().execute()
-                    
-                    if cust_res.data and assigned_agent_id:
-                        # Prepare Payload
-                        send_payload = new_chat.copy()
-                        
-                        # FORCE SENDER TO BE THE ASSIGNED AGENT
-                        # This ensures we use THAT agent's Telegram Session
-                        send_payload["sender_agent_id"] = assigned_agent_id 
-                        
-                        logger.info(f"🚀 Sending Initial Message via Agent: {assigned_agent_id}")
-                        
-                        await send_message_via_channel(
-                            chat_data=send_payload,
-                            customer_data=cust_res.data,
-                            message_content=chat.initial_message,
-                            supabase=supabase
-                        )
-                    else:
-                        if not assigned_agent_id:
-                             logger.warning("⚠️ Cannot send initial message: No Assigned Agent ID provided.")
-                        
-                except Exception as e:
-                    logger.error(f"❌ Failed to send initial message: {e}")
 
-        new_chat["last_message"] = last_message
-        return Chat(**new_chat)
+            message_response = supabase.table("messages").insert(message_data).execute()
 
-    except HTTPException: raise
+            if message_response.data:
+                logger.info(f"Initial message created in chat {chat_data['id']}")
+                last_message = message_response.data[0]
+            else:
+                logger.warning(f"Failed to create initial message in chat {chat_data['id']}")
+
+        # Add last_message to chat data
+        chat_data["last_message"] = last_message
+
+        return Chat(**chat_data)
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating chat: {e}")
-        raise HTTPException(500, "Failed to create chat")
-    
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create chat"
+        )
+
 
 @router.put(
     "/chats/{chat_id}/assign",
