@@ -7,8 +7,10 @@ from fastapi.responses import JSONResponse
 import logging
 import asyncio
 import base64
+import json 
 import uuid
-from datetime import datetime, timezone  # Fixed Import
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any
 
 from app.models.webhook import (
@@ -30,6 +32,8 @@ from app.models.webhook import WhatsAppUnofficialWebhookMessage, WebhookRouteRes
 from app.models.ticket import TicketCreate, ActorType, TicketPriority, TicketDecision
 from app.services.ticket_service import get_ticket_service
 from app.api.crm_chats import send_message_via_channel
+from app.utils.ml_guard import ml_guard
+from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,11 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 # ============================================
 # HELPER FUNCTIONS
 # ============================================
+
+def _generate_status_message(result: dict) -> str:
+    if result.get("status") == "dropped_inactive": return "Message dropped (Agent Inactive)"
+    if result.get("handled_by") == "system_busy": return "Auto-reply sent (Agent Busy)"
+    return "Message processed"
 
 async def process_auto_ticket_async(
     chat_id: str,
@@ -91,7 +100,6 @@ async def process_auto_ticket_async(
     except Exception as e:
         logger.error(f"❌ Auto-Ticket creation failed: {e}")
 
-
 def is_agent_busy(agent: dict) -> bool:
     """
     Check if agent is busy
@@ -103,7 +111,6 @@ def is_agent_busy(agent: dict) -> bool:
         True if agent status is 'busy', False otherwise
     """
     return agent.get("status") == "busy"
-
 
 async def send_busy_agent_auto_reply(
     agent: dict,
@@ -192,7 +199,6 @@ async def send_busy_agent_auto_reply(
     except Exception as e:
         logger.error(f"❌ Error in send_busy_agent_auto_reply: {e}")
         return False
-
 
 async def send_out_of_schedule_message(
     agent: dict,
@@ -285,7 +291,6 @@ async def send_out_of_schedule_message(
         logger.error(f"❌ Error in send_out_of_schedule_message: {e}")
         return False
 
-
 async def flag_message_as_out_of_schedule(
     message_id: str,
     reason: str,
@@ -347,224 +352,194 @@ async def flag_message_as_out_of_schedule(
         logger.error(f"❌ Error flagging message as out-of-schedule: {e}")
         return False
 
+def parse_agent_config(config_data: Any) -> Dict:
+    if not config_data: return {}
+    if isinstance(config_data, dict): return config_data
+    if isinstance(config_data, str):
+        try: return json.loads(config_data)
+        except: return {}
+    return {}
 
-# ... existing imports ...
+async def fetch_agent_settings(supabase, agent_id: str) -> Dict[str, Any]:
+    try:
+        res = supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute()
+        if res.data:
+            data = res.data[0]
+            data.pop("id", None) 
+            data.pop("created_at", None)
+            data.pop("updated_at", None)
+            return data
+    except Exception: pass
+    return {}
+
+async def check_telegram_idempotency(supabase, msg_id: str) -> bool:
+    if not msg_id: return False
+    res = supabase.table("messages").select("id").eq("metadata->>telegram_message_id", str(msg_id)).execute()
+    if res.data:
+        logger.warning(f"🛑 Duplicate Message ID {msg_id}")
+        return True
+    return False
+
+async def send_auto_reply(supabase, channel: str, agent_id: str, contact_info: Dict, message_text: str):
+    """Sends reply via channel (WhatsApp/Telegram)."""
+    try:
+        if channel == "whatsapp":
+            from app.services.whatsapp_service import get_whatsapp_service
+            await get_whatsapp_service().send_text_message(agent_id, contact_info.get("phone"), message_text)
+        elif channel == "telegram":
+            chat_data = {"id": "temp_auto_reply", "channel": "telegram", "sender_agent_id": agent_id}
+            customer_data = {"telegram_id": contact_info.get("telegram_id")}
+            await send_message_via_channel(chat_data, customer_data, message_text, supabase)
+    except Exception as e:
+        logger.error(f"❌ Auto-reply failed: {e}")
+
+async def save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, content, channel, metadata=None):
+    """Explicitly saves system/AI messages to DB and updates Frontend."""
+    try:
+        msg_data = {
+            "chat_id": chat_id,
+            "sender_type": "ai",
+            "sender_id": agent_id,
+            "content": content,
+            "metadata": metadata or {"type": "auto_reply"}
+        }
+        res = supabase.table("messages").insert(msg_data).execute()
+        
+        if res.data and app_settings.WEBSOCKET_ENABLED:
+            new_msg = res.data[0]
+            await get_connection_manager().broadcast_new_message(
+                organization_id=org_id, chat_id=chat_id, message_id=new_msg["id"],
+                customer_id=None, customer_name="AI Agent",
+                message_content=content, channel=channel, handled_by="ai",
+                sender_type="ai", sender_id=agent_id
+            )
+    except Exception as e:
+        logger.error(f"Failed to save/broadcast system message: {e}")
 
 # ============================================
 # MAIN PROCESSOR (FIXED)
 # ============================================
 
-async def process_webhook_message(
-    agent: Dict,
-    channel: str,
-    contact: str,
-    message_content: str,
-    customer_name: Optional[str],
-    message_metadata: Optional[Dict[str, Any]],
-    customer_metadata: Optional[Dict[str, Any]],
-    supabase
-) -> Dict[str, Any]:
-    """
-    Unified logic to process incoming messages from ANY channel.
-    Handles: Schedule/Busy checks, Routing, WebSockets, Ticket Guard, and AI.
-    """
-    
-    # 1. SETUP & CHECKS (Busy/Schedule)
-    from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
-    from zoneinfo import ZoneInfo
-    
-    organization_id = agent["organization_id"]
-    agent_id = agent["id"]
-    agent_is_busy = is_agent_busy(agent)
-    
-    schedule_config = await get_agent_schedule_config(agent_id, supabase)
-    current_time_utc = datetime.now(ZoneInfo("UTC"))
-    is_within, out_of_schedule_reason = is_within_schedule(schedule_config, current_time_utc)
-
-    # 2. ROUTE MESSAGE (Save to DB, Link Customer, Create/Update Chat)
-    router_service = get_message_router_service(supabase)
-    result = await router_service.route_incoming_message(
-        agent=agent,
-        channel=channel,
-        contact=contact,
-        message_content=message_content,
-        customer_name=customer_name,
-        message_metadata=message_metadata,
-        customer_metadata=customer_metadata
-    )
-
-    # 3. UPDATE CUSTOMER INFO (If phone provided in metadata)
-    if customer_metadata and customer_metadata.get("phone"):
-        try:
-            phone_num = customer_metadata.get("phone")
-            cust_id = result.get("customer_id")
-            if cust_id and phone_num:
-                supabase.table("customers").update({"phone": phone_num}).eq("id", cust_id).execute()
-        except Exception as e:
-            logger.warning(f"Failed to update customer phone: {e}")
-
-    # 4. BROADCAST TO WEBSOCKET (Immediate UI Update)
-    if app_settings.WEBSOCKET_ENABLED:
-        try:
-            connection_manager = get_connection_manager()
-            await connection_manager.broadcast_new_message(
-                organization_id=organization_id,
-                chat_id=result["chat_id"],
-                message_id=result["message_id"],
-                customer_id=result["customer_id"],
-                customer_name=customer_name or "Unknown",
-                message_content=message_content,
-                channel=channel,
-                handled_by=result["handled_by"],
-                sender_type="customer", 
-                sender_id=result["customer_id"],
-                is_new_chat=result["is_new_chat"],
-                was_reopened=result["was_reopened"]
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send WebSocket notification: {e}")
-
-    # 5. TICKET GUARD EVALUATION
-    # We evaluate every message to see if it implies a support ticket
-    ticket_service = get_ticket_service()
-
-    # Get total message count to help Guard decide (e.g. ignore 'Hi' if it's the 100th message)
-    try:
-        count_res = supabase.table("messages").select("id", count="exact").eq("chat_id", result["chat_id"]).execute()
-        msg_count = count_res.count or 1
-    except:
-        msg_count = 1
-    
-    decision = await ticket_service.evaluate_incoming_message(
-        message=message_content, 
-        customer_name=customer_name or "Customer",
-        message_count=msg_count
-    )
-
-    # By default, we plan to trigger AI, unless a specific condition stops us
-    should_trigger_ai = True
-
-    # 6. HANDLE GUARD ACTIONS
-    
-    # A. Guard Auto-Reply (e.g. "Ticket Created", "Please wait")
-    if decision.auto_reply_hint:
-        logger.info(f"🤖 Sending Guard Auto-Reply: {decision.auto_reply_hint}")
-        
-        # Prepare chat data for sending
-        chat_data_for_send = {
-            "id": result["chat_id"], 
-            "channel": channel, 
-            "sender_agent_id": agent_id,
-            "customer_id": result["customer_id"], 
-            "ai_agent_id": agent_id 
-        }
-        
-        # Prepare contact data
-        cust_data = {"phone": contact, "email": contact if "@" in contact else None} 
-        
-        # Send External Message
-        await send_message_via_channel(
-            chat_data=chat_data_for_send,
-            customer_data=cust_data,
-            message_content=decision.auto_reply_hint,
-            supabase=supabase
-        )
-        
-        # Save System Reply to DB
-        msg_response = supabase.table("messages").insert({
-            "chat_id": result["chat_id"],
-            "sender_type": "ai", 
-            "sender_id": agent_id,
-            "content": decision.auto_reply_hint,
-            "metadata": {"type": "auto_reply_guard"}
-        }).execute()
-
-        # Broadcast System Reply to Frontend
-        if msg_response.data:
-            new_msg = msg_response.data[0]
-            if app_settings.WEBSOCKET_ENABLED:
-                try:
-                    conn = get_connection_manager()
-                    await conn.broadcast_new_message(
-                        organization_id=organization_id,
-                        chat_id=result["chat_id"],
-                        message_id=new_msg["id"],
-                        customer_id=result["customer_id"],
-                        customer_name=customer_name or "Customer",
-                        message_content=decision.auto_reply_hint,
-                        channel=channel,
-                        handled_by="ai",
-                        sender_type="ai",
-                        sender_id=agent_id
-                    )
-                except Exception as e:
-                    logger.warning(f"WS Broadcast error: {e}")
-
-        # STOP AI: Guard already handled the reply
-        should_trigger_ai = False
-
-    # B. Ticket Creation (Background Task)
-    # [FIX] Supports both Telegram and WhatsApp
-    if (channel in ["telegram", "whatsapp"]) and result["success"] and decision.should_create_ticket:
-        asyncio.create_task(
-            process_auto_ticket_async(
-                chat_id=result["chat_id"],
-                customer_id=result["customer_id"],
-                organization_id=organization_id,
-                customer_name=customer_name or f"{channel.title()} User",
-                message_content=message_content,
-                decision=decision,
-                supabase=supabase
-            )
-        )
-
-    # 7. HANDLE UNAVAILABILITY (Out of Schedule / Busy)
-    # Only run if Guard hasn't already replied (to avoid double messages)
-    
-    if not is_within:
-        # Always flag the message in DB
-        await flag_message_as_out_of_schedule(result["message_id"], out_of_schedule_reason, supabase)
-        
-        if should_trigger_ai: 
-            await send_out_of_schedule_message(agent, channel, contact, supabase)
-            should_trigger_ai = False
-        
-    elif agent_is_busy:
-        if should_trigger_ai:
-            await send_busy_agent_auto_reply(agent, channel, contact, supabase)
-            should_trigger_ai = False
-
-    # 8. AI AGENT RESPONSE (Standard RAG/Chat)
-    # Only runs if: Chat is handled by AI AND No Guard/OOS/Busy reply was sent
-    if should_trigger_ai and result["handled_by"] == "ai":
-        asyncio.create_task(
-            process_ai_response_async(
-                chat_id=result["chat_id"],
-                customer_message_id=result["message_id"],
-                supabase=supabase
-            )
-        )
-
-    return result
-
 def get_supabase_client():
-    """Get Supabase client from settings"""
     from supabase import create_client
-
     if not app_settings.is_supabase_configured:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Supabase is not configured"
-        )
-
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Supabase is not configured")
     return create_client(app_settings.SUPABASE_URL, app_settings.SUPABASE_SERVICE_KEY)
 
-
-def _generate_status_message(result: dict) -> str:
-    if result["is_new_chat"]: return "New chat created"
-    elif result["was_reopened"]: return "Chat reopened"
-    else: return "Message added"
+async def process_webhook_message(
+    agent: Dict, channel: str, contact: str, message_content: str,
+    customer_name: Optional[str], message_metadata: Dict, customer_metadata: Dict, supabase
+) -> Dict:
     
+    agent_id = agent["id"]
+    org_id = agent["organization_id"]
+
+    # 1. INACTIVE CHECK
+    if agent.get("status") == "inactive":
+        return {"success": False, "status": "dropped_inactive"}
+
+    # 2. ROUTING
+    router = get_message_router_service(supabase)
+    res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
+    chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
+
+    # 2a. Update Phone
+    if customer_metadata.get("phone") and cust_id:
+        try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
+        except: pass
+
+    # 2b. Broadcast Incoming
+    if app_settings.WEBSOCKET_ENABLED:
+        try:
+            await get_connection_manager().broadcast_new_message(
+                organization_id=org_id, chat_id=chat_id, message_id=msg_id,
+                customer_id=cust_id, customer_name=customer_name or "Unknown",
+                message_content=message_content, channel=channel, handled_by=res["handled_by"],
+                sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
+                was_reopened=res.get("was_reopened", False)
+            )
+        except: pass
+
+    # 3. BUSY CHECK
+    if agent.get("status") == "busy":
+        msg = "Maaf, saat ini kami sedang sibuk."
+        contact_info = {"phone": contact} if channel == "whatsapp" else {"telegram_id": contact}
+        await send_auto_reply(supabase, channel, agent_id, contact_info, msg)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
+        return {**res, "handled_by": "system_busy"}
+
+    # 4. ACTIVE TICKET CHECK
+    active_ticket = supabase.table("tickets").select("id").eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
+    if active_ticket.data:
+        logger.info(f"🎫 Active Ticket Found.")
+        return {**res, "handled_by": "human_ticket"}
+
+    # 5. SCHEDULE CHECK
+    schedule = await get_agent_schedule_config(agent_id, supabase)
+    is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
+    if not is_within:
+        msg = "Maaf kami sedang tutup saat ini."
+        supabase.table("messages").update({"metadata": {**message_metadata, "out_of_schedule": True}}).eq("id", msg_id).execute()
+        contact_info = {"phone": contact} if channel == "whatsapp" else {"telegram_id": contact}
+        await send_message_via_channel({"id": chat_id, "channel": channel, "sender_agent_id": agent_id}, contact_info, msg, supabase)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
+        return {**res, "handled_by": "ooo_system"}
+
+    # 6. INTELLIGENCE (Guard)
+    ticket_config = parse_agent_config(agent.get("ticketing_config"))
+    should_trigger_ai = True
+
+    if ticket_config.get("enabled"):
+        should_ticket, pred_cat, prio_str, conf, reason, ticket_title = ml_guard.predict(message_content)
+        
+        # [LOGIC A] LOW PRIORITY -> GREETING (Stop AI)
+        if prio_str == "low":
+            logger.info(f"🛡️ Low Priority ({reason}). Sending Greeting & Stopping AI.")
+            greeting_msg = (
+                f"Halo {customer_name or 'Kak'}! 👋\n\n"
+                "Pesan Anda telah kami terima melalui platform Syntra.\n"
+                "Silakan jelaskan permasalahan yang Anda alami secara lebih rinci agar kami dapat membantu Anda dengan lebih baik."
+            )
+            chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
+            cust_data = {"phone": contact} if channel == "whatsapp" else {"telegram_id": contact}
+            await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
+            await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel)
+            
+            should_trigger_ai = False
+            return {**res, "handled_by": "system_greeting"}
+
+        # [LOGIC B] HIGH/MEDIUM -> CREATE TICKET ONLY (Allow AI to reply)
+        elif should_ticket and ticket_config.get("autoCreateTicket"):
+            final_cat = pred_cat
+            if ticket_config.get("categories") and pred_cat not in ticket_config["categories"]:
+                final_cat = ticket_config["categories"][0]
+
+            logger.info(f"🤖 Creating Ticket: {final_cat} [{prio_str}]")
+            try: final_prio = TicketPriority(prio_str)
+            except: final_prio = TicketPriority.MEDIUM
+
+            ticket_svc = get_ticket_service()
+            ticket_data = TicketCreate(
+                chat_id=chat_id, customer_id=cust_id,
+                title=ticket_title, description=f"Message: {message_content}",
+                priority=final_prio, category=final_cat
+            )
+            
+            # Create Ticket (Background)
+            await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
+            
+            # [FIX] REMOVED THE SYSTEM REPLY HERE
+            # The Ticket is created, but we say NOTHING.
+            # We let 'should_trigger_ai' remain True so the AI picks up the conversation naturally.
+
+    # 7. AI RESPONSE
+    if should_trigger_ai:
+        logger.info(f"🤖 Triggering AI Response for Chat {chat_id}")
+        asyncio.create_task(process_ai_response_async(chat_id, msg_id, supabase))
+        return {**res, "handled_by": "ai"}
+    
+    return res
+
 # ============================================
 # WHATSAPP WEBHOOK
 # ============================================
@@ -844,155 +819,84 @@ async def whatsapp_unofficial_webhook(
 # TELEGRAM WEBHOOK
 # ============================================
 
-@router.post(
-    "/telegram",
-    response_model=WebhookRouteResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Receive Telegram message",
-    description="Webhook endpoint to receive incoming messages from Telegram bot",
-    responses={
-        401: {"description": "Missing or invalid X-API-Key header"},
-        404: {"description": "No agent integration found"},
-        500: {"description": "Internal server error"}
-    }
-)
-async def telegram_webhook(
-    message: TelegramWebhookMessage,
-    secret: str = Depends(get_webhook_secret)
-):
-    """
-    Receive incoming Telegram message and route to correct chat.
-
-    **Authentication:** Requires `X-API-Key` header with valid secret key.
-
-    **Flow:** Same as WhatsApp webhook but for Telegram.
-
-    **Request Example:**
-    ```json
-    {
-        "telegram_id": "123456789",
-        "bot_token": "123456:ABC-DEF...",
-        "bot_username": "my_support_bot",
-        "username": "johndoe",
-        "first_name": "John",
-        "last_name": "Doe",
-        "message": "Hello from Telegram",
-        "message_id": 999,
-        "timestamp": "2025-10-21T15:30:00Z"
-    }
-    ```
-
-    Args:
-        message: Telegram webhook message
-        secret: Validated webhook secret (injected by dependency)
-
-    Returns:
-        WebhookRouteResponse with routing details
-
-    Raises:
-        HTTPException: If routing fails or no agent integration found
-    """
+@router.post("/telegram", response_model=WebhookRouteResponse)
+async def telegram_webhook(message: TelegramWebhookMessage, secret: str = Depends(get_webhook_secret)):
     try:
-        logger.info(
-            f"✈️ Telegram webhook received: "
-            f"telegram_id={message.telegram_id}, bot={message.bot_username or 'token'}"
-        )
-
-        # Get Supabase client
         supabase = get_supabase_client()
+        if await check_telegram_idempotency(supabase, str(message.message_id)):
+            return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
 
-        # STEP 1: Find agent by Telegram integration
         agent_finder = get_agent_finder_service(supabase)
-        agent = await agent_finder.find_agent_by_telegram_bot(
-            bot_token=message.bot_token,
-            bot_username=message.bot_username
+        agent = await agent_finder.find_agent_by_telegram_bot(message.bot_token, message.bot_username)
+        if not agent: raise HTTPException(404, "Agent not found")
+        
+        settings_data = await fetch_agent_settings(supabase, agent["id"])
+        if settings_data: agent.update(settings_data)
+
+        customer_name = f"@{message.username}" if message.username else message.first_name
+        msg_meta = {"telegram_message_id": message.message_id, "telegram_chat_id": message.chat_id, "timestamp": message.timestamp, **message.metadata}
+        cust_meta = {"telegram_username": message.username, "telegram_first_name": message.first_name, "phone": str(message.telegram_id)}
+
+        result = await process_webhook_message(agent, "telegram", str(message.telegram_id), message.message, customer_name, msg_meta, cust_meta, supabase)
+        
+        return WebhookRouteResponse(
+            success=True, chat_id=result.get("chat_id"), message_id=result.get("message_id"), 
+            customer_id=result.get("customer_id"), is_new_chat=result.get("is_new_chat", False),
+            was_reopened=result.get("was_reopened", False),
+            handled_by=result.get("handled_by", "unknown"), status=result.get("status", "processed"), 
+            channel="telegram", message=_generate_status_message(result)
         )
-
-        if not agent:
-            logger.error(
-                f"❌ No agent integration found for Telegram bot: "
-                f"{message.bot_username or message.bot_token[:20]}"
-            )
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No agent integration found for Telegram bot"
-            )
-
-        organization_id = agent["organization_id"]
-        logger.info(
-            f"✅ Agent found: {agent['name']} (org={organization_id}, "
-            f"is_ai={agent['user_id'] is None}, status={agent.get('status')})"
-        )
-
-        # Generate customer name from Telegram data
-        customer_name = None
-        if message.first_name:
-            customer_name = message.first_name
-            if message.last_name:
-                customer_name += f" {message.last_name}"
-        elif message.username:
-            customer_name = f"@{message.username}"
-
-        # Prepare message metadata
-        message_metadata = {
-            "telegram_message_id": message.message_id,
-            "telegram_chat_id": message.chat_id,
-            "message_type": message.message_type,
-            "photo_url": message.photo_url,
-            "document_url": message.document_url,
-            "timestamp": message.timestamp,
-            **message.metadata
-        }
-
-        # Prepare customer metadata
-        customer_metadata = {
-            "telegram_username": message.username,
-            "telegram_first_name": message.first_name,
-            "telegram_last_name": message.last_name
-        }
-
-        # STEP 2: Process webhook message (unified logic)
-        result = await process_webhook_message(
-            agent=agent,
-            channel="telegram",
-            contact=message.telegram_id,
-            message_content=message.message,
-            customer_name=customer_name,
-            message_metadata=message_metadata,
-            customer_metadata=customer_metadata,
-            supabase=supabase
-        )
-
-        # Prepare response
-        response = WebhookRouteResponse(
-            success=True,
-            chat_id=result["chat_id"],
-            message_id=result["message_id"],
-            customer_id=result["customer_id"],
-            is_new_chat=result["is_new_chat"],
-            was_reopened=result["was_reopened"],
-            handled_by=result["handled_by"],
-            status=result["status"],
-            channel=result["channel"],
-            message=_generate_status_message(result)
-        )
-
-        logger.info(
-            f"✅ Telegram message routed: "
-            f"chat={result['chat_id']}, is_new={result['is_new_chat']}"
-        )
-
-        return response
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"❌ Error processing Telegram webhook: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process Telegram message: {str(e)}"
-        )
+        logger.error(f"Telegram Error: {e}")
+        raise HTTPException(500, str(e))
 
+@router.post("/telegram-userbot", response_model=WebhookRouteResponse)
+async def telegram_userbot_webhook(payload: WhatsAppUnofficialWebhookMessage, secret: str = Depends(get_webhook_secret)):
+    try:
+        agent_id = payload.sessionId
+        data_wrapper = payload.data.get("message", {}) or {}
+        data_content = data_wrapper.get("_data", {})
+        if not data_content: raise HTTPException(400, "Invalid JSON structure")
+        
+        msg_id = data_content.get("id", {}).get("id")
+        supabase = get_supabase_client()
+        if await check_telegram_idempotency(supabase, str(msg_id)):
+             return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
+
+        sender_id = data_content.get("from")
+        message_text = data_content.get("body", "")
+        sender_display_name = data_content.get("notifyName", f"User {sender_id}")
+        timestamp_unix = data_content.get("t")
+        
+        raw_phone = data_content.get("phone")
+        final_phone = str(sender_id)
+        if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
+            final_phone = str(raw_phone)
+
+        logger.info(f"🤖 Userbot Message: agent={agent_id} sender={sender_id} phone={final_phone}")
+
+        agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
+        if not agent_res.data: raise HTTPException(404, "Agent not found")
+        agent = agent_res.data[0]
+
+        settings_data = await fetch_agent_settings(supabase, agent_id)
+        if settings_data: agent.update(settings_data)
+
+        msg_meta = {"source_format": "wa_unofficial_json", "telegram_message_id": msg_id, "telegram_sender_id": sender_id, "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None}
+        cust_meta = {"telegram_id": sender_id, "phone": final_phone}
+
+        result = await process_webhook_message(agent, "telegram", str(sender_id), message_text, sender_display_name, msg_meta, cust_meta, supabase)
+        
+        return WebhookRouteResponse(
+            success=True, chat_id=result["chat_id"], message_id=result["message_id"], 
+            customer_id=result["customer_id"], is_new_chat=result["is_new_chat"], 
+            was_reopened=result.get("was_reopened", False),
+            handled_by=result["handled_by"], status=result["status"], 
+            channel="telegram", message=_generate_status_message(result)
+        )
+    except Exception as e:
+        logger.error(f"Userbot Error: {e}")
+        raise HTTPException(500, str(e))
 
 # ============================================
 # EMAIL WEBHOOK
@@ -1126,7 +1030,6 @@ async def email_webhook(
             detail=f"Failed to process Email: {str(e)}"
         )
 
-
 # ============================================
 # WA-UNOFFICIAL HELPER FUNCTIONS
 # ============================================
@@ -1193,7 +1096,6 @@ async def _upload_media_to_supabase(
         logger.error(f"Failed to upload media to Supabase: {e}")
         raise Exception(f"Media upload failed: {str(e)}")
 
-
 def _extract_phone_number(whatsapp_id: str) -> str:
     """
     Extract phone number from WhatsApp ID format
@@ -1206,8 +1108,8 @@ def _extract_phone_number(whatsapp_id: str) -> str:
     """
     return whatsapp_id.split("@")[0] if "@" in whatsapp_id else whatsapp_id
 
-
 async def _convert_unofficial_to_standard(
+        
     unofficial_message: WhatsAppUnofficialWebhookMessage
 ) -> WhatsAppWebhookMessage:
     """
@@ -1353,113 +1255,11 @@ async def _convert_unofficial_to_standard(
     except HTTPException:
         raise
     except Exception as e:
+
         logger.error(f"Failed to convert unofficial message to standard format: {e}")
         raise HTTPException(
+
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Message conversion failed: {str(e)}"
         )
-
-
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
-
-def _generate_status_message(result: dict) -> str:
-    """
-    Generate human-readable status message from routing result.
-
-    Args:
-        result: Routing result dictionary
-
-    Returns:
-        Status message string
-    """
-    if result["is_new_chat"]:
-        if result["handled_by"] == "ai":
-            return "New chat created and assigned to AI agent"
-        elif result["handled_by"] == "human":
-            return "New chat created and assigned to human agent"
-        else:
-            return "New chat created (unassigned)"
-    elif result["was_reopened"]:
-        return f"Message routed to existing chat (chat was reopened, handled by {result['handled_by']})"
-    else:
-        return f"Message added to active chat (handled by {result['handled_by']})"
-
-@router.post(
-    "/telegram-userbot",
-    response_model=WebhookRouteResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Receive Telegram Userbot message",
-)
-async def telegram_userbot_webhook(
-    payload: WhatsAppUnofficialWebhookMessage, 
-    secret: str = Depends(get_webhook_secret)
-):
-    try:
-        agent_id = payload.sessionId
-        data_content = payload.data.get("message", {}).get("_data", {})
-        
-        if not data_content:
-             raise HTTPException(status_code=400, detail="Invalid JSON structure")
-
-        sender_id = data_content.get("from")  
-        message_text = data_content.get("body", "")
-        sender_display_name = data_content.get("notifyName", f"User {sender_id}")
-        message_id = data_content.get("id", {}).get("id")
-        timestamp_unix = data_content.get("t")
-        
-        # [NEW] Extract Phone Number
-        sender_phone = data_content.get("phone")
-
-        logger.info(f"🤖 Userbot Message: agent={agent_id} sender={sender_id} phone={sender_phone}")
-
-        supabase = get_supabase_client()
-        agent_response = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        
-        if not agent_response.data:
-            raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
-        
-        agent = agent_response.data[0]
-
-        message_metadata = {
-            "source_format": "wa_unofficial_json",
-            "telegram_message_id": message_id,
-            "telegram_sender_id": sender_id,
-            "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None
-        }
-        
-        # [NEW] Add phone to customer metadata
-        customer_metadata = {
-            "telegram_id": sender_id,
-            "phone": sender_phone # This will be picked up by process_webhook_message
-        }
-
-        result = await process_webhook_message(
-            agent=agent,
-            channel="telegram", 
-            contact=sender_id,
-            message_content=message_text,
-            customer_name=sender_display_name,
-            message_metadata=message_metadata,
-            customer_metadata=customer_metadata, # Passed here
-            supabase=supabase
-        )
-
-        return WebhookRouteResponse(
-            success=True,
-            chat_id=result["chat_id"],
-            message_id=result["message_id"],
-            customer_id=result["customer_id"],
-            is_new_chat=result["is_new_chat"],
-            was_reopened=result["was_reopened"],
-            handled_by=result["handled_by"],
-            status=result["status"],
-            channel=result["channel"],
-            message=_generate_status_message(result)
-        )
-
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"❌ Userbot Webhook Failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    

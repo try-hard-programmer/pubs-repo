@@ -19,7 +19,7 @@ class AgentStatus(str, Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
     BUSY = "busy"
-
+    ARCHIVED = "archived"
 
 class ChatStatus(str, Enum):
     """Chat status enumeration"""

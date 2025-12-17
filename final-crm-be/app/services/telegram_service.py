@@ -165,6 +165,47 @@ class TelegramService:
         except Exception as e:
             logger.error(f"Start Session Failed: {e}")
             raise
+    
+    # =================================================================
+    # 4. TERMINATE SESSION (NEW & CUSTOM FOR TELEGRAM)
+    # =================================================================
+    async def terminate_session(self, agent_id: str) -> Dict[str, Any]:
+        """
+        Stop the worker session and UPDATE DB to remove session (Keep keys).
+        """
+        logger.info(f"Terminating Telegram session for agent: {agent_id}")
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                url = f"{self.base_url}/sessions/stop/{agent_id}"
+                await client.post(url, headers=self._get_headers())
+                logger.info("Worker session stopped.")
+        except Exception as e:
+            logger.warning(f"Failed to stop worker session (might be already down): {e}")
+
+        try:
+            # Fetch current config first to preserve keys
+            creds = await self._get_credentials(agent_id)
+            
+            # Create new config: Keep IDs, remove session, set status disconnected
+            new_config = {
+                "api_id": creds.get("api_id"),
+                "api_hash": creds.get("api_hash"),
+                "status": "disconnected"
+            }
+
+            self.supabase.table("agent_integrations").update({
+                "status": "disconnected",
+                "config": new_config,
+                "updated_at": "now()"
+            }).eq("agent_id", agent_id).eq("channel", "telegram").execute()
+            
+            logger.info("Database updated: Session cleared, API credentials preserved.")
+            return {"status": "success", "message": "Session disconnected (credentials saved)."}
+            
+        except Exception as e:
+            logger.error(f"Failed to update DB record: {e}")
+            raise Exception(f"Database error: {str(e)}")
 
 
 # Singleton

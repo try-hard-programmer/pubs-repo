@@ -66,3 +66,15 @@ async def start_session_endpoint(payload: SessionControlRequest, user=Depends(ge
         return await service.start_session(payload.agent_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+# --- 4. Terminate Session ---
+@router.delete("/terminate/{agent_id}")
+async def terminate_session_endpoint(agent_id: str, user=Depends(get_current_user)):
+    """
+    Stops the session on the worker and disconnects in DB (preserving API credentials).
+    """
+    try:
+        service = get_telegram_service()
+        return await service.terminate_session(agent_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

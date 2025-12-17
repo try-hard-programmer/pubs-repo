@@ -11,7 +11,9 @@ from contextlib import asynccontextmanager
 from starlette.middleware.base import BaseHTTPMiddleware
 import logging
 import os
+import re  # [ADDED] Required for the Preprocessor
 
+# Test Update docker build
 # Import configuration
 from app.config import settings
 
@@ -21,12 +23,85 @@ from app.api import documents, agents, chat, organizations, file_manager, crm_ag
 # Import services
 from app.services import get_agent_service
 
+# [ADDED] Import ML Guard for startup verification
+from app.utils.ml_guard import ml_guard
+
 # Initialize logger
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# =========================================================================
+# 1. DEFINE PREPROCESSOR IN __main__ (CRITICAL FOR PICKLE LOADING)
+# =========================================================================
+# This class MUST exist here because the .pkl file was trained in a script 
+# running as __main__. Moving this will break the model loader.
+class MultiServicePreprocessor:
+    def __init__(self):
+        self.noise_words = [
+            'tolong','mohon','bantu','gan','sis','min','kak','minta','harap',
+            'halo','permisi','mas','mbak','pak','bu','om','boss','bro'
+        ]
+
+        self.service_keywords = {
+            'listrik': ['listrik','mcb','token','kwh','meteran','voltase','padam','mati','sekring'],
+            'air': ['air','pdam','pipa','bocor','pompa','keruh','tekanan'],
+            'internet': ['internet','wifi','modem','router','ont','fiber','lemot','koneksi'],
+            'gas': ['gas','lpg','tabung','regulator','kompor','selang'],
+            'sanitasi': ['wc','toilet','closet','septictank','saluran','mampet'],
+            'ac': ['ac','air conditioner','dingin','freon','kompresor'],
+            'elektronik': ['kulkas','mesin cuci','tv','kipas','lampu','setrika'],
+            'gedung': ['lift','elevator','eskalator','genset','cctv'],
+            'telepon': ['telepon','fax','pabx'],
+            'tv_kabel': ['tv kabel','parabola','decoder','channel']
+        }
+
+        self.urgency_keywords = [
+            'mati total','down','meledak','terbakar','asap','api',
+            'bocor','banjir','meluap','bahaya','darurat','cepat',
+            'segera','urgent','parah','berbahaya'
+        ]
+
+        self.billing_keywords = [
+            'tagihan','bayar','biaya','invoice','mahal','tarif',
+            'denda','telat','tertunggak','pasang baru','upgrade'
+        ]
+
+    def clean_text(self, text):
+        text = str(text).lower()
+        for w in self.noise_words:
+            text = re.sub(rf'\b{w}\b', '', text)
+        text = re.sub(r'[^a-z0-9\s]', ' ', text)
+        return re.sub(r'\s+', ' ', text).strip()
+
+    def inject_features(self, text):
+        tags = []
+
+        for svc, kws in self.service_keywords.items():
+            if any(k in text for k in kws):
+                tags.append(f"__SVC_{svc.upper()}__")
+
+        if any(k in text for k in self.urgency_keywords):
+            tags.extend(["__URGENT__"] * 3)
+
+        if any(k in text for k in self.billing_keywords):
+            tags.append("__BILLING__")
+
+        return tags
+
+    def process_batch(self, texts):
+        out = []
+        for t in texts:
+            clean = self.clean_text(t)
+            tags = self.inject_features(clean)
+            out.append(f"{clean} {' '.join(tags)}".strip())
+        return out
+
+# [CRITICAL] Inject into __main__ namespace so pickle finds it
+import __main__
+setattr(__main__, "MultiServicePreprocessor", MultiServicePreprocessor)
 
 
 # Custom middleware to handle proxy headers from Traefik
@@ -62,10 +137,14 @@ async def lifespan(app: FastAPI):
     agent_service = get_agent_service()
     await agent_service.initialize_agents()
 
+    # [ADDED] Force Load NLP Model (to verify it works on startup)
+    logger.info("🧠 Verifying NLP Guard Model...")
+    ml_guard._load_model()
+
     logger.info("Application startup complete")
     yield
 
-    # Shutdownbantu saya
+    # Shutdown
     logger.info("Application shutdown")
 
 
@@ -76,53 +155,6 @@ app = FastAPI(
 ## 🚀 Syntra AI File Manager & RAG System
 
 A comprehensive document management and retrieval-augmented generation (RAG) platform with multi-agent architecture.
-
-### Key Features
-
-- **📁 File Management**: Complete CRUD operations for files and folders with organization-scoped isolation
-- **🤖 Multi-Agent System**: Specialized AI agents powered by Google ADK
-- **🔍 Semantic Search**: Advanced document retrieval using ChromaDB vector database
-- **🔐 Permission System**: Granular access control with 5 permission levels (view, edit, delete, share, manage)
-- **🤝 Sharing**: Share files with users, groups, or create public links
-- **🎯 Organization Isolation**: Complete data separation for multi-tenant architecture
-- **📊 Embeddings**: Automatic document embedding with rollback on failure
-- **💬 Chat History**: Conversation tracking with reference documents
-
-### Architecture
-
-- **Backend**: FastAPI 3.0+ with async/await
-- **Database**: PostgreSQL with Supabase (Row Level Security)
-- **Storage**: Supabase Storage with hierarchical organization
-- **Vector DB**: ChromaDB for semantic search
-- **AI**: Google Generative AI (Gemini) with ADK agents
-- **Auth**: JWT-based authentication with role-based access control
-
-### Authentication
-
-All endpoints (except health checks and public shares) require JWT authentication:
-```bash
-Authorization: Bearer <your-jwt-token>
-```
-
-### Organization Model
-
-Users belong to organizations, and all data is scoped by organization:
-- Documents are stored in org-specific ChromaDB collections
-- Files are stored in org-specific Supabase Storage buckets
-- Permissions and shares are isolated per organization
-
-### Getting Started
-
-1. **Create Organization**: POST /organizations/
-2. **Upload Document**: POST /documents/upload
-3. **Query Agent**: POST /agent/rag
-4. **Manage Files**: Use /filemanager/* endpoints
-
-### Support
-
-- Documentation: [GitHub Wiki](https://github.com/yourusername/filemanager-api/wiki)
-- Issues: [GitHub Issues](https://github.com/yourusername/filemanager-api/issues)
-- API Version: v2.0.0
 """,
     version="2.0.0",
     lifespan=lifespan,

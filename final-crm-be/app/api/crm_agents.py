@@ -350,59 +350,47 @@ async def update_agent(
     except HTTPException: raise
     except Exception as e:
         logger.error(f"Update failed: {e}")
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, str(e))	
 	
-	
-@router.put(
-    "/{agent_id}",
+@router.patch(
+    "/{agent_id}/status",
     response_model=Agent,
-    summary="Update agent"
+    summary="Update agent status",
+    description="Update agent status only (active/inactive/busy)."
 )
-async def update_agent(
+async def update_agent_status(
     agent_id: str,
-    agent_update: AgentUpdate,
+    status_update: AgentStatusUpdate,
     current_user: User = Depends(get_current_user)
 ):
+    """Update agent status only"""
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # 1. Verify existence
-        current = supabase.table("agents").select("*").eq("id", agent_id).single().execute()
+        # 1. Verify existence and ownership
+        current = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).single().execute()
         if not current.data:
-            raise HTTPException(404, "Agent not found")
+            raise HTTPException(status_code=404, detail="Agent not found")
 
-        update_data = agent_update.model_dump(exclude_unset=True)
-        if not update_data:
-            return Agent(**current.data)
-
-        # 2. UNIQUENESS CHECK
-        # We must check if the NEW email or phone conflicts
-        new_email = update_data.get("email") or current.data["email"]
-        new_phone = update_data.get("phone") or current.data["phone"]
-
-        # Only run check if email or phone is changing
-        if "email" in update_data or "phone" in update_data:
-            _, conflict_phone_agent = await check_agent_conflicts(
-                supabase, organization_id, new_email, new_phone, exclude_agent_id=agent_id
-            )
-            
-            # Special Handling: If we are taking a phone number from an INACTIVE agent, reclaim it
-            if conflict_phone_agent and conflict_phone_agent["status"] == "inactive":
-                 logger.info(f"♻️ Reclaiming phone {new_phone} from inactive agent {conflict_phone_agent['id']}")
-                 supabase.table("agents").update({"phone": None}).eq("id", conflict_phone_agent["id"]).execute()
-
-        # 3. Update
-        if "status" in update_data:
-            update_data["status"] = update_data["status"].value
-
+        # 2. Update status
+        update_data = {
+            "status": status_update.status.value,
+            "last_active_at": datetime.now(timezone.utc).isoformat()
+        }
+        
         response = supabase.table("agents").update(update_data).eq("id", agent_id).execute()
+        
+        if not response.data:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to update agent status")
+            
         return Agent(**response.data[0])
 
-    except HTTPException: raise
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Update failed: {e}")
-        raise HTTPException(500, str(e))
+        logger.error(f"Error updating agent status {agent_id}: {e}")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
 	
 @router.delete(
     "/{agent_id}",
@@ -424,9 +412,10 @@ async def delete_agent(
         if not existing.data:
             raise HTTPException(404, detail="Agent not found")
 
-        # 2. SOFT DELETE: Mark inactive & unlink user
+        # 2. SOFT DELETE: Mark archived & unlink user
+        # [UPDATED] Using "archived" status as requested
         update_data = {
-            "status": "inactive",
+            "status": "archived",
             "user_id": None,
             "last_active_at": datetime.now(timezone.utc).isoformat()
         }
@@ -435,7 +424,6 @@ async def delete_agent(
         supabase.table("agents").update(update_data).eq("id", agent_id).execute()
 
         # 3. UNASSIGN ACTIVE CHATS
-        # REMOVED "in_progress" because it is not a valid ChatStatus enum
         active_statuses = ["open", "assigned", "pending"]
         
         # A. Clear from 'assigned_agent_id' (Legacy field)
@@ -446,7 +434,6 @@ async def delete_agent(
             .execute()
             
         # B. Clear from 'human_agent_id' & reset handled_by
-        # We set handled_by to 'unassigned' so it appears in the "Unassigned" tab
         supabase.table("chats") \
             .update({
                 "human_agent_id": None, 
@@ -457,7 +444,7 @@ async def delete_agent(
             .in_("status", active_statuses) \
             .execute()
 
-        logger.info(f"Agent {agent_id} soft-deleted and unassigned from active chats by {current_user.user_id}")
+        logger.info(f"Agent {agent_id} archived and unassigned from active chats by {current_user.user_id}")
 
         return None
 
@@ -469,7 +456,7 @@ async def delete_agent(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete agent: {str(e)}"
         )
-
+	
 # ============================================
 # AGENT SETTINGS ENDPOINTS
 # ============================================

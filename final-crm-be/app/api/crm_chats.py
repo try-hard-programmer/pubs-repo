@@ -677,22 +677,26 @@ async def create_chat(
         
         logger.info(f"🚀 [create_chat] Contact: {chat.contact}, Channel: {chat.channel}")
 
+        # Normalize Channel Value safely
+        channel_val = chat.channel.value if hasattr(chat.channel, "value") else chat.channel
+
         # ---------------------------------------------------------
         # 1. RESOLVE CUSTOMER (PRIORITY: METADATA ID)
         # ---------------------------------------------------------
         customer_id = chat.customer_id
+        
         if not customer_id:
             if not chat.contact: raise HTTPException(400, "Contact required")
             
             clean_input = re.sub(r'[^\d]', '', chat.contact)
             
-            # A. Check Metadata First
-            if chat.channel == "telegram":
+            # A. Check Metadata First (Search by ID)
+            if channel_val == "telegram":
                 meta_q = supabase.table("customers").select("id").eq("organization_id", organization_id).contains("metadata", {"telegram_id": clean_input}).execute()
                 if meta_q.data:
                     customer_id = meta_q.data[0]["id"]
 
-            elif chat.channel == "whatsapp":
+            elif channel_val == "whatsapp":
                 meta_q = supabase.table("customers").select("id").eq("organization_id", organization_id).contains("metadata", {"whatsapp_id": clean_input}).execute()
                 if meta_q.data:
                     customer_id = meta_q.data[0]["id"]
@@ -700,9 +704,13 @@ async def create_chat(
             # B. Check Phone/Email Column
             if not customer_id:
                 query = supabase.table("customers").select("id").eq("organization_id", organization_id)
+                
                 if "@" in chat.contact:
+                    # It's an email
                     existing = query.eq("email", chat.contact).execute()
                 else:
+                    # It's a phone or ID
+                    # Try exact match, then various prefix formats
                     no_prefix = clean_input[2:] if clean_input.startswith('62') else clean_input
                     or_query = f"phone.eq.{chat.contact},phone.eq.{clean_input},phone.eq.0{no_prefix},phone.eq.62{no_prefix}"
                     existing = query.or_(or_query).execute()
@@ -710,16 +718,36 @@ async def create_chat(
                 if existing.data:
                     customer_id = existing.data[0]["id"]
 
-            # C. Create New
+            # C. Create New Customer (If not found)
             if not customer_id:
+                # [FIX] Prepare Metadata & Fallback Phone
+                cust_metadata = {"source": "dashboard_create"}
+                final_phone = None
+                final_email = None
+
+                if "@" in chat.contact:
+                    final_email = chat.contact
+                else:
+                    # Logic: If Telegram and not email, assume the input IS the ID/Phone
+                    # We store it in 'phone' column to satisfy strict requirements
+                    final_phone = chat.contact
+                    
+                    # [STRICT GUARD] Only inject telegram_id metadata if channel is Telegram
+                    if channel_val == "telegram":
+                        cust_metadata["telegram_id"] = clean_input
+
                 new_cust = supabase.table("customers").insert({
                     "organization_id": organization_id,
                     "name": chat.customer_name or "New Customer",
-                    "phone": chat.contact if "@" not in chat.contact else None,
-                    "email": chat.contact if "@" in chat.contact else None,
-                    "metadata": {"source": "dashboard_create"}
+                    "phone": final_phone,
+                    "email": final_email,
+                    "metadata": cust_metadata
                 }).execute()
-                customer_id = new_cust.data[0]["id"]
+                
+                if new_cust.data:
+                    customer_id = new_cust.data[0]["id"]
+                else:
+                    raise HTTPException(500, "Failed to create customer")
 
         # ---------------------------------------------------------
         # 2. RESOLVE AGENT (Supports UUID natively)
@@ -736,7 +764,7 @@ async def create_chat(
         if chat.assigned_agent_id:
             target_id = chat.assigned_agent_id
             
-            # 'Me' shortcut (Safe fallback, but Frontend will likely send UUID)
+            # 'Me' shortcut
             if target_id == "me":
                 me_res = supabase.table("agents").select("id").eq("user_id", current_user.user_id).eq("organization_id", organization_id).execute()
                 if me_res.data:
@@ -744,7 +772,7 @@ async def create_chat(
                 else:
                     raise HTTPException(400, "You do not have an Agent profile.")
 
-            # Validate Agent Exists (UUID Lookup)
+            # Validate Agent
             agent_check = supabase.table("agents").select("id", "user_id").eq("organization_id", organization_id).eq("id", target_id).execute()
             
             if agent_check.data:
@@ -758,11 +786,11 @@ async def create_chat(
                     if default_ai: ai_agent_id = default_ai
                     
                     # STRICT INTEGRATION CHECK
-                    int_check = supabase.table("agent_integrations").select("id").eq("agent_id", assigned_agent_id).eq("channel", chat.channel.value).eq("enabled", True).execute()
+                    int_check = supabase.table("agent_integrations").select("id").eq("agent_id", assigned_agent_id).eq("channel", channel_val).eq("enabled", True).execute()
                     if int_check.data:
                         sender_agent_id = assigned_agent_id 
                     else:
-                        raise HTTPException(400, f"Selected Agent has no connected {chat.channel.value} account.")
+                        raise HTTPException(400, f"Selected Agent has no connected {channel_val} account.")
                 else: # AI
                     ai_agent_id = assigned_agent_id
                     sender_agent_id = assigned_agent_id
@@ -779,7 +807,7 @@ async def create_chat(
         # ---------------------------------------------------------
         # 3. REUSE OR CREATE CHAT
         # ---------------------------------------------------------
-        active_chat = supabase.table("chats").select("*").eq("customer_id", customer_id).eq("channel", chat.channel.value).neq("status", "resolved").neq("status", "closed").execute()
+        active_chat = supabase.table("chats").select("*").eq("customer_id", customer_id).eq("channel", channel_val).neq("status", "resolved").neq("status", "closed").execute()
         
         chat_obj = None
         if active_chat.data:
@@ -799,7 +827,7 @@ async def create_chat(
             chat_obj.update(upd)
         else:
             new_chat_data = {
-                "organization_id": organization_id, "customer_id": customer_id, "channel": chat.channel.value,
+                "organization_id": organization_id, "customer_id": customer_id, "channel": channel_val,
                 "assigned_agent_id": assigned_agent_id, "ai_agent_id": ai_agent_id, "human_agent_id": human_agent_id,
                 "handled_by": handled_by, "status": status_value, "sender_agent_id": sender_agent_id,
                 "unread_count": 0, "last_message_at": datetime.utcnow().isoformat()
@@ -821,7 +849,6 @@ async def create_chat(
     except Exception as e:
         logger.error(f"Create chat error: {e}", exc_info=True)
         raise HTTPException(500, "Failed to create chat")
-
 
 @router.put(
     "/chats/{chat_id}/assign",
