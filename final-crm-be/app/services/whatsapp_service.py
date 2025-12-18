@@ -13,6 +13,7 @@ from app.config.settings import settings
 import os
 import asyncio
 from app.config import settings as app_settings
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +286,8 @@ class WhatsAppService:
             # If it's a raw number, append @c.us. If it's @lid or @g.us, leave it alone.
             if "@" not in chat_id:
                 chat_id = f"{chat_id}@c.us"
+            
+            logger.info(f"📤 Sending text message to: {chat_id} (Original: {phone_number})")
 
             # Use the correct API payload based on Swagger
             payload = {
@@ -309,13 +312,18 @@ class WhatsAppService:
         
     async def send_media_message(self, session_id: str, phone_number: str, media_url: str, caption: Optional[str] = None, media_type: str = "image") -> Dict[str, Any]:
         try:
+            logger.info(f"📤 Sending media message to: {phone_number}")
+            
             # [FIX] LID RESOLUTION FOR MEDIA
             chat_id = phone_number
             if "@lid" in str(phone_number):
+                logger.info(f"🔍 Attempting to resolve LID for media send: {phone_number}")
                 contact_data = await self.get_contact_by_id(session_id, phone_number)
                 if contact_data.get("success") and contact_data.get("number"):
                     chat_id = contact_data.get("number")
+                    logger.info(f"✅ Resolved LID {phone_number} to {chat_id}")
                 else:
+                    logger.warning(f"⚠️ Could not resolve LID {phone_number}, using as is.")
                     chat_id = phone_number # Keep @lid
 
             chat_id = self._format_chat_id(chat_id)
@@ -342,13 +350,18 @@ class WhatsAppService:
 
     async def send_file_message(self, session_id: str, phone_number: str, file_url: str, filename: Optional[str] = None, caption: Optional[str] = None) -> Dict[str, Any]:
         try:
+            logger.info(f"📤 Sending file message to: {phone_number}")
+            
             # [FIX] LID RESOLUTION FOR FILES
             chat_id = phone_number
             if "@lid" in str(phone_number):
+                logger.info(f"🔍 Attempting to resolve LID for file send: {phone_number}")
                 contact_data = await self.get_contact_by_id(session_id, phone_number)
                 if contact_data.get("success") and contact_data.get("number"):
                     chat_id = contact_data.get("number")
+                    logger.info(f"✅ Resolved LID {phone_number} to {chat_id}")
                 else:
+                    logger.warning(f"⚠️ Could not resolve LID {phone_number}, using as is.")
                     chat_id = phone_number # Keep @lid
 
             chat_id = self._format_chat_id(chat_id)
@@ -479,37 +492,6 @@ class WhatsAppService:
         except Exception as e:
             logger.error(f"Failed to get chat info: {e}")
             raise Exception(f"Chat info retrieval failed: {str(e)}")
-
-    async def get_contact_by_id(self, session_id: str, chat_id: str) -> Dict[str, Any]:
-        """
-        [NEW] Attempt to find a contact's real details from an ID (LID or JID).
-        """
-        try:
-            url = f"{self.base_url}/client/getContacts/{session_id}"
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(url, headers=self._get_headers())
-                if response.status_code != 200:
-                    return {"success": False, "message": "Failed to fetch contact list"}
-
-                contacts = response.json()
-                for contact in contacts:
-                    # Check both serialized ID and nested ID
-                    serialized = contact.get("id", {}).get("_serialized")
-                    if serialized == chat_id:
-                        # Extract the real number if it exists in the contact object
-                        # WhatsApp often puts the real number in contact['number']
-                        real_number = contact.get("number")
-                        return {
-                            "success": True,
-                            "name": contact.get("name") or contact.get("pushname"),
-                            "number": real_number,
-                            "is_business": contact.get("isBusiness", False),
-                            "data": contact
-                        }
-                return {"success": False, "message": "Contact not found in list"}
-        except Exception as e:
-            logger.error(f"Contact lookup error: {e}")
-            return {"success": False, "message": str(e)}
         
     def get_supabase_client(self):
         """Get Supabase client from settings"""
@@ -555,76 +537,31 @@ class WhatsAppService:
         }
 
     async def get_contact_by_id(self, session_id: str, chat_id: str) -> Dict[str, Any]:
-        """
-        [ENHANCED] Find a contact's real details from an ID (LID or JID).
-        
-        Args:
-            session_id: WhatsApp session ID
-            chat_id: Contact ID (can be LID like 271454901956746@lid or regular like 6281234567890@c.us)
-        
-        Returns:
-            Dict with success, name, number (real phone with @c.us), and full contact data
-        """
+        """Efficiently resolve a single ID using targeted getClassInfo route"""
         try:
-            url = f"{self.base_url}/client/getContacts/{session_id}"
+            url = f"{self.base_url}/contact/getClassInfo/{session_id}"
+            payload = {"contactId": chat_id}
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(url, headers=self._get_headers())
+                response = await client.post(url, json=payload, headers=self._get_headers())
                 
                 if response.status_code != 200:
-                    return {"success": False, "message": f"Failed to fetch contacts: {response.status_code}"}
+                    return {"success": False, "message": f"Server error {response.status_code}"}
 
-                contacts = response.json()
+                data = response.json()
+                result = data.get("result", {})
                 
-                # Search for matching contact
-                for contact in contacts:
-                    # Get serialized ID from contact
-                    serialized_id = contact.get("id", {}).get("_serialized")
-                    
-                    # Check if this is our target contact
-                    if serialized_id == chat_id:
-                        # Extract real phone number
-                        # Priority: 1) number field, 2) user field from id, 3) extract from _serialized
-                        real_number = None
-                        
-                        # Method 1: Direct number field
-                        if contact.get("number"):
-                            real_number = f"{contact['number']}@c.us"
-                        
-                        # Method 2: Extract from id.user field
-                        elif contact.get("id", {}).get("user"):
-                            user = contact["id"]["user"]
-                            # Clean and format the number
-                            if "@" in str(user):
-                                real_number = user
-                            else:
-                                real_number = f"{user}@c.us"
-                        
-                        # Method 3: Parse from _serialized if it's a standard number format
-                        elif "@c.us" in str(serialized_id):
-                            real_number = serialized_id
-                        
-                        return {
-                            "success": True,
-                            "name": contact.get("name") or contact.get("pushname") or contact.get("verifiedName"),
-                            "number": real_number,
-                            "is_business": contact.get("isBusiness", False),
-                            "is_lid": "@lid" in str(chat_id),
-                            "original_id": chat_id,
-                            "data": contact
-                        }
-                
-                # Contact not found in list
-                logger.warning(f"Contact {chat_id} not found in contacts list")
+                # Returns the real number string (e.g., '628...')
                 return {
-                    "success": False, 
-                    "message": f"Contact {chat_id} not found in contacts list. It may not be in your WhatsApp contacts."
+                    "success": True,
+                    "name": result.get("name") or result.get("pushname"),
+                    "number": result.get("number"),
+                    "data": result
                 }
-                
         except Exception as e:
-            logger.error(f"Contact lookup error: {e}")
+            logger.error(f"❌ Contact resolution failed: {e}")
             return {"success": False, "message": str(e)}
-
+    
 # Singleton instance
 _whatsapp_service: Optional[WhatsAppService] = None
 

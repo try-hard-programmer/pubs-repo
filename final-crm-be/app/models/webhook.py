@@ -57,7 +57,8 @@ class WhatsAppWebhookMessage(IncomingWebhookMessage):
 class WhatsAppUnofficialWebhookMessage(BaseModel):
     """WhatsApp Unofficial webhook message (from whatsapp-web.js)"""
     dataType: str = Field(..., description="Type of data (message, media)")
-    data: Dict[str, Any] = Field(..., description="Message or media data")
+    # Change Dict[str, Any] to Optional[Any] to prevent 422 errors
+    data: Optional[Any] = Field(default=None, description="Message or media data")
     sessionId: str = Field(..., description="WhatsApp session ID")
 
     class Config:

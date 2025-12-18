@@ -55,7 +55,8 @@ class MessageRouterService:
         """
         try:
             logger.info(f"🔍 Finding customer: channel={channel}, contact={contact}")
-
+            logger.info(f"🔍 [4. ROUTER LOOKUP] Searching DB for: '{contact}' (Channel: {channel})")
+            logger.info(f"🔍 [DB LOOKUP] Table: customers, Query: organization_id={organization_id} AND phone='{contact}'")
             # Build query based on channel type
             if channel == "whatsapp":
                 # Find by phone number
@@ -88,6 +89,7 @@ class MessageRouterService:
                     .eq("metadata->>session_id", contact)
 
             else:
+                logger.warning(f"❌ [4. ROUTER LOOKUP] No match for '{contact}'. Creating duplicate entry.")
                 raise ValueError(f"Unsupported channel: {channel}")
 
             # Execute query
@@ -97,7 +99,7 @@ class MessageRouterService:
             if response.data:
                 customer = response.data[0]
                 current_name = customer.get('name', 'Unknown')
-
+                
                 # Helper function to check if a string is a phone number
                 def is_phone_number(value: str) -> bool:
                     """Check if value looks like a phone number (starts with country code digits)"""
@@ -118,11 +120,6 @@ class MessageRouterService:
                 )
 
                 if should_update:
-                    logger.info(
-                        f"🔄 Updating customer name from '{current_name}' to '{customer_name}' "
-                        f"for customer {customer['id']}"
-                    )
-
                     # Update customer name
                     update_response = self.supabase.table("customers") \
                         .update({"name": customer_name}) \
@@ -137,10 +134,10 @@ class MessageRouterService:
 
                 logger.info(f"✅ Customer found: {customer['id']} ({customer.get('name', 'Unknown')})")
                 return customer
-
-            # If not found, create new customer
-            logger.info(f"📝 Creating new customer for {channel}: {contact}")
-
+            else:
+                # 📝 ADD THIS: This confirms why the duplicate is made
+                logger.warning(f"❌ [DB MISMATCH] No customer found for '{contact}'. Creating NEW record.")
+      
             # [FIXED LOGIC]
             # 1. Phone Logic
             phone_val = None
@@ -257,7 +254,8 @@ class MessageRouterService:
         self,
         customer_id: str,
         channel: str,
-        organization_id: str
+        organization_id: str,
+        new_metadata: Optional[Dict[str, Any]] = None 
     ) -> None:
         """
         Update customer metadata with contact tracking info.
@@ -274,49 +272,48 @@ class MessageRouterService:
             organization_id: Organization UUID
         """
         try:
-            logger.info(f"📊 Updating customer metadata: {customer_id}")
-
-            # Get current customer data
+            # 1. Fetch current customer metadata
             customer_response = self.supabase.table("customers") \
                 .select("metadata") \
                 .eq("id", customer_id) \
-                .eq("organization_id", organization_id) \
                 .execute()
 
             if not customer_response.data:
-                logger.warning(f"⚠️  Customer {customer_id} not found for metadata update")
                 return
 
-            current_metadata = customer_response.data[0].get("metadata", {})
+            current_metadata = customer_response.data[0].get("metadata", {}) or {}
+            now_iso = datetime.utcnow().isoformat()
 
-            # Update metadata
+            # 2. Perform Smart Merge
+            # We preserve existing keys but update/add contact tracking
             updated_metadata = {
                 **current_metadata,
-                "last_contact_at": datetime.utcnow().isoformat(),
+                **(new_metadata or {}), # Merge incoming (whatsapp_name, whatsapp_lid, etc)
+                "last_contact_at": now_iso,
                 "message_count": current_metadata.get("message_count", 0) + 1,
-                "preferred_channel": channel,  # Simple strategy: last used channel
+                "preferred_channel": channel
             }
 
-            # Update channels_used list
+            # 3. Handle First Contact (Crucial for Dashboard-created records)
+            if "first_contact_at" not in current_metadata:
+                updated_metadata["first_contact_at"] = now_iso
+            if "first_contact_channel" not in current_metadata:
+                updated_metadata["first_contact_channel"] = channel
+
+            # 4. Update channels list
             channels_used = current_metadata.get("channels_used", [])
             if channel not in channels_used:
                 channels_used.append(channel)
             updated_metadata["channels_used"] = channels_used
 
-            # Update customer
+            # 5. Save back to DB
             self.supabase.table("customers") \
                 .update({"metadata": updated_metadata}) \
                 .eq("id", customer_id) \
                 .execute()
 
-            logger.info(
-                f"✅ Customer metadata updated: message_count={updated_metadata['message_count']}, "
-                f"preferred_channel={channel}"
-            )
-
         except Exception as e:
-            logger.error(f"❌ Error updating customer metadata: {e}")
-            # Don't raise - metadata update failure shouldn't block message routing
+            logger.error(f"❌ Metadata sync error: {e}")
 
     async def route_incoming_message(
         self,
@@ -523,7 +520,8 @@ class MessageRouterService:
             await self.update_customer_metadata(
                 customer_id=customer_id,
                 channel=channel,
-                organization_id=organization_id
+                organization_id=organization_id,
+                new_metadata=customer_metadata
             )
 
             # Prepare routing result

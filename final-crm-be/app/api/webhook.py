@@ -460,7 +460,7 @@ async def resolve_lid_to_real_number(
     # Only resolve for WhatsApp LIDs
     if channel != "whatsapp" or "@lid" not in str(contact):
         return contact
-    
+    logger.info(f"🔄 [5. LID RESOLVER] Attempting to resolve LID: {contact}")
     try:
         logger.info(f"🔄 Resolving LID {contact} to real number...")
         
@@ -476,7 +476,7 @@ async def resolve_lid_to_real_number(
             
             # TODO: Cache resolved number in customer metadata
             # This prevents needing to resolve the same LID multiple times
-            
+            logger.info(f"🔄 [5. LID RESOLVER] Result: {lookup.get('number', 'FAILED')}")
             return resolved
         else:
             logger.warning(f"⚠️ Could not resolve LID {contact}: {lookup.get('message', 'Unknown error')}")
@@ -810,17 +810,28 @@ async def whatsapp_unofficial_webhook(
         agent_id = message.sessionId
         supabase = get_supabase_client()
 
+        logger.info(f"📡 [3. WEBHOOK ENTRY] Session: {message.sessionId}, Data: {message.dataType}")
+        
         # 1. Handle System Events (QR, Auth, Ready)
-        if message.dataType in ["qr", "authenticated", "ready", "disconnected"]:
+        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen"]
+        if message.dataType in system_events:
             logger.info(f"📡 WhatsApp System Event: {message.dataType} for session {agent_id}")
             
             agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
             if agent_res.data and app_settings.WEBSOCKET_ENABLED:
                 org_id = agent_res.data[0]["organization_id"]
+                
+                # CORRECTED CALL: Wrap event/data into the 'message' dictionary
                 await get_connection_manager().broadcast_to_organization(
-                    organization_id=org_id,
-                    event="whatsapp_status_update",
-                    data={"agent_id": agent_id, "status": message.dataType, "data": message.data}
+                    message={
+                        "type": "whatsapp_status_update",
+                        "data": {
+                            "agent_id": agent_id, 
+                            "status": message.dataType, 
+                            "data": message.data
+                        }
+                    },
+                    organization_id=org_id
                 )
             return JSONResponse(content={"success": True, "status": "processed_system_event"})
 
@@ -873,12 +884,25 @@ async def whatsapp_unofficial_webhook(
 
         # Convert Format
         standard_message = await _convert_unofficial_to_standard(message)
-        
-        # Handle ID / Contact Name
-        contact_id = standard_message.phone_number
-        sender_name = standard_message.sender_name
+        logger.info(f"📡 [3. WEBHOOK ENTRY] Proceeding with Contact: '{standard_message.phone_number}'")
 
+        # Handle ID / Contact Name
+        contact_id = await resolve_lid_to_real_number(
+            contact=standard_message.phone_number, 
+            agent_id=agent_id, 
+            channel="whatsapp", 
+            supabase=supabase
+        )
+    
+        logger.info(f"🚀 [ROUTING] Using resolved ID: '{contact_id}'")
+
+        sender_name = standard_message.sender_name
+        logger.info(f"🚀 [ROUTING START] Searching for customer with ID: '{contact_id}'")
         # Attempt to resolve name if it's a LID or just to be sure, but KEEP the contact_id for replying
+
+        # Clean the resolved number (remove @c.us) to match DB format
+        if "@c.us" in contact_id:
+            contact_id = contact_id.split("@")[0]
         if "@" in contact_id:
              # Just logging, we don't change contact_id because we need the original ID to reply
              logger.info(f"📩 Received message from ID: {contact_id}")
@@ -957,52 +981,94 @@ async def telegram_webhook(message: TelegramWebhookMessage, secret: str = Depend
         raise HTTPException(500, str(e))
 
 @router.post("/telegram-userbot", response_model=WebhookRouteResponse)
-async def telegram_userbot_webhook(payload: WhatsAppUnofficialWebhookMessage, secret: str = Depends(get_webhook_secret)):
+async def telegram_userbot_webhook(
+    payload: WhatsAppUnofficialWebhookMessage, 
+    secret: str = Depends(get_webhook_secret)
+):
+    """
+    Receive and route messages from a Telegram Userbot formatted as unofficial payloads.
+    Ensures correct identifier mapping to avoid duplicate customers in CRM.
+    """
     try:
         agent_id = payload.sessionId
         data_wrapper = payload.data.get("message", {}) or {}
-        data_content = data_wrapper.get("_data", {})
-        if not data_content: raise HTTPException(400, "Invalid JSON structure")
+        data_content = data_wrapper.get("_data", {}) or data_wrapper
         
+        if not data_content: 
+            raise HTTPException(status_code=400, detail="Invalid JSON structure: missing message content")
+        
+        # 1. Idempotency Check (Prevent duplicate processing)
         msg_id = data_content.get("id", {}).get("id")
         supabase = get_supabase_client()
-        if await check_telegram_idempotency(supabase, str(msg_id)):
+        if msg_id and await check_telegram_idempotency(supabase, str(msg_id)):
              return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
 
-        sender_id = data_content.get("from")
+        # 2. Extract Data
+        sender_id = str(data_content.get("from", ""))
         message_text = data_content.get("body", "")
-        sender_display_name = data_content.get("notifyName", f"User {sender_id}")
+        sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
         timestamp_unix = data_content.get("t")
         
+        # Handle Phone Extraction from Userbot metadata for identity mapping
         raw_phone = data_content.get("phone")
-        final_phone = str(sender_id)
+        final_phone = sender_id
         if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
             final_phone = str(raw_phone)
 
-        logger.info(f"🤖 Userbot Message: agent={agent_id} sender={sender_id} phone={final_phone}")
-
+        # 3. Agent Verification & Settings
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data: raise HTTPException(404, "Agent not found")
+        if not agent_res.data: 
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
         agent = agent_res.data[0]
-
         settings_data = await fetch_agent_settings(supabase, agent_id)
-        if settings_data: agent.update(settings_data)
+        if settings_data: 
+            agent.update(settings_data)
 
-        msg_meta = {"source_format": "wa_unofficial_json", "telegram_message_id": msg_id, "telegram_sender_id": sender_id, "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None}
-        cust_meta = {"telegram_id": sender_id, "phone": final_phone}
+        # 4. Prepare Metadata for DB
+        msg_meta = {
+            "source_format": "wa_unofficial_json", 
+            "telegram_message_id": msg_id, 
+            "telegram_sender_id": sender_id, 
+            "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None
+        }
+        
+        cust_meta = {
+            "telegram_id": sender_id, 
+            "phone": final_phone,
+            "source": "telegram_userbot"
+        }
 
-        result = await process_webhook_message(agent, "telegram", str(sender_id), message_text, sender_display_name, msg_meta, cust_meta, supabase)
+        # 5. Routing
+        result = await process_webhook_message(
+            agent=agent, 
+            channel="telegram", 
+            contact=sender_id, 
+            message_content=message_text, 
+            customer_name=sender_display_name, 
+            message_metadata=msg_meta, 
+            customer_metadata=cust_meta, 
+            supabase=supabase
+        )
         
         return WebhookRouteResponse(
-            success=True, chat_id=result["chat_id"], message_id=result["message_id"], 
-            customer_id=result["customer_id"], is_new_chat=result["is_new_chat"], 
+            success=True, 
+            chat_id=result.get("chat_id"), 
+            message_id=result.get("message_id"), 
+            customer_id=result.get("customer_id"), 
+            is_new_chat=result.get("is_new_chat", False), 
             was_reopened=result.get("was_reopened", False),
-            handled_by=result["handled_by"], status=result["status"], 
-            channel="telegram", message=_generate_status_message(result)
+            handled_by=result.get("handled_by", "ai"), 
+            status=result.get("status", "open"), 
+            channel="telegram", 
+            message=_generate_status_message(result)
         )
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Userbot Error: {e}")
-        raise HTTPException(500, str(e))
+        logger.error(f"❌ Userbot Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================
@@ -1204,57 +1270,58 @@ async def _upload_media_to_supabase(
         raise Exception(f"Media upload failed: {str(e)}")
 
 def _extract_phone_number(whatsapp_id: str) -> str:
-    """
-    Extract phone number from WhatsApp ID format
-    Handles @c.us suffix and ensures clean format.
-    """
+    logger.info(f"🧪 [1. EXTRACTOR] Input: '{whatsapp_id}'") # LOG THIS
+    
     if not whatsapp_id:
         return ""
     
-    # FIX: Preserve LID (Linked Device IDs) so we can resolve/reply to them correctly
     if "@lid" in whatsapp_id:
+        # This is where the @lid bypasses the cleaning logic
+        logger.info(f"🧪 [1. EXTRACTOR] LID Detected. Bypassing clean. Result: '{whatsapp_id}'") 
         return whatsapp_id
 
-    # Split by @ first to remove suffix
-    clean_id = whatsapp_id.split("@")[0]
-    # Split by : (sometimes IDs come as user:device@c.us)
-    clean_id = clean_id.split(":")[0]
+    clean_id = whatsapp_id.split("@")[0].split(":")[0]
+    logger.info(f"🧪 [1. EXTRACTOR] Standard Clean Result: '{clean_id}'")
     return clean_id
 
 async def _convert_unofficial_to_standard(
     unofficial_message: WhatsAppUnofficialWebhookMessage
 ) -> WhatsAppWebhookMessage:
     """
-    Convert WhatsApp unofficial payload to standard WhatsAppWebhookMessage format
+    Convert WhatsApp unofficial payload to standard WhatsAppWebhookMessage format.
+    Ensures safe variable initialization to prevent scope crashes and supports 
+    both text and media message types.
     """
+    # 1. Initialize variables at top to prevent local variable scope errors
+    phone_number = ""
+    to_number = ""
+    sender_name = "Unknown"
+    message_text = ""
+    message_id = None
+    timestamp_iso = None
+    metadata = {"session_id": unofficial_message.sessionId}
+
     try:
         data_type = unofficial_message.dataType
         data = unofficial_message.data
 
-        # FIX: Added "message_create" to allowed types
+        # Handle text messages (supports both 'message' and 'message_create' events)
         if data_type in ["message", "message_create"]:
             message_obj = data.get("message", {})
-            message_data = message_obj.get("_data", {})
+            message_data = message_obj.get("_data", {}) or message_obj
 
-            # Validate it's a chat message
-            # FIX: Relaxed validation to allow messages with body content even if type varies
-            if message_data.get("type") != "chat" and not message_data.get("body"):
-                 pass 
-
-            # Extract data
+            # Extract numbers - LID preservation is handled by _extract_phone_number helper
             phone_number = _extract_phone_number(message_data.get("from", ""))
             to_number = _extract_phone_number(message_data.get("to", ""))
             message_text = message_data.get("body", "")
             
-            # Fallback: notifyName -> phone_number
+            # Fallback: Profile name (notifyName) -> Phone number
             sender_name = message_data.get("notifyName") or phone_number
-            message_id = message_data.get("id", {}).get("id")
-            timestamp = message_data.get("t")
-
-            # Convert timestamp to ISO format
-            timestamp_iso = None
-            if timestamp:
-                timestamp_iso = datetime.fromtimestamp(timestamp).isoformat()
+            message_id = message_data.get("id", {}).get("id") if isinstance(message_data.get("id"), dict) else None
+            
+            t_val = message_data.get("t")
+            if t_val:
+                timestamp_iso = datetime.fromtimestamp(t_val).isoformat()
 
             return WhatsAppWebhookMessage(
                 phone_number=phone_number,
@@ -1264,67 +1331,43 @@ async def _convert_unofficial_to_standard(
                 message_id=message_id,
                 message_type="text",
                 timestamp=timestamp_iso,
-                metadata={"session_id": unofficial_message.sessionId}
+                metadata=metadata
             )
 
-        # Media message (image or voice)
+        # Handle media messages (images, voice notes)
         elif data_type == "media":
             message_media = data.get("messageMedia", {})
             message_obj = data.get("message", {})
             message_data = message_obj.get("_data", {}) if message_obj else message_media
 
-            # Determine media type
             media_mime_type = message_media.get("mimetype", "")
             media_type_str = message_media.get("type", message_data.get("type", ""))
 
-            # Validate media type
             if media_type_str == "image":
-                file_extension = "jpg"
-                media_format = "IMG"
+                file_extension, media_format = "jpg", "IMG"
             elif media_type_str == "ptt":
-                file_extension = "ogg"
-                media_format = "PTT"
+                file_extension, media_format = "ogg", "PTT"
             else:
-                # Log but don't crash the entire webhook, just raise 400 for this specific msg
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Unsupported media type: {media_type_str}"
-                )
+                raise HTTPException(status_code=400, detail=f"Unsupported media type: {media_type_str}")
 
             phone_number = _extract_phone_number(message_data.get("from", ""))
             to_number = _extract_phone_number(message_data.get("to", ""))
-
-            sender_name = (
-                message_media.get("notifyName") or
-                message_data.get("notifyName") or
-                phone_number
-            )
-
+            sender_name = message_media.get("notifyName") or message_data.get("notifyName") or phone_number
+            
             message_id = message_data.get("id", {}).get("id") if isinstance(message_data.get("id"), dict) else None
-            timestamp = message_data.get("t") or message_media.get("t")
-            caption = message_media.get("caption", "")
+            t_val = message_data.get("t") or message_media.get("t")
+            if t_val:
+                timestamp_iso = datetime.fromtimestamp(t_val).isoformat()
+
             media_data_base64 = message_media.get("data", "")
-
             if not media_data_base64:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Media data is missing"
-                )
+                raise HTTPException(status_code=400, detail="Media data is missing")
 
-            media_url = await _upload_media_to_supabase(
-                media_data_base64,
-                media_mime_type,
-                file_extension
-            )
-
-            if caption:
-                message_text = f"{caption}\n\n{media_format}:{media_url}"
-            else:
-                message_text = f"{media_format}:{media_url}"
-
-            timestamp_iso = None
-            if timestamp:
-                timestamp_iso = datetime.fromtimestamp(timestamp).isoformat()
+            # Upload to Supabase and get signed URL
+            media_url = await _upload_media_to_supabase(media_data_base64, media_mime_type, file_extension)
+            
+            caption = message_media.get("caption", "")
+            message_text = f"{caption}\n\n{media_format}:{media_url}" if caption else f"{media_format}:{media_url}"
 
             return WhatsAppWebhookMessage(
                 phone_number=phone_number,
@@ -1336,20 +1379,14 @@ async def _convert_unofficial_to_standard(
                 media_url=media_url,
                 caption=caption,
                 timestamp=timestamp_iso,
-                metadata={"session_id": unofficial_message.sessionId}
+                metadata=metadata
             )
 
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported dataType: {data_type}"
-            )
+            raise HTTPException(status_code=400, detail=f"Unsupported dataType: {data_type}")
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to convert unofficial message to standard format: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Message conversion failed: {str(e)}"
-        )
+        logger.error(f"❌ Failed to convert unofficial message: {e}")
+        raise HTTPException(status_code=500, detail=f"Message conversion failed: {str(e)}")
