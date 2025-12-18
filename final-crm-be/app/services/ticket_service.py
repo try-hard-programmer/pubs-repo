@@ -64,20 +64,49 @@ class TicketService:
             return f"{prefix}{int(datetime.now(timezone.utc).timestamp())}"
     
     # =========================================================
-    # 2. CREATE TICKET (Strict Schema Match)
+    # 2. CREATE TICKET (Strict Schema Match + Title Fix)
     # =========================================================
     async def create_ticket(
         self, 
         data: TicketCreate, 
         organization_id: str, 
-        ticket_config: Dict = None, # [CHANGED] Receive parsed config directly
+        ticket_config: Dict = None, 
         actor_id: Optional[str] = None,
         actor_type: ActorType = ActorType.SYSTEM
     ) -> Ticket:
         
-        # 1. Generate Number using the passed config
+        # 1. Generate Number
         ticket_num = await self._generate_ticket_number(organization_id, ticket_config)
         logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
+
+        # [FIX] Resolve Customer Name for Title Generation
+        # Even if FE sends "UNKNOWN", we fix it here.
+        customer_name = "Unknown Customer"
+        if data.customer_id:
+            try:
+                cust_res = self.supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
+                if cust_res.data:
+                    customer_name = cust_res.data.get("name") or "Unknown Customer"
+            except Exception as e:
+                logger.warning(f"Failed to resolve customer name: {e}")
+
+        # [FIX] Smart Title Generation
+        # If title is missing OR explicitly looks like a placeholder, regenerate it.
+        final_title = data.title
+        
+        is_placeholder = final_title and ("UNKNOWN" in final_title or "New Ticket" in final_title)
+        
+        if not final_title or is_placeholder:
+            priority_val = data.priority.value if hasattr(data.priority, "value") else str(data.priority)
+            priority_str = priority_val.upper()
+            
+            # Create snippet from description
+            desc_text = data.description or "No Content"
+            snippet = desc_text[:30] + "..." if len(desc_text) > 30 else desc_text
+            
+            # Format: [LOW] John Doe - Issue Description...
+            final_title = f"[{priority_str}] {customer_name} - {snippet}"
+            logger.info(f"✨ Auto-generated Title: {final_title}")
 
         # 2. Prepare Insert Data
         insert_data = {
@@ -85,7 +114,7 @@ class TicketService:
             "customer_id": data.customer_id,
             "chat_id": data.chat_id,
             "ticket_number": ticket_num,
-            "title": data.title,
+            "title": final_title,  # Use the fixed title
             "description": data.description,
             "category": data.category,
             "priority": data.priority.value if hasattr(data.priority, "value") else data.priority,
@@ -127,7 +156,7 @@ class TicketService:
         except Exception: pass
 
         return new_ticket
-    
+
     # =========================================================
     # 3. HELPERS
     # =========================================================

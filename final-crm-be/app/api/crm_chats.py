@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends, status
 from typing import Optional, List, Dict, Any
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 from app.models.agent import (
@@ -869,49 +869,12 @@ async def create_chat(
         logger.error(f"Create chat error: {e}", exc_info=True)
         raise HTTPException(500, "Failed to create chat")
 
+
 @router.put(
     "/chats/{chat_id}/assign",
     response_model=Chat,
     summary="Assign chat to agent",
-    description="""
-    Assign a chat to a specific agent (AI or Human).
-
-    **Features:**
-    - Assign to specific agent by providing `assigned_agent_id`
-    - Quick assign to current user by setting `assigned_to_me=true`
-    - Auto-creates agent profile if user doesn't have one yet
-    - Automatically detects if assigned agent is AI or Human and updates `handled_by` field
-    - Updates chat status to 'assigned'
-
-    **Use Cases:**
-    1. **Assign to specific agent**: Provide `assigned_agent_id` with the target agent UUID
-    2. **Assign to me**: Set `assigned_to_me=true` and system will find/create agent for current user
-    3. **Transfer chat**: Reassign already assigned chat to different agent
-
-    **Request Body:**
-    ```json
-    {
-        "assigned_agent_id": "550e8400-e29b-41d4-a716-446655440000",
-        "assigned_to_me": false,
-        "reason": "Customer requested transfer to specialist"
-    }
-    ```
-
-    **Or for self-assignment:**
-    ```json
-    {
-        "assigned_to_me": true,
-        "reason": "Taking over this conversation"
-    }
-    ```
-
-    **Behavior:**
-    - If agent doesn't exist for current user and `assigned_to_me=true`, a new agent will be created automatically
-    - Chat status will be updated to 'assigned'
-    - System automatically determines if agent is AI (user_id is NULL) or Human (user_id is not NULL)
-    - `handled_by` field will be set to 'ai' or 'human' accordingly
-    - Previous assignment will be overwritten
-    """
+    description="Assigns chat to agent (Gateway Model). Preserves original sender_agent_id for connectivity."
 )
 async def assign_chat(
     chat_id: str,
@@ -920,54 +883,48 @@ async def assign_chat(
 ):
     """
     Assign chat to an agent.
-
-    This endpoint allows assigning a chat to either:
-    - A specific agent by providing assigned_agent_id
-    - Current user by setting assigned_to_me=true (auto-creates agent if needed)
-
-    The system automatically detects whether the assigned agent is an AI agent or Human agent
-    by checking the user_id field (NULL = AI, not NULL = Human).
-
-    Args:
-        chat_id: UUID of the chat to assign
-        assignment: ChatAssign object containing:
-            - assigned_agent_id: Agent UUID (optional if assigned_to_me=true)
-            - assigned_to_me: Boolean to assign to current user (default: False)
-            - reason: Optional reason for assignment
-        current_user: Authenticated user (from dependency)
-
-    Returns:
-        Chat: Updated chat object with assignment details including last_message
-
-    Raises:
-        404: Chat or agent not found
-        500: Failed to create agent or assign chat
+    
+    GATEWAY ARCHITECTURE:
+    - Changes 'assigned_agent_id' (Who is handling it).
+    - PRESERVES 'sender_agent_id' (Who owns the WhatsApp/Telegram connection).
+    - Auto-syncs the customer's active ticket to the new agent.
     """
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        print("CURRENT USER ID: ", str(current_user))
-
-        # Check if chat exists
+        # 1. Get Chat & Channel Info
         chat_check = supabase.table("chats").select("*").eq("id", chat_id).eq("organization_id", organization_id).execute()
 
         if not chat_check.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Chat with ID {chat_id} not found"
-            )
+            raise HTTPException(404, f"Chat {chat_id} not found")
+        
+        existing_chat = chat_check.data[0]
+        customer_id = existing_chat.get("customer_id")
 
-        #  if assignment.assigned_to_me find agent with user_id current user.user_id
+        # 2. Resolve Target Agent ID
+        target_agent_id = None
+
         if assignment.assigned_to_me:
+            # Logic: Find my agent -> Find by Email -> Create New
             agent_response = supabase.table("agents") \
 				.select("id") \
 				.eq("user_id", current_user.user_id) \
 				.eq("organization_id", organization_id) \
 				.execute()
 
-            #  if not agent with user_id current user.user_id found please create agent with user_id current user.user_id
             if not agent_response.data:
+                # Try Email Link
+                user_email = current_user.user_metadata.get("email")
+                if user_email:
+                    email_check = supabase.table("agents").select("id").eq("email", user_email).eq("organization_id", organization_id).execute()
+                    if email_check.data:
+                        # Link orphan
+                        target_agent_id = email_check.data[0]['id']
+                        supabase.table("agents").update({"user_id": current_user.user_id, "status": "active"}).eq("id", target_agent_id).execute()
+            
+            # Create New if still missing
+            if not target_agent_id and not agent_response.data:
                 agent_data = {
 					"organization_id": organization_id,
 					"name": current_user.user_metadata.get("full_name") or "Unnamed Agent",
@@ -976,75 +933,74 @@ async def assign_chat(
                     "phone": current_user.user_metadata.get("phone") or f"000",
 					"status": "active",
 				}
-                create_agent_response = supabase.table("agents").insert(agent_data).execute()
-                agent_response = create_agent_response;
-                if not create_agent_response.data:
-                    raise HTTPException(
-						status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-						detail="Failed to create agent for current user")
-
-            assignment.assigned_agent_id = agent_response.data[0]["id"]
-
-        # Verify agent exists
-        agent_check = supabase.table("agents").select("id","user_id").eq("id", assignment.assigned_agent_id).eq("organization_id", organization_id).execute()
-
-        if not agent_check.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Agent with ID {assignment.assigned_agent_id} not found"
-            )
-
-        handle_by = "ai"
-        human_agent_id = None
-
-        if agent_check.data[0].get("user_id") is not None:
-            handle_by = "human"
-            human_agent_id = agent_check.data[0]["id"]
-
-        # Update chat
-        update_data = {
-            "assigned_agent_id": assignment.assigned_agent_id,
-            "status": "assigned",
-            "human_agent_id": human_agent_id,
-	        "handled_by": handle_by,
-        }
-
-        response = supabase.table("chats").update(update_data).eq("id", chat_id).execute()
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to assign chat"
-            )
-
-        logger.info(f"Chat {chat_id} assigned to agent {assignment.assigned_agent_id} by user {current_user.user_id}")
-
-        chat_data = response.data[0]
-
-        # Get last message for this chat
-        last_message_response = supabase.table("messages") \
-            .select("*") \
-            .eq("chat_id", chat_id) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
-
-        # Add last_message to chat data
-        if last_message_response.data:
-            chat_data["last_message"] = last_message_response.data[0]
+                create_res = supabase.table("agents").insert(agent_data).execute()
+                if not create_res.data: raise HTTPException(500, "Failed to create agent")
+                target_agent_id = create_res.data[0]["id"]
+            
+            elif agent_response.data:
+                target_agent_id = agent_response.data[0]["id"]
         else:
-            chat_data["last_message"] = None
+            target_agent_id = assignment.assigned_agent_id
 
+        # 3. Verify Agent Exists
+        if not target_agent_id: raise HTTPException(400, "No agent identified for assignment")
+        
+        agent_check = supabase.table("agents").select("id","user_id","name").eq("id", target_agent_id).eq("organization_id", organization_id).execute()
+        if not agent_check.data: raise HTTPException(404, "Agent not found")
+        
+        target_agent = agent_check.data[0]
+
+        # 4. Prepare Update Data
+        # IMPORTANT: We do NOT update sender_agent_id. We keep the gateway.
+        handle_by = "human" if target_agent.get("user_id") else "ai"
+        
+        update_data = {
+            "assigned_agent_id": target_agent_id,
+            "status": "assigned",
+            "handled_by": handle_by,
+        }
+        
+        if handle_by == "human":
+            update_data["human_agent_id"] = target_agent_id
+
+        # 5. Execute Chat Update
+        response = supabase.table("chats").update(update_data).eq("id", chat_id).execute()
+        if not response.data: raise HTTPException(500, "Failed to assign chat")
+
+        # 6. Sync Ticket
+        if customer_id:
+            try:
+                open_ticket = supabase.table("tickets") \
+                    .select("id") \
+                    .eq("customer_id", customer_id) \
+                    .neq("status", "resolved") \
+                    .neq("status", "closed") \
+                    .order("created_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+
+                if open_ticket.data:
+                    supabase.table("tickets").update({
+                        "assigned_agent_id": target_agent_id,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", open_ticket.data[0]["id"]).execute()
+                    logger.info(f"🔄 Synced Ticket {open_ticket.data[0]['id']}")
+            except Exception as e:
+                logger.warning(f"Ticket sync warning: {e}")
+
+        # Return result
+        chat_data = response.data[0]
+        
+        # Enrich with Last Message
+        last_msg = supabase.table("messages").select("*").eq("chat_id", chat_id).order("created_at", desc=True).limit(1).execute()
+        chat_data["last_message"] = last_msg.data[0] if last_msg.data else None
+        
         return Chat(**chat_data)
 
-    except HTTPException:
-        raise
+    except HTTPException: raise
     except Exception as e:
-        logger.error(f"Error assigning chat {chat_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to assign chat"
-        )
+        logger.error(f"Error assigning chat: {e}")
+        raise HTTPException(500, f"Assignment failed: {str(e)}")
 
 
 @router.put(
@@ -1494,80 +1450,76 @@ async def create_message(
 # TICKET ENDPOINTS
 # ============================================
 
+
 @router.get(
     "/tickets",
     response_model=TicketListResponse,
     summary="Get all tickets",
-    description="Retrieve all tickets with optional filtering, date ranges, and sorting"
+    description="Retrieve all tickets with optional filtering, joined with Customer data."
 )
 async def get_tickets(
     status_filter: Optional[TicketStatus] = Query(None, description="Filter by ticket status"),
     priority: Optional[TicketPriority] = Query(None, description="Filter by priority"),
     category: Optional[str] = Query(None, description="Filter by category"),
     assigned_to: Optional[str] = Query(None, description="Filter by assigned agent ID"),
-    
-    # [NEW] Date Filtering
-    updated_after: Optional[datetime] = Query(None, description="Fetch tickets updated after this timestamp (ISO 8601)"),
-    created_after: Optional[datetime] = Query(None, description="Fetch tickets created after this timestamp (ISO 8601)"),
-    
-    # [NEW] Sorting
-    sort_by: str = Query("updated_at", description="Field to sort by (created_at, updated_at, priority, ticket_number)"),
-    sort_order: str = Query("desc", description="Sort order (asc or desc)"),
-    
-    # Pagination
-    skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
-    
+    chat_id: Optional[str] = Query(None, description="Filter tickets by specific chat ID"),
+    customer_id: Optional[str] = Query(None, description="Filter tickets by specific customer ID"),
+    updated_after: Optional[datetime] = Query(None),
+    created_after: Optional[datetime] = Query(None),
+    sort_by: str = Query("updated_at"),
+    sort_order: str = Query("desc"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
     current_user: User = Depends(get_current_user)
 ):
-    """Get all tickets with filters"""
+    """Get all tickets with filters and Customer Join"""
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # Build query
-        query = supabase.table("tickets").select("*", count="exact").eq("organization_id", organization_id)
+        # [FIX] JOIN: Fetch tickets AND the related customer name
+        query = supabase.table("tickets") \
+            .select("*, customers(id, name, email)", count="exact") \
+            .eq("organization_id", organization_id)
 
-        # Apply Standard Filters
-        if status_filter:
-            query = query.eq("status", status_filter.value)
+        # Filters
+        if status_filter: query = query.eq("status", status_filter.value)
+        if priority: query = query.eq("priority", priority.value)
+        if category: query = query.eq("category", category)
+        if assigned_to: query = query.eq("assigned_agent_id", assigned_to)
+        if chat_id: query = query.eq("chat_id", chat_id)
+        if customer_id: query = query.eq("customer_id", customer_id)
+        if updated_after: query = query.gte("updated_at", updated_after.isoformat())
+        if created_after: query = query.gte("created_at", created_after.isoformat())
 
-        if priority:
-            query = query.eq("priority", priority.value)
-
-        if category:
-            query = query.eq("category", category)
-
-        if assigned_to:
-            query = query.eq("assigned_agent_id", assigned_to)
-
-        # [NEW] Apply Date Filters
-        if updated_after:
-            query = query.gte("updated_at", updated_after.isoformat())
-        
-        if created_after:
-            query = query.gte("created_at", created_after.isoformat())
-
-        # [NEW] Apply Sorting
-        # Validate sort field to prevent SQL injection or errors
+        # Sort & Paginate
         valid_sort_fields = ["created_at", "updated_at", "priority", "ticket_number", "status"]
-        if sort_by not in valid_sort_fields:
-            sort_by = "updated_at" # Fallback default
-
+        if sort_by not in valid_sort_fields: sort_by = "updated_at"
         is_descending = sort_order.lower() == "desc"
-        query = query.order(sort_by, desc=is_descending)
+        query = query.order(sort_by, desc=is_descending).range(skip, skip + limit - 1)
 
-        # Apply Pagination (Must be last before execute)
-        query = query.range(skip, skip + limit - 1)
-
-        # Execute query
         response = query.execute()
 
-        tickets = [Ticket(**ticket) for ticket in response.data]
+        # [FIX] Map data & Log it
+        tickets_with_customer = []
+        for ticket_data in response.data:
+            customer_obj = ticket_data.get("customers")
+            
+            # Populate fields
+            if customer_obj:
+                ticket_data["customer_name"] = customer_obj.get("name")
+                ticket_data["customer"] = customer_obj 
+            else:
+                ticket_data["customer_name"] = "Unknown Customer"
+
+            # [LOG] Debugging: Print the name to the console
+            logger.info(f"🎫 Ticket {ticket_data.get('ticket_number')} -> Customer: {ticket_data.get('customer_name')}")
+
+            tickets_with_customer.append(Ticket(**ticket_data))
 
         return TicketListResponse(
-            tickets=tickets,
-            total=response.count if response.count else len(tickets)
+            tickets=tickets_with_customer,
+            total=response.count if response.count else len(tickets_with_customer)
         )
 
     except HTTPException:
@@ -1578,7 +1530,9 @@ async def get_tickets(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch tickets"
         )
-    
+
+
+
 @router.get(
     "/tickets/{ticket_id}",
     response_model=Ticket,
@@ -1621,64 +1575,90 @@ async def get_ticket_by_id(
     description="Create a new support ticket (Auto-logs creation activity)"
 )
 async def create_ticket(
-    ticket: TicketCreate,
-    current_user: User = Depends(get_current_user)
-):
-    """Create a new ticket using TicketService"""
-    try:
-        organization_id = await get_user_organization_id(current_user)
-        supabase = get_supabase_client()
-
-        # 1. Validation Logic (Keep this here to protect data integrity)
-        # Verify chat exists
-        chat_check = supabase.table("chats").select("id").eq("id", ticket.chat_id).eq("organization_id", organization_id).execute()
-        if not chat_check.data:
-            raise HTTPException(status_code=404, detail=f"Chat {ticket.chat_id} not found")
-
-        # Verify customer exists
-        customer_check = supabase.table("customers").select("id").eq("id", ticket.customer_id).eq("organization_id", organization_id).execute()
-        if not customer_check.data:
-            raise HTTPException(status_code=404, detail=f"Customer {ticket.customer_id} not found")
+        self, 
+        data: TicketCreate, 
+        organization_id: str, 
+        ticket_config: Dict = None, 
+        actor_id: Optional[str] = None,
+        actor_type: ActorType = ActorType.SYSTEM
+    ) -> Ticket:
         
-        # Check for existing open tickets (Business Rule)
-        latest_ticket_response = supabase.table("tickets") \
-            .select("status") \
-            .eq("customer_id", ticket.customer_id) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        # 1. Generate Number
+        ticket_num = await self._generate_ticket_number(organization_id, ticket_config)
+        logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
 
-        if latest_ticket_response.data:
-            latest_status = latest_ticket_response.data[0]["status"]
-            if latest_status not in ["resolved", "closed"]:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Cannot create new ticket. Active ticket exists with status: {latest_status.title()}."
-                )
+        # [FIX] Resolve Customer Name explicitly from DB
+        customer_name = "Unknown Customer"
+        if data.customer_id:
+            try:
+                cust_res = self.supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
+                if cust_res.data:
+                    customer_name = cust_res.data.get("name") or "Unknown Customer"
+            except Exception as e:
+                logger.warning(f"Failed to resolve customer name: {e}")
 
-        # 2. Execution (Delegate to Service)
-        # This handles: Ticket Number Gen -> DB Insert -> Activity Log
-        ticket_service = get_ticket_service()
+        # [FIX] Smart Title Generation
+        # If title is missing or generic (UNKNOWN), regenerate it using the real name
+        final_title = data.title
+        is_placeholder = final_title and ("UNKNOWN" in final_title or "New Ticket" in final_title)
         
-        new_ticket = await ticket_service.create_ticket(
-            data=ticket,
-            organization_id=organization_id,
-            actor_id=current_user.user_id, # Log YOU as the creator
-            actor_type=ActorType.HUMAN
+        if not final_title or is_placeholder:
+            priority_val = data.priority.value if hasattr(data.priority, "value") else str(data.priority)
+            
+            # Create description snippet
+            desc_text = data.description or "No Content"
+            snippet = desc_text[:30] + "..." if len(desc_text) > 30 else desc_text
+            
+            # Format: [LOW] John Doe - Issue Description...
+            final_title = f"[{priority_val.upper()}] {customer_name} - {snippet}"
+
+        # 2. Insert Data
+        insert_data = {
+            "organization_id": organization_id,
+            "customer_id": data.customer_id,
+            "chat_id": data.chat_id,
+            "ticket_number": ticket_num,
+            "title": final_title,  # <--- Using the fixed title
+            "description": data.description,
+            "category": data.category,
+            "priority": data.priority.value if hasattr(data.priority, "value") else data.priority,
+            "status": TicketStatus.OPEN.value,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        res = self.supabase.table("tickets").insert(insert_data).execute()
+        if not res.data: 
+            raise Exception("Failed to insert ticket")
+        
+        new_ticket = Ticket(**res.data[0])
+
+        # 3. Log & Broadcast
+        await self.log_activity(
+            ticket_id=new_ticket.id, 
+            action="created", 
+            description=f"Ticket created by {actor_type.value}", 
+            actor_id=actor_id, 
+            actor_type=actor_type
         )
 
-        logger.info(f"Ticket created: {new_ticket.ticket_number} by user {current_user.user_id}")
+        try:
+            conn = get_connection_manager()
+            await conn.broadcast_chat_update(
+                organization_id=organization_id,
+                chat_id=new_ticket.chat_id,
+                update_type="ticket_created",  
+                data={
+                    "ticket_id": new_ticket.id,
+                    "ticket_number": new_ticket.ticket_number,
+                    "status": new_ticket.status,
+                    "priority": new_ticket.priority
+                }
+            )
+        except Exception: pass
+
         return new_ticket
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating ticket: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create ticket"
-        )
-    
 @router.put(
     "/tickets/{ticket_id}",
     response_model=Ticket,

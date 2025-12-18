@@ -73,18 +73,25 @@ async def check_agent_conflicts(
     supabase, 
     organization_id: str, 
     email: str, 
-    phone: str, 
+    phone: Optional[str], 
     exclude_agent_id: Optional[str] = None
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Checks for existing agents with the same email or phone.
     Returns a tuple: (existing_by_email, existing_by_phone)
+    Does NOT raise exceptions, returns objects for logic handling.
     """
     # 1. Build Query
     query = supabase.table("agents") \
         .select("id, status, email, phone, user_id, name") \
-        .eq("organization_id", organization_id) \
-        .or_(f"email.eq.{email},phone.eq.{phone}")
+        .eq("organization_id", organization_id)
+    
+    # Build OR condition
+    or_conditions = [f"email.eq.{email}"]
+    if phone:
+        or_conditions.append(f"phone.eq.{phone}")
+    
+    query = query.or_(",".join(or_conditions))
     
     # Exclude current agent if updating
     if exclude_agent_id:
@@ -98,26 +105,29 @@ async def check_agent_conflicts(
     # 2. Separate conflicts
     if response.data:
         for agent in response.data:
-            # Check for active conflict (BLOCKING)
-            if agent["status"] != "inactive":
-                if agent["email"] == email:
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Email '{email}' is already used by active agent '{agent['name']}'"
-                    )
-                if agent["phone"] == phone:
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Phone '{phone}' is already used by active agent '{agent['name']}'"
-                    )
-            
-            # Track inactive conflicts (For potential takeover)
             if agent["email"] == email:
                 match_email = agent
-            if agent["phone"] == phone:
+            # Only match phone if it's not None
+            if phone and agent["phone"] == phone:
                 match_phone = agent
 
     return match_email, match_phone
+
+def get_auth_user_id_by_email(supabase, email: str) -> Optional[str]:
+    """
+    Attempts to fetch a User ID from Supabase Auth by email.
+    Useful for auto-linking agents to registered users.
+    """
+    try:
+        # Try to use admin API to find user
+        # Note: This depends on the python client capabilities/permissions
+        users = supabase.auth.admin.list_users()
+        for u in users:
+            if u.email == email:
+                return u.id
+        return None
+    except Exception:
+        return None
 
 # ============================================
 # AGENT CRUD ENDPOINTS
@@ -198,6 +208,7 @@ async def get_agent(
 			detail="Failed to fetch agent"
 		)
 
+
 @router.post(
     "/",
     response_model=Agent,
@@ -214,7 +225,6 @@ async def create_agent(
         supabase = get_supabase_client()
 
         # [FIX] Normalize phone BEFORE any checks
-        # This prevents "+62812" and "62812" from being treated as different numbers
         if agent.phone:
             agent.phone = normalize_phone(agent.phone)
 
@@ -223,47 +233,73 @@ async def create_agent(
             supabase, organization_id, agent.email, agent.phone
         )
 
-        # --- 2. HANDLE PHONE RECLAMATION ---
-        # If phone exists on a DIFFERENT inactive agent, we must "free" it first
-        if existing_phone_agent:
-            # If the phone holder is NOT the one we are about to reactivate (by email)
-            if not existing_email_agent or existing_phone_agent["id"] != existing_email_agent["id"]:
-                logger.info(f"♻️ Reclaiming phone {agent.phone} from inactive agent {existing_phone_agent['id']}")
-                # Nullify phone on the old inactive agent so we can use it
-                supabase.table("agents").update({"phone": None}).eq("id", existing_phone_agent["id"]).execute()
-
-        # --- 3. EXECUTION ---
+        # --- 2. HANDLE CONFLICTS & IDEMPOTENCY ---
         
-        # SCENARIO A: Reactivate existing Email
+        # SCENARIO A: Email Exists
         if existing_email_agent:
-            logger.info(f"♻️ Reactivating inactive agent: {existing_email_agent['id']}")
+            # If Active -> Return it (Idempotent success)
+            if existing_email_agent["status"] != "inactive":
+                logger.info(f"✅ Agent exists and active: {existing_email_agent['email']}. Returning existing.")
+                return Agent(**existing_email_agent)
             
+            # If Inactive -> Prepare to Reactivate
+            logger.info(f"♻️ Found inactive agent {existing_email_agent['email']}. Reactivating...")
+            # We will handle reactivation in the execution block below using this ID
+        
+        # SCENARIO B: Phone Exists (on a DIFFERENT agent)
+        if existing_phone_agent and agent.phone:
+            # Check if it's the SAME agent we are about to reactivate
+            is_same_agent = existing_email_agent and existing_phone_agent["id"] == existing_email_agent["id"]
+            
+            if not is_same_agent:
+                if existing_phone_agent["status"] != "inactive":
+                    # Hard Conflict: Phone used by another ACTIVE agent
+                    raise HTTPException(400, f"Phone {agent.phone} is already used by active agent {existing_phone_agent['name']}")
+                else:
+                    # Soft Conflict: Phone used by INACTIVE agent -> Reclaim it
+                    logger.info(f"♻️ Reclaiming phone {agent.phone} from inactive agent {existing_phone_agent['id']}")
+                    supabase.table("agents").update({"phone": None}).eq("id", existing_phone_agent["id"]).execute()
+
+        # --- 3. PREPARE DATA ---
+        
+        # Determine User ID Linking
+        final_user_id = agent.user_id
+        if not final_user_id:
+            # 1. Check if admin is creating themselves
+            if current_user.user_metadata.get("email") == agent.email:
+                final_user_id = current_user.user_id
+            else:
+                # 2. Try to lookup in Auth system
+                final_user_id = get_auth_user_id_by_email(supabase, agent.email)
+                if final_user_id:
+                    logger.info(f"🔗 Auto-linked agent {agent.email} to Auth User {final_user_id}")
+
+        # --- 4. EXECUTION ---
+
+        # SCENARIO: Reactivate Existing
+        if existing_email_agent:
             reactivate_data = {
                 "status": "active",
                 "name": agent.name,
-                "phone": agent.phone, # Now safe to use (normalized & unique)
+                "phone": agent.phone,
                 "avatar_url": agent.avatar_url,
+                "user_id": final_user_id or existing_email_agent["user_id"], # Keep old if no new provided
                 "last_active_at": datetime.now(timezone.utc).isoformat()
             }
-            
-            # Update user_id only if provided
-            if agent.user_id is not None:
-                reactivate_data["user_id"] = agent.user_id
-
             response = supabase.table("agents").update(reactivate_data).eq("id", existing_email_agent["id"]).execute()
             return Agent(**response.data[0])
 
-        # SCENARIO B: Create Fresh Agent
-        logger.info(f"✨ Creating new agent: {agent.email}")
+        # SCENARIO: Create New
+        logger.info(f"✨ Creating fresh agent: {agent.email}")
         
         new_agent_data = {
             "organization_id": organization_id,
             "name": agent.name,
             "email": agent.email,
-            "phone": agent.phone, # Normalized
+            "phone": agent.phone,
             "status": agent.status.value,
             "avatar_url": agent.avatar_url,
-            "user_id": agent.user_id,
+            "user_id": final_user_id,
             "assigned_chats_count": 0,
             "resolved_today_count": 0,
             "avg_response_time_seconds": 0,
@@ -297,6 +333,7 @@ async def create_agent(
         logger.error(f"Error creating agent: {e}")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
 
+
 @router.put(
     "/{agent_id}",
     response_model=Agent,
@@ -316,31 +353,50 @@ async def update_agent(
         current = supabase.table("agents").select("*").eq("id", agent_id).single().execute()
         if not current.data:
             raise HTTPException(404, "Agent not found")
+        
+        existing_data = current.data
 
         update_data = agent_update.model_dump(exclude_unset=True)
         if not update_data:
-            return Agent(**current.data)
+            return Agent(**existing_data)
 
         # [FIX] Normalize phone if present in update
-        if "phone" in update_data and update_data["phone"]:
+        if "phone" in update_data:
             update_data["phone"] = normalize_phone(update_data["phone"])
 
-        # 2. UNIQUENESS CHECK
-        new_email = update_data.get("email") or current.data["email"]
-        new_phone = update_data.get("phone") or current.data["phone"]
-
-        # Only run check if email or phone is changing
-        if "email" in update_data or "phone" in update_data:
-            _, conflict_phone_agent = await check_agent_conflicts(
+        # 2. UNIQUENESS CHECK (Only if changing email/phone)
+        new_email = update_data.get("email", existing_data["email"])
+        new_phone = update_data.get("phone", existing_data["phone"])
+        
+        should_check = "email" in update_data or "phone" in update_data
+        
+        if should_check:
+            match_email, match_phone = await check_agent_conflicts(
                 supabase, organization_id, new_email, new_phone, exclude_agent_id=agent_id
             )
             
-            # Special Handling: If we are taking a phone number from an INACTIVE agent, reclaim it
-            if conflict_phone_agent and conflict_phone_agent["status"] == "inactive":
-                 logger.info(f"♻️ Reclaiming phone {new_phone} from inactive agent {conflict_phone_agent['id']}")
-                 supabase.table("agents").update({"phone": None}).eq("id", conflict_phone_agent["id"]).execute()
+            # Check Email Conflict
+            if match_email and match_email["status"] != "inactive":
+                 raise HTTPException(400, f"Email {new_email} is already used by active agent {match_email['name']}")
 
-        # 3. Update
+            # Check Phone Conflict
+            if match_phone and new_phone:
+                if match_phone["status"] != "inactive":
+                    raise HTTPException(400, f"Phone {new_phone} is already used by active agent {match_phone['name']}")
+                else:
+                    # Reclaim phone from inactive agent
+                    logger.info(f"♻️ Reclaiming phone {new_phone} from inactive agent {match_phone['id']}")
+                    supabase.table("agents").update({"phone": None}).eq("id", match_phone["id"]).execute()
+
+        # 3. User Linking (If email changed and no user_id)
+        if "email" in update_data and not update_data.get("user_id") and not existing_data.get("user_id"):
+             # Attempt auto-link
+             found_user_id = get_auth_user_id_by_email(supabase, new_email)
+             if found_user_id:
+                 update_data["user_id"] = found_user_id
+                 logger.info(f"🔗 Auto-linked updated agent {new_email} to User {found_user_id}")
+
+        # 4. Update
         if "status" in update_data and update_data["status"]:
             update_data["status"] = update_data["status"].value
 
@@ -351,7 +407,8 @@ async def update_agent(
     except Exception as e:
         logger.error(f"Update failed: {e}")
         raise HTTPException(500, str(e))	
-	
+
+
 @router.patch(
     "/{agent_id}/status",
     response_model=Agent,

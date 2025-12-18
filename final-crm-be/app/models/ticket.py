@@ -101,6 +101,8 @@ class Ticket(BaseModel):
     updated_at: datetime
     resolved_at: Optional[datetime]
     closed_at: Optional[datetime]
+    customer_name: Optional[str] = None
+    customer: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
