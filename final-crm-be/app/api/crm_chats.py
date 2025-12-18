@@ -153,19 +153,38 @@ async def send_message_via_channel(
         effective_chat_data = chat_data.copy()
         
         if chat_channel == "whatsapp":
-            target = customer_data.get("phone")
+            # [FIX] PRIORITY: Check metadata for stored WhatsApp ID (LID or @c.us)
+            metadata = customer_data.get("metadata", {}) or {}
+            target = metadata.get("whatsapp_lid")
+            
+            # Fallback to phone or whatsapp_id
+            if not target:
+                target = customer_data.get("phone")
             if not target or target == "None":
-                target = customer_data.get("metadata", {}).get("whatsapp_id")
+                target = metadata.get("whatsapp_id")
             
             if not target: return {"success": False, "message": "Customer has no phone or WhatsApp ID"}
             
-            cleaned = re.sub(r'[^\d]', '', target)
-            if len(cleaned) < 15 and not cleaned.startswith('62') and cleaned.startswith('0'): 
-                cleaned = '62' + cleaned[1:]
+            # [FIX] GENERIC ID PRESERVATION
+            # If the target contains '@', assume it is a valid ID (LID, Group, or Standard) and USE AS IS.
+            # Do NOT strip characters from it.
+            final_target = str(target).strip()
+            
+            if "@" in final_target:
+                # Valid ID (e.g., "user@lid", "123@g.us", "62812@c.us")
+                pass 
+            else:
+                # Only clean if it looks like a raw phone number
+                cleaned = re.sub(r'[^\d]', '', final_target)
+                # Auto-fix Indonesia numbers if needed
+                if len(cleaned) < 15 and not cleaned.startswith('62') and cleaned.startswith('0'): 
+                    cleaned = '62' + cleaned[1:]
+                final_target = cleaned
             
             svc = get_whatsapp_service()
             try:
-                res = await svc.send_text_message(sender_id, cleaned, message_content)
+                # Now passing the correct ID to the service
+                res = await svc.send_text_message(sender_id, final_target, message_content)
                 return {"success": True, "data": res}
             except Exception as e:
                 return {"success": False, "message": str(e)}
@@ -185,7 +204,7 @@ async def send_message_via_channel(
 
     except Exception as e:
         logger.error(f"Send Error: {e}")
-        return {"success": False, "message": str(e)}      
+        return {"success": False, "message": str(e)}
 
 async def create_message_internal(chat_data: dict, content: str, user_id: str, supabase):
     """Inserts message, Sends, and SYNCHRONOUSLY captures ID."""

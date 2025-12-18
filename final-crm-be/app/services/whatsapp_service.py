@@ -170,6 +170,15 @@ class WhatsAppService:
             logger.error(f"Failed to get QR code for session {session_id}: {e}")
             raise Exception(f"QR code retrieval failed: {str(e)}")
 
+    def _format_chat_id(self, phone_number: str) -> str:
+        """
+        [FIX] Format chat ID correctly for LID or standard numbers.
+        If it already has a suffix (@c.us, @lid, @g.us), use it as is.
+        """
+        phone_str = str(phone_number)
+        if "@" in phone_str:
+            return phone_str
+        return f"{phone_str}@c.us"
 
     async def check_session_status(self, session_id: str) -> Dict[str, Any]:
         """
@@ -268,190 +277,98 @@ class WhatsAppService:
             logger.error(f"Failed to terminate session {session_id}: {e}")
             raise Exception(f"Session termination failed: {str(e)}")
 
-    async def send_text_message(
-        self,
-        session_id: str,
-        phone_number: str,
-        message: str
-    ) -> Dict[str, Any]:
-        """
-        Send text message via WhatsApp
-
-        Args:
-            session_id: Session identifier
-            phone_number: Recipient phone number (format: 628123456789)
-            message: Message text content
-
-        Returns:
-            Message send result with message ID
-
-        Raises:
-            Exception: If message sending fails
-        """
+    async def send_text_message(self, session_id: str, phone_number: str, message: str) -> Dict[str, Any]:
         try:
-            url = f"{self.base_url}/client/sendMessage/{session_id}"
+            # [FIX] Simplified logic: Trust the ID if it contains '@'
+            chat_id = str(phone_number).strip()
+            
+            # If it's a raw number, append @c.us. If it's @lid or @g.us, leave it alone.
+            if "@" not in chat_id:
+                chat_id = f"{chat_id}@c.us"
 
+            # Use the correct API payload based on Swagger
             payload = {
-                "chatId": f"{phone_number}@c.us",
+                "chatId": chat_id,
                 "contentType": "string",
                 "content": message
             }
 
+            url = f"{self.base_url}/client/sendMessage/{session_id}"
+
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
-                    url,
-                    json=payload,
+                    url, 
+                    json=payload, 
                     headers=self._get_headers()
                 )
                 response.raise_for_status()
-
-                result = response.json()
-                logger.info(f"✅ Text message sent via session {session_id} to {phone_number}")
-
-                return {
-                    "success": True,
-                    "session_id": session_id,
-                    "phone_number": phone_number,
-                    "message_type": "text",
-                    "data": result
-                }
-
-        except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP {e.response.status_code}: {e.response.text}"
-            logger.error(f"Failed to send text message: {error_msg}")
-            raise Exception(f"Message sending failed: {error_msg}")
+                return {"success": True, "session_id": session_id, "phone_number": phone_number, "data": response.json()}
         except Exception as e:
             logger.error(f"Failed to send text message: {e}")
             raise Exception(f"Message sending failed: {str(e)}")
-
-    async def send_media_message(
-        self,
-        session_id: str,
-        phone_number: str,
-        media_url: str,
-        caption: Optional[str] = None,
-        media_type: str = "image"
-    ) -> Dict[str, Any]:
-        """
-        Send media message (image, video, audio) via WhatsApp
-
-        Args:
-            session_id: Session identifier
-            phone_number: Recipient phone number
-            media_url: Public URL of the media file
-            caption: Optional caption for the media
-            media_type: Type of media (image, video, audio)
-
-        Returns:
-            Message send result
-
-        Raises:
-            Exception: If message sending fails
-        """
+        
+    async def send_media_message(self, session_id: str, phone_number: str, media_url: str, caption: Optional[str] = None, media_type: str = "image") -> Dict[str, Any]:
         try:
-            url = f"{self.base_url}/client/sendMessage/{session_id}"
+            # [FIX] LID RESOLUTION FOR MEDIA
+            chat_id = phone_number
+            if "@lid" in str(phone_number):
+                contact_data = await self.get_contact_by_id(session_id, phone_number)
+                if contact_data.get("success") and contact_data.get("number"):
+                    chat_id = contact_data.get("number")
+                else:
+                    chat_id = phone_number # Keep @lid
 
-            # Prepare media payload based on type
+            chat_id = self._format_chat_id(chat_id)
+
             payload = {
-                "chatId": f"{phone_number}@c.us",
+                "chatId": chat_id,
                 "contentType": media_type,
                 "content": media_url
             }
-
             if caption:
                 payload["caption"] = caption
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
-                    url,
-                    json=payload,
+                    f"{self.base_url}/client/sendMessage/{session_id}", 
+                    json=payload, 
                     headers=self._get_headers()
                 )
                 response.raise_for_status()
-
-                result = response.json()
-                logger.info(f"✅ Media message ({media_type}) sent via session {session_id} to {phone_number}")
-
-                return {
-                    "success": True,
-                    "session_id": session_id,
-                    "phone_number": phone_number,
-                    "message_type": media_type,
-                    "media_url": media_url,
-                    "data": result
-                }
-
-        except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP {e.response.status_code}: {e.response.text}"
-            logger.error(f"Failed to send media message: {error_msg}")
-            raise Exception(f"Media message sending failed: {error_msg}")
+                return {"success": True, "session_id": session_id, "media_url": media_url, "data": response.json()}
         except Exception as e:
             logger.error(f"Failed to send media message: {e}")
             raise Exception(f"Media message sending failed: {str(e)}")
 
-    async def send_file_message(
-        self,
-        session_id: str,
-        phone_number: str,
-        file_url: str,
-        filename: Optional[str] = None,
-        caption: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Send document/file message via WhatsApp
-
-        Args:
-            session_id: Session identifier
-            phone_number: Recipient phone number
-            file_url: Public URL of the file
-            filename: Optional filename to display
-            caption: Optional caption for the file
-
-        Returns:
-            Message send result
-
-        Raises:
-            Exception: If message sending fails
-        """
+    async def send_file_message(self, session_id: str, phone_number: str, file_url: str, filename: Optional[str] = None, caption: Optional[str] = None) -> Dict[str, Any]:
         try:
-            url = f"{self.base_url}/client/sendMessage/{session_id}"
+            # [FIX] LID RESOLUTION FOR FILES
+            chat_id = phone_number
+            if "@lid" in str(phone_number):
+                contact_data = await self.get_contact_by_id(session_id, phone_number)
+                if contact_data.get("success") and contact_data.get("number"):
+                    chat_id = contact_data.get("number")
+                else:
+                    chat_id = phone_number # Keep @lid
+
+            chat_id = self._format_chat_id(chat_id)
 
             payload = {
-                "chatId": f"{phone_number}@c.us",
+                "chatId": chat_id,
                 "contentType": "MessageMediaDocument",
                 "content": file_url
             }
-
-            if filename:
-                payload["filename"] = filename
-
-            if caption:
-                payload["caption"] = caption
+            if filename: payload["filename"] = filename
+            if caption: payload["caption"] = caption
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
-                    url,
-                    json=payload,
+                    f"{self.base_url}/client/sendMessage/{session_id}", 
+                    json=payload, 
                     headers=self._get_headers()
                 )
                 response.raise_for_status()
-
-                result = response.json()
-                logger.info(f"✅ File message sent via session {session_id} to {phone_number}")
-
-                return {
-                    "success": True,
-                    "session_id": session_id,
-                    "phone_number": phone_number,
-                    "message_type": "file",
-                    "file_url": file_url,
-                    "data": result
-                }
-
-        except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP {e.response.status_code}: {e.response.text}"
-            logger.error(f"Failed to send file message: {error_msg}")
-            raise Exception(f"File message sending failed: {error_msg}")
+                return {"success": True, "session_id": session_id, "file_url": file_url, "data": response.json()}
         except Exception as e:
             logger.error(f"Failed to send file message: {e}")
             raise Exception(f"File message sending failed: {str(e)}")
@@ -563,6 +480,37 @@ class WhatsAppService:
             logger.error(f"Failed to get chat info: {e}")
             raise Exception(f"Chat info retrieval failed: {str(e)}")
 
+    async def get_contact_by_id(self, session_id: str, chat_id: str) -> Dict[str, Any]:
+        """
+        [NEW] Attempt to find a contact's real details from an ID (LID or JID).
+        """
+        try:
+            url = f"{self.base_url}/client/getContacts/{session_id}"
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, headers=self._get_headers())
+                if response.status_code != 200:
+                    return {"success": False, "message": "Failed to fetch contact list"}
+
+                contacts = response.json()
+                for contact in contacts:
+                    # Check both serialized ID and nested ID
+                    serialized = contact.get("id", {}).get("_serialized")
+                    if serialized == chat_id:
+                        # Extract the real number if it exists in the contact object
+                        # WhatsApp often puts the real number in contact['number']
+                        real_number = contact.get("number")
+                        return {
+                            "success": True,
+                            "name": contact.get("name") or contact.get("pushname"),
+                            "number": real_number,
+                            "is_business": contact.get("isBusiness", False),
+                            "data": contact
+                        }
+                return {"success": False, "message": "Contact not found in list"}
+        except Exception as e:
+            logger.error(f"Contact lookup error: {e}")
+            return {"success": False, "message": str(e)}
+        
     def get_supabase_client(self):
         """Get Supabase client from settings"""
         from supabase import create_client
@@ -574,8 +522,6 @@ class WhatsAppService:
             )
 
         return create_client(app_settings.SUPABASE_URL, app_settings.SUPABASE_SERVICE_KEY)
-
-
 
     def configure_webhook(
         self,
@@ -608,6 +554,76 @@ class WhatsAppService:
             "note": "Webhooks are configured via environment variables in the WhatsApp API service"
         }
 
+    async def get_contact_by_id(self, session_id: str, chat_id: str) -> Dict[str, Any]:
+        """
+        [ENHANCED] Find a contact's real details from an ID (LID or JID).
+        
+        Args:
+            session_id: WhatsApp session ID
+            chat_id: Contact ID (can be LID like 271454901956746@lid or regular like 6281234567890@c.us)
+        
+        Returns:
+            Dict with success, name, number (real phone with @c.us), and full contact data
+        """
+        try:
+            url = f"{self.base_url}/client/getContacts/{session_id}"
+            
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, headers=self._get_headers())
+                
+                if response.status_code != 200:
+                    return {"success": False, "message": f"Failed to fetch contacts: {response.status_code}"}
+
+                contacts = response.json()
+                
+                # Search for matching contact
+                for contact in contacts:
+                    # Get serialized ID from contact
+                    serialized_id = contact.get("id", {}).get("_serialized")
+                    
+                    # Check if this is our target contact
+                    if serialized_id == chat_id:
+                        # Extract real phone number
+                        # Priority: 1) number field, 2) user field from id, 3) extract from _serialized
+                        real_number = None
+                        
+                        # Method 1: Direct number field
+                        if contact.get("number"):
+                            real_number = f"{contact['number']}@c.us"
+                        
+                        # Method 2: Extract from id.user field
+                        elif contact.get("id", {}).get("user"):
+                            user = contact["id"]["user"]
+                            # Clean and format the number
+                            if "@" in str(user):
+                                real_number = user
+                            else:
+                                real_number = f"{user}@c.us"
+                        
+                        # Method 3: Parse from _serialized if it's a standard number format
+                        elif "@c.us" in str(serialized_id):
+                            real_number = serialized_id
+                        
+                        return {
+                            "success": True,
+                            "name": contact.get("name") or contact.get("pushname") or contact.get("verifiedName"),
+                            "number": real_number,
+                            "is_business": contact.get("isBusiness", False),
+                            "is_lid": "@lid" in str(chat_id),
+                            "original_id": chat_id,
+                            "data": contact
+                        }
+                
+                # Contact not found in list
+                logger.warning(f"Contact {chat_id} not found in contacts list")
+                return {
+                    "success": False, 
+                    "message": f"Contact {chat_id} not found in contacts list. It may not be in your WhatsApp contacts."
+                }
+                
+        except Exception as e:
+            logger.error(f"Contact lookup error: {e}")
+            return {"success": False, "message": str(e)}
 
 # Singleton instance
 _whatsapp_service: Optional[WhatsAppService] = None

@@ -71,33 +71,22 @@ class WebhookCallbackService:
     def _format_whatsapp_chat_id(self, phone: str) -> str:
         """
         Format phone number to WhatsApp chatId format.
-
-        Personal chat: {phone}@c.us (phone starts with country code)
-        Group chat: {phone}@g.us (phone doesn't start with country code)
-
-        Common country codes: 62 (ID), 1 (US), 44 (UK), 91 (IN), 86 (CN), etc.
-
-        Args:
-            phone: Normalized phone number (international format)
-
-        Returns:
-            WhatsApp chatId (e.g., "6281288888888@c.us" or "120363xxx@g.us")
-
-        Example:
-            _format_whatsapp_chat_id("6281288888888") → "6281288888888@c.us"
-            _format_whatsapp_chat_id("120363xxx") → "120363xxx@g.us"
         """
+        # FIX: If the phone number already contains an '@' (like @lid, @g.us, or existing @c.us),
+        # return it as is. Do not append another suffix.
+        if "@" in phone:
+            return phone
+
         # Common country codes pattern (1-3 digits)
-        # 1 (US/CA), 7 (RU), 20 (EG), 27 (ZA), 30-49 (Europe), 60-66 (Asia), 81 (JP), 82 (KR), 86 (CN), 91 (IN), etc.
         country_code_pattern = r'^(1|7|2[0-7]|3[0-9]|4[0-4]|4[6-9]|5[1-8]|6[0-6]|8[1-6]|9[0-8])'
 
         if re.match(country_code_pattern, phone):
             # Personal chat
             return f"{phone}@c.us"
         else:
-            # Group chat
+            # Group chat (fallback if no suffix found and doesn't look like international number)
             return f"{phone}@g.us"
-
+        
     async def _ensure_chat_data(self, chat: Dict[str, Any], supabase) -> Dict[str, Any]:
         """
         Helper to ensure chat object has customer_id and agent_id.
