@@ -5,6 +5,7 @@ Based on: https://github.com/chrishubert/whatsapp-api
 """
 import logging
 import httpx
+import base64
 from typing import Optional, Dict, Any, List
 
 from fastapi import HTTPException, status
@@ -562,6 +563,86 @@ class WhatsAppService:
             logger.error(f"❌ Contact resolution failed: {e}")
             return {"success": False, "message": str(e)}
     
+    async def _download_media(self, url: str) -> Optional[Dict[str, str]]:
+        """Download media -> {mimetype, data(base64)}"""
+        try:
+            logger.info(f"📥 Downloading media: {url}")
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    b64 = base64.b64encode(resp.content).decode('utf-8')
+                    mime = resp.headers.get("content-type", "application/octet-stream")
+                    return {"data": b64, "mimetype": mime}
+                logger.error(f"Download failed: {resp.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            return None
+
+    async def send_media_message(self, session_id: str, phone_number: str, media_url: str, caption: Optional[str] = None, media_type: str = "image") -> Dict[str, Any]:
+        try:
+            logger.info(f"📤 Sending media to: {phone_number}")
+            chat_id = self._format_chat_id(phone_number)
+            
+            # Resolve LID if present
+            if "@lid" in str(phone_number):
+                res = await self.get_contact_by_id(session_id, phone_number)
+                if res.get("success") and res.get("number"): chat_id = self._format_chat_id(res["number"])
+
+            media_data = await self._download_media(media_url) if media_url.startswith("http") else None
+            
+            if media_data:
+                payload = {
+                    "chatId": chat_id, "contentType": "MessageMedia",
+                    "content": {"mimetype": media_data["mimetype"], "data": media_data["data"], "filename": "media"},
+                    "options": {"caption": caption}
+                }
+            else:
+                payload = {
+                    "chatId": chat_id, "contentType": "MessageMediaFromURL",
+                    "content": media_url, "options": {"caption": caption}
+                }
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(f"{self.base_url}/client/sendMessage/{session_id}", json=payload, headers=self._get_headers())
+                response.raise_for_status()
+                return {"success": True, "data": response.json()}
+        except Exception as e:
+            logger.error(f"Failed to send media: {e}")
+            raise Exception(f"Send media failed: {e}")
+
+    async def send_file_message(self, session_id: str, phone_number: str, file_url: str, filename: Optional[str] = None, caption: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            logger.info(f"📤 Sending file to: {phone_number}")
+            chat_id = self._format_chat_id(phone_number)
+            
+            if "@lid" in str(phone_number):
+                res = await self.get_contact_by_id(session_id, phone_number)
+                if res.get("success") and res.get("number"): chat_id = self._format_chat_id(res["number"])
+
+            media_data = await self._download_media(file_url) if file_url.startswith("http") else None
+            
+            if media_data:
+                payload = {
+                    "chatId": chat_id, "contentType": "MessageMedia",
+                    "content": {"mimetype": media_data["mimetype"], "data": media_data["data"], "filename": filename or "file"},
+                    "options": {"caption": caption}
+                }
+            else:
+                payload = {
+                    "chatId": chat_id, "contentType": "MessageMediaFromURL",
+                    "content": file_url, "options": {"caption": caption}
+                }
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(f"{self.base_url}/client/sendMessage/{session_id}", json=payload, headers=self._get_headers())
+                response.raise_for_status()
+                return {"success": True, "data": response.json()}
+        except Exception as e:
+            logger.error(f"Failed to send file: {e}")
+            raise Exception(f"Send file failed: {e}")
+
+
 # Singleton instance
 _whatsapp_service: Optional[WhatsAppService] = None
 

@@ -54,31 +54,42 @@ class TelegramClientManager:
         for client in self.clients.values():
             await client.disconnect()
 
-    async def send_message(self, account_id: str, chat_id: str, text: str):
+    async def send_message(self, account_id: str, chat_id: str, text: str, media_url: Optional[str] = None):
+        """
+        Send a message (Text or Media) to a chat.
+        """
         client = self.clients.get(account_id)
         if not client:
             logger.warning(f"⚠️ Cannot send message: Client {account_id} not connected/found.")
             return None 
         
         try:
-            # 1. Try resolving chat_id to integer (Telegram User IDs are ints)
-            entity = int(chat_id)
-        except ValueError:
-            # 2. If it's a username (string), keep it as string
-            entity = chat_id
+            # 1. Resolve Entity (User ID or Username)
+            try:
+                entity = int(chat_id)
+            except ValueError:
+                entity = chat_id
             
-        try:
-            logger.info(f"📤 Sending to {entity} via {account_id}...")
-            msg = await client.send_message(entity, text)
+            # 2. Send Media or Text
+            if media_url:
+                logger.info(f"📤 Sending FILE to {entity} via {account_id} (URL: {media_url})")
+                # Telethon 'send_file' supports URLs natively
+                msg = await client.send_file(entity, file=media_url, caption=text or "")
+            else:
+                if not text:
+                    logger.warning("⚠️ Attempted to send empty message without media. Skipping.")
+                    return None
+                    
+                logger.info(f"📤 Sending TEXT to {entity} via {account_id}...")
+                msg = await client.send_message(entity, text)
             
-            # [FIX] Return tuple: (Message ID, Resolved Chat ID)
-            # msg.chat_id contains the actual ID of the user we just messaged
+            # 3. Return IDs (Message ID, Chat ID)
             return msg.id, msg.chat_id
             
         except Exception as e:
             logger.error(f"❌ Telethon Send Error: {e}")
             raise e
-            
+               
     async def _process_update(self, account_id: str, event):
         """Normalize Telegram event to dict and call handlers."""
         try:

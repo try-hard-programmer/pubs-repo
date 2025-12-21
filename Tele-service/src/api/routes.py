@@ -30,7 +30,8 @@ class StartSessionRequest(BaseModel):
 class WebhookSendRequest(BaseModel):
     agent_id: str   
     chat_id: str    
-    text: str       
+    text: str = "" # Default to empty to allow file-only messages
+    media_url: Optional[str] = None # Added for file support
 
 class InitAuthRequest(BaseModel):
     api_id: int
@@ -221,11 +222,12 @@ async def webhook_send_message(req: WebhookSendRequest):
     logger.info(f"🪝 Webhook received reply for account: {req.agent_id} -> user: {req.chat_id}")
     
     try:
-        # [FIX] Unpack tuple (msg_id, resolved_chat_id)
+        # [FIX] Pass media_url to manager
         result = await telegram_manager.send_message(
             account_id=req.agent_id,
             chat_id=req.chat_id,
-            text=req.text
+            text=req.text,
+            media_url=req.media_url
         )
         
         if not result:
@@ -236,21 +238,21 @@ async def webhook_send_message(req: WebhookSendRequest):
         # Optional: Save to local DB History (Outgoing)
         await db.save_message(
             telegram_account_id=req.agent_id,
-            chat_id=str(resolved_chat_id), # Save the REAL ID
+            chat_id=str(resolved_chat_id),
             message_id=str(msg_id),
             direction="outgoing",
-            text=req.text,
+            text=req.text or "[MEDIA]",
             status="sent"
         )
 
         return {
             "status": "success", 
             "message_id": msg_id, 
-            "resolved_chat_id": str(resolved_chat_id), # [FIX] Return this to CRM!
+            "resolved_chat_id": str(resolved_chat_id),
             "detail": "Sent via Userbot Loopback"
         }
 
     except Exception as e:
         logger.error(f"❌ Webhook send failed: {e}")
-        # Return 500 so Main API knows it failed
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))    
+

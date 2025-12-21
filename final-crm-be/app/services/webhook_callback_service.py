@@ -243,13 +243,23 @@ class WebhookCallbackService:
         self, agent_id: str, telegram_id: str, message_content: str,
         supabase=None, customer_id: str=None, current_metadata: dict=None, chat_id: str=None
     ) -> Dict[str, Any]:
-        """Send message via the Python Userbot Worker."""
+        """
+        Send message via the Python Userbot Worker.
+        INCLUDES FIX for URL construction (/api/api issue).
+        """
         try:
             base_url = settings.TELEGRAM_API_URL
             if not base_url: raise Exception("TELEGRAM_API_URL missing")
             
-            endpoint_url = f"{base_url.rstrip('/')}/api/webhook/send"
-            if "/api/api" in endpoint_url: endpoint_url = endpoint_url.replace("/api/api", "/api")
+            # [FIX] Robust URL Construction
+            base_url = base_url.rstrip("/")
+            if base_url.endswith("/api"):
+                endpoint_url = f"{base_url}/webhook/send"
+            else:
+                endpoint_url = f"{base_url}/api/webhook/send"
+            
+            # Double check for double /api/api
+            endpoint_url = endpoint_url.replace("/api/api/", "/api/")
 
             payload = {"agent_id": agent_id, "chat_id": telegram_id, "text": message_content}
             headers = {"Content-Type": "application/json", "X-Service-Key": settings.TELEGRAM_SECRET_KEY_SERVICE}
@@ -298,8 +308,9 @@ class WebhookCallbackService:
 
         except Exception as e:
             logger.error(f"❌ Userbot dispatch failed: {e}")
-            raise e   
-    
+            raise e
+                
+
     async def send_email_callback(
         self,
         chat: Dict[str, Any],

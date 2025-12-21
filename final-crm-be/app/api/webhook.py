@@ -13,7 +13,7 @@ import time
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 from app.models.webhook import (
     WhatsAppWebhookMessage,
@@ -487,6 +487,57 @@ async def resolve_lid_to_real_number(
         logger.error(f"❌ LID resolution error: {e}")
         return contact
     
+async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
+    """
+    DRY Helper: Analyzes message body/media, uploads content if needed, 
+    and returns (cleaned_text, message_type, media_url).
+    """
+    content = ""
+    msg_type = "text"
+    media_url = None
+    
+    # 1. Check for standard Media Object
+    if data_type == "media":
+        media_obj = message_data.get("messageMedia", {}) or message_data
+        base64_data = media_obj.get("data", "")
+        if not base64_data: raise ValueError("Media data missing")
+        
+        mime = media_obj.get("mimetype", "application/octet-stream")
+        raw_type = media_obj.get("type", "file")
+        
+        # Extension mapping
+        ext_map = {"image": "jpg", "ptt": "ogg", "document": "pdf", "audio": "mp3", "video": "mp4"}
+        ext = ext_map.get(raw_type, "bin")
+        
+        media_url = await _upload_media_to_supabase(base64_data, mime, ext)
+        msg_type = raw_type if raw_type in ["image", "video", "audio"] else "file"
+        
+        # Content is URL + Caption (if any)
+        caption = media_obj.get("caption", "")
+        content = f"{caption}\n{media_url}" if caption else media_url
+
+    # 2. Check for Base64 in Body (Text Message acting as Image)
+    else:
+        body = message_data.get("body", "")
+        is_base64 = False
+        
+        if body and isinstance(body, str):
+            if body.startswith("/9j/") or body.startswith("iVBORw0KGgo"): is_base64 = True
+            elif len(body) > 500 and " " not in body[:50]: is_base64 = True # Heuristic
+            
+        if is_base64:
+            logger.info("📸 Detected Base64 in body -> Uploading...")
+            try:
+                media_url = await _upload_media_to_supabase(body, "image/jpeg", "jpg")
+                content = media_url # Raw URL, no prefix
+                msg_type = "image"
+            except Exception as e:
+                logger.error(f"Base64 body upload failed: {e}")
+                content = "[Image Upload Failed]"
+        else:
+            content = body
+            
+    return content, msg_type, media_url
 
 # ============================================
 # MAIN PROCESSOR (FIXED)
@@ -506,95 +557,91 @@ async def process_webhook_message(
     agent_id = agent["id"]
     org_id = agent["organization_id"]
 
-    # 1. INACTIVE CHECK
     if agent.get("status") == "inactive":
         return {"success": False, "status": "dropped_inactive"}
 
-    # 2. ROUTING
+    # ROUTING
     router = get_message_router_service(supabase)
     res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
     chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
 
-    # 2a. Update Phone
+    # Update Phone
     if customer_metadata.get("phone") and cust_id:
         try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
         except: pass
 
-    # 2b. Broadcast Incoming
+    # Broadcast Incoming
     if app_settings.WEBSOCKET_ENABLED:
         try:
+            # [FIX] Added metadata param so FE gets message_type
             await get_connection_manager().broadcast_new_message(
                 organization_id=org_id, chat_id=chat_id, message_id=msg_id,
                 customer_id=cust_id, customer_name=customer_name or "Unknown",
                 message_content=message_content, channel=channel, handled_by=res["handled_by"],
                 sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
-                was_reopened=res.get("was_reopened", False)
+                was_reopened=res.get("was_reopened", False),
+                metadata=message_metadata 
             )
         except: pass
 
-    # 3. BUSY CHECK
+    # BUSY CHECK
     if agent.get("status") == "busy":
         msg = "Maaf, saat ini kami sedang sibuk."
-        contact_info = {"phone": contact} if channel == "whatsapp" else {"telegram_id": contact}
+        contact_info = {"phone": contact, "telegram_id": contact}
         await send_auto_reply(supabase, channel, agent_id, contact_info, msg)
         await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
         return {**res, "handled_by": "system_busy"}
 
-    # 4. ACTIVE TICKET CHECK (SMART ESCALATION)
-    # [FIXED] Changed assignee_id to assigned_agent_id to match your DB schema
+    # ACTIVE TICKET CHECK
     active_ticket = None
     ticket_query = supabase.table("tickets").select("id, status, priority, assigned_agent_id").eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
     
     if ticket_query.data:
         active_ticket = ticket_query.data[0]
-        # STOP AI ONLY IF HUMAN IS ASSIGNED
         if active_ticket.get("assigned_agent_id"):
             logger.info(f"🎫 Active Ticket Found (Human Assigned). Stopping AI.")
             return {**res, "handled_by": "human_ticket"}
 
-    # 5. SCHEDULE CHECK
+    # SCHEDULE CHECK
     schedule = await get_agent_schedule_config(agent_id, supabase)
     is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
     if not is_within:
         msg = "Maaf kami sedang tutup saat ini."
         supabase.table("messages").update({"metadata": {**message_metadata, "out_of_schedule": True}}).eq("id", msg_id).execute()
-        contact_info = {"phone": contact} if channel == "whatsapp" else {"telegram_id": contact}
-        await send_message_via_channel({"id": chat_id, "channel": channel, "sender_agent_id": agent_id}, contact_info, msg, supabase)
+        chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
+        cust_data = {"phone": contact, "metadata": {"telegram_id": contact}}
+        await send_message_via_channel(chat_data, cust_data, msg, supabase)
         await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
         return {**res, "handled_by": "ooo_system"}
 
-    # 6. INTELLIGENCE (Guard)
-    ticket_config = parse_agent_config(agent.get("ticketing_config"))
+    # INTELLIGENCE
+    ticket_config = agent.get("ticketing_config") or {}
+    if isinstance(ticket_config, str):
+        try: ticket_config = json.loads(ticket_config)
+        except: ticket_config = {}
+
     should_trigger_ai = True
 
     if ticket_config.get("enabled"):
         should_ticket, pred_cat, prio_str, conf, reason, ticket_title = ml_guard.predict(message_content)
         
-        # [LOGIC A] LOW PRIORITY -> GREETING (Stop AI)
         if prio_str == "low":
             logger.info(f"🛡️ Low Priority ({reason}). Sending Greeting & Stopping AI.")
-            
             resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
-
-            # Send Greeting
             greeting_msg = (
                 f"Halo {customer_name or 'Kak'}! 👋\n\n"
                 "Pesan Anda telah kami terima melalui platform Syntra.\n"
                 "Silakan jelaskan permasalahan yang Anda alami secara lebih rinci agar kami dapat membantu Anda dengan lebih baik."
             )
-            
             chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
-            cust_data = {"phone": resolved_contact} if channel == "whatsapp" else {"telegram_id": resolved_contact}
+            cust_data = {"phone": resolved_contact, "metadata": {"telegram_id": resolved_contact}}
             
             await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
             await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel)
             
-            # Create Ticket ONLY if none exists (Loop prevention)
             if not active_ticket and ticket_config.get("autoCreateTicket"):
                 try: final_prio = TicketPriority.LOW
                 except: final_prio = "low"
-                
-                logger.info(f"🎫 Creating LOW Priority Ticket for Greeting")
                 ticket_svc = get_ticket_service()
                 ticket_data = TicketCreate(
                     chat_id=chat_id, customer_id=cust_id,
@@ -607,31 +654,21 @@ async def process_webhook_message(
             should_trigger_ai = False
             return {**res, "handled_by": "system_greeting"}
 
-        # [LOGIC B] HIGH/MEDIUM -> UPDATE TICKET & TRIGGER AI
         elif should_ticket:
             final_cat = pred_cat
             if ticket_config.get("categories") and pred_cat not in ticket_config["categories"]:
                 final_cat = ticket_config["categories"][0]
-
             try: final_prio = TicketPriority(prio_str)
             except: final_prio = TicketPriority.MEDIUM
 
             if active_ticket:
-                # UPDATE EXISTING TICKET (Escalation)
-                logger.info(f"🔄 Updating Existing Ticket {active_ticket['id']} to {final_prio}")
                 try:
                     supabase.table("tickets").update({
-                        "title": ticket_title,
-                        "priority": final_prio,
-                        "category": final_cat,
+                        "title": ticket_title, "priority": final_prio, "category": final_cat,
                         "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
                     }).eq("id", active_ticket["id"]).execute()
-                except Exception as e:
-                    logger.error(f"Failed to update ticket priority: {e}")
-            
+                except: pass
             elif ticket_config.get("autoCreateTicket"):
-                # CREATE NEW TICKET (High/Medium)
-                logger.info(f"🤖 Creating Ticket: {final_cat} [{prio_str}]")
                 ticket_svc = get_ticket_service()
                 ticket_data = TicketCreate(
                     chat_id=chat_id, customer_id=cust_id,
@@ -640,9 +677,7 @@ async def process_webhook_message(
                 )
                 await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
 
-    # 7. AI RESPONSE
     if should_trigger_ai:
-        logger.info(f"🤖 Triggering AI Response for Chat {chat_id}")
         asyncio.create_task(process_ai_response_async(chat_id, msg_id, supabase))
         return {**res, "handled_by": "ai"}
     
@@ -1284,109 +1319,35 @@ def _extract_phone_number(whatsapp_id: str) -> str:
     logger.info(f"🧪 [1. EXTRACTOR] Standard Clean Result: '{clean_id}'")
     return clean_id
 
-async def _convert_unofficial_to_standard(
-    unofficial_message: WhatsAppUnofficialWebhookMessage
-) -> WhatsAppWebhookMessage:
+async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookMessage) -> WhatsAppWebhookMessage:
     """
-    Convert WhatsApp unofficial payload to standard WhatsAppWebhookMessage format.
-    Ensures safe variable initialization to prevent scope crashes and supports 
-    both text and media message types.
+    Unified converter using DRY helper.
     """
-    # 1. Initialize variables at top to prevent local variable scope errors
-    phone_number = ""
-    to_number = ""
-    sender_name = "Unknown"
-    message_text = ""
-    message_id = None
-    timestamp_iso = None
-    metadata = {"session_id": unofficial_message.sessionId}
-
+    data = unofficial.data
+    wrapper = data.get("message", {}) or data.get("messageMedia", {})
+    msg_data = wrapper.get("_data", {}) or wrapper
+    
+    # Common Extraction
+    phone = _extract_phone_number(msg_data.get("from", ""))
+    to_num = _extract_phone_number(msg_data.get("to", ""))
+    sender = msg_data.get("notifyName") or phone
+    msg_id = msg_data.get("id", {}).get("id") if isinstance(msg_data.get("id"), dict) else None
+    ts = datetime.fromtimestamp(msg_data.get("t")).isoformat() if msg_data.get("t") else None
+    
+    # Unified Content Processing
     try:
-        data_type = unofficial_message.dataType
-        data = unofficial_message.data
-
-        # Handle text messages (supports both 'message' and 'message_create' events)
-        if data_type in ["message", "message_create"]:
-            message_obj = data.get("message", {})
-            message_data = message_obj.get("_data", {}) or message_obj
-
-            # Extract numbers - LID preservation is handled by _extract_phone_number helper
-            phone_number = _extract_phone_number(message_data.get("from", ""))
-            to_number = _extract_phone_number(message_data.get("to", ""))
-            message_text = message_data.get("body", "")
-            
-            # Fallback: Profile name (notifyName) -> Phone number
-            sender_name = message_data.get("notifyName") or phone_number
-            message_id = message_data.get("id", {}).get("id") if isinstance(message_data.get("id"), dict) else None
-            
-            t_val = message_data.get("t")
-            if t_val:
-                timestamp_iso = datetime.fromtimestamp(t_val).isoformat()
-
-            return WhatsAppWebhookMessage(
-                phone_number=phone_number,
-                to_number=to_number,
-                sender_name=sender_name,
-                message=message_text,
-                message_id=message_id,
-                message_type="text",
-                timestamp=timestamp_iso,
-                metadata=metadata
-            )
-
-        # Handle media messages (images, voice notes)
-        elif data_type == "media":
-            message_media = data.get("messageMedia", {})
-            message_obj = data.get("message", {})
-            message_data = message_obj.get("_data", {}) if message_obj else message_media
-
-            media_mime_type = message_media.get("mimetype", "")
-            media_type_str = message_media.get("type", message_data.get("type", ""))
-
-            if media_type_str == "image":
-                file_extension, media_format = "jpg", "IMG"
-            elif media_type_str == "ptt":
-                file_extension, media_format = "ogg", "PTT"
-            else:
-                raise HTTPException(status_code=400, detail=f"Unsupported media type: {media_type_str}")
-
-            phone_number = _extract_phone_number(message_data.get("from", ""))
-            to_number = _extract_phone_number(message_data.get("to", ""))
-            sender_name = message_media.get("notifyName") or message_data.get("notifyName") or phone_number
-            
-            message_id = message_data.get("id", {}).get("id") if isinstance(message_data.get("id"), dict) else None
-            t_val = message_data.get("t") or message_media.get("t")
-            if t_val:
-                timestamp_iso = datetime.fromtimestamp(t_val).isoformat()
-
-            media_data_base64 = message_media.get("data", "")
-            if not media_data_base64:
-                raise HTTPException(status_code=400, detail="Media data is missing")
-
-            # Upload to Supabase and get signed URL
-            media_url = await _upload_media_to_supabase(media_data_base64, media_mime_type, file_extension)
-            
-            caption = message_media.get("caption", "")
-            message_text = f"{caption}\n\n{media_format}:{media_url}" if caption else f"{media_format}:{media_url}"
-
-            return WhatsAppWebhookMessage(
-                phone_number=phone_number,
-                to_number=to_number,
-                sender_name=sender_name,
-                message=message_text,
-                message_id=message_id,
-                message_type=media_type_str,
-                media_url=media_url,
-                caption=caption,
-                timestamp=timestamp_iso,
-                metadata=metadata
-            )
-
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported dataType: {data_type}")
-
-    except HTTPException:
-        raise
+        text, type_str, url = await _handle_message_content(data, unofficial.dataType)
     except Exception as e:
-        logger.error(f"❌ Failed to convert unofficial message: {e}")
-        raise HTTPException(status_code=500, detail=f"Message conversion failed: {str(e)}")
+        logger.error(f"Content parse error: {e}")
+        text = "[Content Error]"
+        type_str = "text"
+        url = None
+
+    return WhatsAppWebhookMessage(
+        phone_number=phone, to_number=to_num, sender_name=sender,
+        message=text, message_id=msg_id, message_type=type_str,
+        media_url=url, timestamp=ts, metadata={"session_id": unofficial.sessionId}
+    )
+
+
+
