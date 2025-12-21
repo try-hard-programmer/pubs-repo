@@ -3,7 +3,7 @@ WebSocket Service
 Manages WebSocket connections for real-time notifications to frontend clients
 """
 from fastapi import WebSocket, WebSocketDisconnect
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Any
 import logging
 import json
 from datetime import datetime
@@ -148,6 +148,7 @@ class ConnectionManager:
             f"sent={success_count}, failed={len(failed_connections)}"
         )
 
+    # [FIX] Added 'attachment' parameter
     async def broadcast_new_message(
         self,
         organization_id: str,
@@ -158,25 +159,15 @@ class ConnectionManager:
         message_content: str,
         channel: str,
         handled_by: str,
-        sender_type: str, # <--- NEW
-        sender_id: str,   # <--- NEW
+        sender_type: str,
+        sender_id: str,
+        sender_name: str = None,
         is_new_chat: bool = False,
-        was_reopened: bool = False
+        was_reopened: bool = False,
+        attachment: Dict[str, Any] = None  # <--- NEW ARGUMENT
     ):
         """
         Broadcast new incoming message notification to all organization members.
-
-        Args:
-            organization_id: Organization UUID
-            chat_id: Chat UUID
-            message_id: Message UUID
-            customer_id: Customer UUID
-            customer_name: Customer name
-            message_content: Message text content
-            channel: Communication channel
-            handled_by: Who is handling the chat
-            is_new_chat: Whether this is a new chat
-            was_reopened: Whether chat was reopened
         """
         notification = {
             "type": "new_message",
@@ -189,14 +180,17 @@ class ConnectionManager:
                 "message_content": message_content,
                 "channel": channel,
                 "handled_by": handled_by,
-                "sender_type": sender_type, # <--- NEW PAYLOAD FIELD
-                "sender_id": sender_id,     # <--- NEW PAYLOAD FIELD
+                "sender_type": sender_type,
+                "sender_id": sender_id,
+                "sender_name": sender_name,
                 "is_new_chat": is_new_chat,
-                "was_reopened": was_reopened
+                "was_reopened": was_reopened,
+                "attachment": attachment  # <--- Send this to Frontend
             }
         }
 
         await self.broadcast_to_organization(notification, organization_id)
+               
 
     async def broadcast_chat_update(
         self,

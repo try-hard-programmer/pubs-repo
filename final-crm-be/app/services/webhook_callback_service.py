@@ -102,30 +102,25 @@ class WebhookCallbackService:
                 logger.error(f"❌ Failed to refetch chat data: {e}")
         return chat
     
-    async def send_callback(self, chat: Dict[str, Any], message_content: str, supabase) -> Dict[str, Any]:
-        """Send webhook callback based on chat channel."""
-        
-        # [FIX] Now this function exists
+    # [CRITICAL FIX] Added media_url argument
+    async def send_callback(self, chat: Dict[str, Any], message_content: str, supabase, media_url: Optional[str] = None) -> Dict[str, Any]:
         chat = await self._ensure_chat_data(chat, supabase)
-        
         channel = chat.get("channel")
 
         try:
             if channel == "whatsapp":
                 return await self.send_whatsapp_callback(chat, message_content, supabase)
             elif channel == "telegram":
-                return await self.send_telegram_callback(chat, message_content, supabase)
+                # [CRITICAL FIX] Passing media_url down
+                return await self.send_telegram_callback(chat, message_content, supabase, media_url)
             elif channel == "email":
-                # Placeholder for email
-                return {"success": False, "reason": "email_not_implemented", "channel": channel}
+                return {"success": False, "reason": "email_not_implemented"}
             else:
-                logger.warning(f"Unsupported channel for webhook: {channel}")
-                return {"success": False, "reason": "unsupported_channel", "channel": channel}
-
+                return {"success": False, "reason": "unsupported_channel"}
         except Exception as e:
-            logger.error(f"Error in send_callback for channel {channel}: {e}")
-            return {"success": False, "reason": "callback_error", "error": str(e)}
-        
+            logger.error(f"Error in send_callback: {e}")
+            return {"success": False, "reason": "error", "error": str(e)}          
+
     async def send_whatsapp_callback(self, chat: Dict[str, Any], message_content: str, supabase) -> Dict[str, Any]:
         """Send webhook callback to WhatsApp service."""
         try:
@@ -168,149 +163,70 @@ class WebhookCallbackService:
             logger.error(f"❌ WhatsApp message send failed: {e}")
             return {"success": False, "reason": "error", "error": str(e)}
     
-    async def send_telegram_callback(self, chat: Dict[str, Any], message_content: str, supabase) -> Dict[str, Any]:
-        """Send webhook callback to Telegram."""
+    # [CRITICAL FIX] Added media_url argument
+    async def send_telegram_callback(self, chat: Dict[str, Any], message_content: str, supabase, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:
             logger.info(f"✈️ Processing Telegram callback for chat: {chat['id']}")
-
+            
             customer_id = chat.get("customer_id")
-            if not customer_id: raise Exception("Missing customer_id in chat object")
-
-            # 1. Get Customer Details
             cust_res = supabase.table("customers").select("metadata, phone").eq("id", customer_id).execute()
-            if not cust_res.data: raise Exception(f"Customer {customer_id} not found")
+            if not cust_res.data: raise Exception("Customer not found")
 
             customer_data = cust_res.data[0]
-            customer_metadata = customer_data.get("metadata", {}) or {}
-            telegram_id = customer_metadata.get("telegram_id")
+            telegram_id = customer_data.get("metadata", {}).get("telegram_id")
             raw_phone = customer_data.get("phone")
-
-            logger.info(f"👤 Resolved Identity - TelegramID: {telegram_id}, Phone: {raw_phone}")
-
-            # 2. Get Agent Config
-            sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
-            int_res = supabase.table("agent_integrations").select("config").eq("agent_id", sender_agent_id).eq("channel", "telegram").eq("enabled", True).execute()
-
-            bot_token = None
-            if int_res.data:
-                bot_token = int_res.data[0].get("config", {}).get("botToken")
-
-            # 3. Decision Logic: Userbot vs Bot
-            use_userbot = not bot_token
             
-            # Determine Target ID
             target_id = telegram_id
             if not target_id and raw_phone:
                 target_id = f"+{self._normalize_phone_number(raw_phone)}"
             
-            if not target_id:
-                raise Exception("Customer missing both Telegram ID and Phone number")
+            if not target_id: raise Exception("No Target ID found")
 
-            # A. Userbot Flow
-            if use_userbot:
-                return await self.send_telegram_userbot_callback(
-                    agent_id=sender_agent_id, telegram_id=target_id, message_content=message_content,
-                    supabase=supabase, customer_id=customer_id, current_metadata=customer_metadata, chat_id=chat['id']
-                )
-
-            # B. Standard Bot Flow
-            webhook_url = settings.TELEGRAM_WEBHOOK_URL
-            if not webhook_url:
-                if settings.TELEGRAM_API_URL:
-                     return await self.send_telegram_userbot_callback(
-                        agent_id=sender_agent_id, telegram_id=target_id, message_content=message_content,
-                        supabase=supabase, customer_id=customer_id, current_metadata=customer_metadata, chat_id=chat['id']
-                    )
-                return {"success": False, "reason": "webhook_url_not_configured"}
-
-            payload = {
-                "bot_token": bot_token,
-                "telegram_id": telegram_id,
-                "message": message_content,
-                "metadata": {"chat_id": chat["id"], "timestamp": datetime.utcnow().isoformat()}
-            }
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(webhook_url, json=payload, headers={"Content-Type": "application/json"})
-                response.raise_for_status()
-                return {"success": True, "channel": "telegram", "response": response.json()}
+            sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
+            
+            # Userbot Logic
+            return await self.send_telegram_userbot_callback(
+                agent_id=sender_agent_id, 
+                telegram_id=target_id, 
+                message_content=message_content,
+                media_url=media_url # <--- Passing it to the worker
+            )
 
         except Exception as e:
             logger.error(f"❌ Telegram callback failed: {e}")
-            return {"success": False, "reason": "error", "error": str(e)}
+            return {"success": False, "error": str(e)}
     
-    async def send_telegram_userbot_callback(
-        self, agent_id: str, telegram_id: str, message_content: str,
-        supabase=None, customer_id: str=None, current_metadata: dict=None, chat_id: str=None
-    ) -> Dict[str, Any]:
-        """
-        Send message via the Python Userbot Worker.
-        INCLUDES FIX for URL construction (/api/api issue).
-        """
+    # [CRITICAL FIX] Added media_url argument and payload inclusion
+    async def send_telegram_userbot_callback(self, agent_id: str, telegram_id: str, message_content: str, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:
             base_url = settings.TELEGRAM_API_URL
             if not base_url: raise Exception("TELEGRAM_API_URL missing")
             
-            # [FIX] Robust URL Construction
-            base_url = base_url.rstrip("/")
-            if base_url.endswith("/api"):
-                endpoint_url = f"{base_url}/webhook/send"
-            else:
-                endpoint_url = f"{base_url}/api/webhook/send"
+            endpoint_url = f"{base_url.rstrip('/')}/api/webhook/send".replace("/api/api/", "/api/")
+
+            # Payload includes media_url now
+            payload = {
+                "agent_id": agent_id, 
+                "chat_id": telegram_id, 
+                "text": message_content,
+                "media_url": media_url 
+            }
             
-            # Double check for double /api/api
-            endpoint_url = endpoint_url.replace("/api/api/", "/api/")
-
-            payload = {"agent_id": agent_id, "chat_id": telegram_id, "text": message_content}
             headers = {"Content-Type": "application/json", "X-Service-Key": settings.TELEGRAM_SECRET_KEY_SERVICE}
+            
+            logger.info(f"🚀 Dispatching to Userbot Worker: {endpoint_url} (Media: {bool(media_url)})")
 
-            logger.info(f"🚀 Dispatching to Userbot Worker: {endpoint_url}")
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(endpoint_url, json=payload, headers=headers)
-                
                 if response.status_code != 200:
                     logger.error(f"⚠️ Worker Error: {response.text}")
-                    return {"success": False, "reason": "worker_error", "error": response.text}
-
-                resp_json = response.json()
-
-                # [MERGE LOGIC]
-                if resp_json.get("status") == "success" and supabase and customer_id:
-                    resolved_id = str(resp_json.get("resolved_chat_id"))
-                    
-                    if resolved_id and resolved_id != "None":
-                        curr_cust = supabase.table("customers").select("organization_id, phone").eq("id", customer_id).single().execute()
-                        if curr_cust.data:
-                            org_id = curr_cust.data["organization_id"]
-                            curr_phone = curr_cust.data["phone"]
-
-                            # Check for DUPLICATE
-                            ghost_match = supabase.table("customers").select("id") \
-                                .eq("organization_id", org_id).neq("id", customer_id) \
-                                .contains("metadata", {"telegram_id": resolved_id}).execute()
-
-                            if ghost_match.data:
-                                ghost_id = ghost_match.data[0]["id"]
-                                logger.info(f"⚡ Merge Triggered: {customer_id} -> {ghost_id}")
-                                supabase.table("customers").update({"phone": curr_phone, "updated_at": datetime.utcnow().isoformat()}).eq("id", ghost_id).execute()
-                                if chat_id: supabase.table("chats").update({"customer_id": ghost_id}).eq("id", chat_id).execute()
-                                supabase.table("customers").delete().eq("id", customer_id).execute()
-                                return {"success": True, "channel": "telegram_userbot", "response": resp_json, "merged_customer_id": ghost_id}
-
-                            elif current_metadata.get("telegram_id") != resolved_id:
-                                logger.info(f"🔗 Linking Customer {customer_id} to Telegram ID {resolved_id}")
-                                new_metadata = current_metadata.copy()
-                                new_metadata["telegram_id"] = resolved_id
-                                supabase.table("customers").update({"metadata": new_metadata}).eq("id", customer_id).execute()
-
-                return {"success": True, "channel": "telegram_userbot", "response": resp_json}
+                    return {"success": False, "error": response.text}
+                return {"success": True, "response": response.json()}
 
         except Exception as e:
             logger.error(f"❌ Userbot dispatch failed: {e}")
             raise e
-                
-
+        
     async def send_email_callback(
         self,
         chat: Dict[str, Any],

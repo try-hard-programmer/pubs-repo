@@ -416,8 +416,7 @@ async def send_auto_reply(supabase, channel: str, agent_id: str, contact_info: D
     except Exception as e:
         logger.error(f"❌ Auto-reply failed: {e}")
 
-async def save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, content, channel, metadata=None):
-    """Explicitly saves system/AI messages to DB and updates Frontend."""
+async def save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, content, channel, metadata=None, agent_name=None): # <--- Added agent_name
     try:
         msg_data = {
             "chat_id": chat_id,
@@ -432,9 +431,10 @@ async def save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id,
             new_msg = res.data[0]
             await get_connection_manager().broadcast_new_message(
                 organization_id=org_id, chat_id=chat_id, message_id=new_msg["id"],
-                customer_id=None, customer_name="AI Agent",
+                customer_id=None, customer_name=agent_name or "AI Agent", # Fallback
                 message_content=content, channel=channel, handled_by="ai",
-                sender_type="ai", sender_id=agent_id
+                sender_type="ai", sender_id=agent_id,
+                sender_name=agent_name # <--- [FIX] Pass the real name here
             )
     except Exception as e:
         logger.error(f"Failed to save/broadcast system message: {e}")
@@ -489,51 +489,63 @@ async def resolve_lid_to_real_number(
     
 async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
     """
-    DRY Helper: Analyzes message body/media, uploads content if needed, 
-    and returns (cleaned_text, message_type, media_url).
+    DRY Helper: Analyzes message body/media, uploads content if needed.
+    [FIX] Now detects message_type based on MIME type, not just the generic 'type' label.
     """
     content = ""
     msg_type = "text"
     media_url = None
     
-    # 1. Check for standard Media Object
     if data_type == "media":
+        # Handle Media
         media_obj = message_data.get("messageMedia", {}) or message_data
-        base64_data = media_obj.get("data", "")
-        if not base64_data: raise ValueError("Media data missing")
+        base64_data = media_obj.get("data") or media_obj.get("body", "")
+        
+        if not base64_data: 
+            # Last resort: check if 'body' in the root message_data has the base64
+            base64_data = message_data.get("body", "")
+
+        if not base64_data: 
+            raise ValueError("Media data missing")
         
         mime = media_obj.get("mimetype", "application/octet-stream")
         raw_type = media_obj.get("type", "file")
         
-        # Extension mapping
-        ext_map = {"image": "jpg", "ptt": "ogg", "document": "pdf", "audio": "mp3", "video": "mp4"}
-        ext = ext_map.get(raw_type, "bin")
+        # [FIX] Detect Type from MIME (More accurate than raw_type)
+        if "image" in mime:
+            msg_type = "image"
+        elif "video" in mime:
+            msg_type = "video"
+        elif "audio" in mime:
+            msg_type = "audio"
+        elif "pdf" in mime:
+            msg_type = "document"
+        else:
+            msg_type = "file"
+            
+        # [FIX] Improved Extension Logic (Simple fallback)
+        ext = "bin"
+        if "/" in mime:
+            ext = mime.split("/")[-1].replace("jpeg", "jpg")
+        else:
+            ext_map = {"image": "jpg", "ptt": "ogg", "document": "pdf", "audio": "mp3", "video": "mp4"}
+            ext = ext_map.get(raw_type, "bin")
         
         media_url = await _upload_media_to_supabase(base64_data, mime, ext)
-        msg_type = raw_type if raw_type in ["image", "video", "audio"] else "file"
         
-        # Content is URL + Caption (if any)
-        caption = media_obj.get("caption", "")
-        content = f"{caption}\n{media_url}" if caption else media_url
-
-    # 2. Check for Base64 in Body (Text Message acting as Image)
+        # Content is ONLY caption
+        content = media_obj.get("caption", "")
     else:
-        body = message_data.get("body", "")
-        is_base64 = False
+        # Handle Text
+        body = message_data.get("body") or message_data.get("_data", {}).get("body", "")
         
-        if body and isinstance(body, str):
-            if body.startswith("/9j/") or body.startswith("iVBORw0KGgo"): is_base64 = True
-            elif len(body) > 500 and " " not in body[:50]: is_base64 = True # Heuristic
-            
-        if is_base64:
-            logger.info("📸 Detected Base64 in body -> Uploading...")
+        # Check for Base64 sneaking in as text
+        if body and isinstance(body, str) and (body.startswith("/9j/") or (len(body) > 500 and " " not in body[:50])):
             try:
                 media_url = await _upload_media_to_supabase(body, "image/jpeg", "jpg")
-                content = media_url # Raw URL, no prefix
+                content = "" 
                 msg_type = "image"
-            except Exception as e:
-                logger.error(f"Base64 body upload failed: {e}")
-                content = "[Image Upload Failed]"
+            except: content = body
         else:
             content = body
             
@@ -560,20 +572,23 @@ async def process_webhook_message(
     if agent.get("status") == "inactive":
         return {"success": False, "status": "dropped_inactive"}
 
-    # ROUTING
+    # 1. ROUTING (Upsert Logic)
     router = get_message_router_service(supabase)
     res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
+    
+    # Extract IDs safely
     chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
 
-    # Update Phone
+    # 2. UPDATE PHONE (If needed)
     if customer_metadata.get("phone") and cust_id:
         try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
         except: pass
 
-    # Broadcast Incoming
+    # 3. BROADCAST TO FRONTEND
+    # [FIX] Removed try/except pass so we can see errors. Added logging.
     if app_settings.WEBSOCKET_ENABLED:
         try:
-            # [FIX] Added metadata param so FE gets message_type
+            # Now passing metadata is safe because we updated websocket_service.py
             await get_connection_manager().broadcast_new_message(
                 organization_id=org_id, chat_id=chat_id, message_id=msg_id,
                 customer_id=cust_id, customer_name=customer_name or "Unknown",
@@ -582,14 +597,26 @@ async def process_webhook_message(
                 was_reopened=res.get("was_reopened", False),
                 metadata=message_metadata 
             )
-        except: pass
+        except Exception as e: 
+            logger.error(f"❌ WS Broadcast Failed: {e}")
 
+    # 4. STOP HERE IF MERGED (Prevent Double Auto-Reply)
+    # [FIX] We moved this check DOWN so the broadcast above still happens.
+    if res.get("is_merged_event"):
+        logger.info(f"🛑 Skipping AI/Auto-Reply for merged message event (ID: {msg_id})")
+        return res
+
+    # ==================================================================
+    # LOGIC BELOW ONLY RUNS FOR NEW MESSAGES (Not Merges)
+    # ==================================================================
+
+    # 5. BUSY CHECK
     # BUSY CHECK
     if agent.get("status") == "busy":
         msg = "Maaf, saat ini kami sedang sibuk."
         contact_info = {"phone": contact, "telegram_id": contact}
         await send_auto_reply(supabase, channel, agent_id, contact_info, msg)
-        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel, agent_name=agent["name"])
         return {**res, "handled_by": "system_busy"}
 
     # ACTIVE TICKET CHECK
@@ -637,7 +664,7 @@ async def process_webhook_message(
             cust_data = {"phone": resolved_contact, "metadata": {"telegram_id": resolved_contact}}
             
             await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
-            await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel)
+            await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel, agent_name=agent["name"])
             
             if not active_ticket and ticket_config.get("autoCreateTicket"):
                 try: final_prio = TicketPriority.LOW
@@ -682,7 +709,6 @@ async def process_webhook_message(
         return {**res, "handled_by": "ai"}
     
     return res
-
 
 # ============================================
 # WHATSAPP WEBHOOK
@@ -839,110 +865,64 @@ async def whatsapp_unofficial_webhook(
     secret: str = Depends(get_webhook_secret)
 ):
     try:
-        # ==================================================================
-        # PHASE A: SYSTEM EVENTS & VALIDATION
-        # ==================================================================
+        # PHASE A: SYSTEM EVENTS
         agent_id = message.sessionId
         supabase = get_supabase_client()
-
         logger.info(f"📡 [3. WEBHOOK ENTRY] Session: {message.sessionId}, Data: {message.dataType}")
         
-        # 1. Handle System Events (QR, Auth, Ready)
-        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen"]
+        # [FIX] Added 'message_ack' to ignored events to stop Double Processing
+        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke"]
         if message.dataType in system_events:
-            logger.info(f"📡 WhatsApp System Event: {message.dataType} for session {agent_id}")
-            
+            logger.info(f"📡 WhatsApp System Event: {message.dataType}")
             agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
             if agent_res.data and app_settings.WEBSOCKET_ENABLED:
                 org_id = agent_res.data[0]["organization_id"]
-                
-                # CORRECTED CALL: Wrap event/data into the 'message' dictionary
                 await get_connection_manager().broadcast_to_organization(
-                    message={
-                        "type": "whatsapp_status_update",
-                        "data": {
-                            "agent_id": agent_id, 
-                            "status": message.dataType, 
-                            "data": message.data
-                        }
-                    },
+                    message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType, "data": message.data}},
                     organization_id=org_id
                 )
             return JSONResponse(content={"success": True, "status": "processed_system_event"})
 
-        # 2. Extract Data & Filter Self-Messages
+        # PHASE B: IDEMPOTENCY
         data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
         data_content = data_wrapper.get("_data", {}) or data_wrapper 
-
         if data_content.get("id", {}).get("fromMe", False):
              return JSONResponse(content={"status": "ignored", "reason": "from_me"})
 
-        # ==================================================================
-        # PHASE B: IDEMPOTENCY (Fast Cache + DB)
-        # ==================================================================
         whatsapp_id = data_content.get("id", {}).get("id")
         if whatsapp_id:
-            # 1. FAST MEMORY CHECK (Stops Race Conditions)
-            if dedup_cache.is_duplicate(whatsapp_id):
-                logger.info(f"⚡ Fast Dedup: Skipping duplicate {whatsapp_id}")
+            # [FIX] Smart Cache: Split keys by type to allow Merge
+            dedup_key = f"{whatsapp_id}_{message.dataType}"
+            if dedup_cache.is_duplicate(dedup_key):
+                logger.info(f"⚡ Fast Dedup: Skipping duplicate {dedup_key}")
                 return JSONResponse(content={"status": "ignored", "reason": "duplicate_fast_cache"})
 
-            # 2. DATABASE CHECK (Stops Retries/Resends)
-            existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
-            if existing.data:
-                return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
+            # [FIX] Bypass DB check for media to allow Router Upsert
+            if message.dataType != "media":
+                existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
+                if existing.data:
+                    return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
 
-        # ==================================================================
-        # PHASE C: AGENT & INTEGRATION VERIFICATION
-        # ==================================================================
+        # ... (Rest of function remains unchanged) ...
+        # PHASE C: VERIFICATION
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data:
-            return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
+        if not agent_res.data: return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
         agent = agent_res.data[0]
 
-        # Verify Integration
-        integration_res = supabase.table("agent_integrations") \
-            .select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
-
-        if not integration_res.data:
-            return JSONResponse(content={"status": "error", "message": "No WhatsApp integration found"})
-
-        if integration_res.data[0].get("enabled") is False:
+        integration_res = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
+        if not integration_res.data or integration_res.data[0].get("enabled") is False:
             return JSONResponse(content={"status": "ignored", "reason": "integration_disabled"})
 
-        # ==================================================================
-        # PHASE D: PREPARATION & ROUTING
-        # ==================================================================
-        # Apply Settings
+        # PHASE D: ROUTING
         settings_data = await fetch_agent_settings(supabase, agent_id)
         if settings_data: agent.update(settings_data)
 
-        # Convert Format
         standard_message = await _convert_unofficial_to_standard(message)
-        logger.info(f"📡 [3. WEBHOOK ENTRY] Proceeding with Contact: '{standard_message.phone_number}'")
-
-        # Handle ID / Contact Name
-        contact_id = await resolve_lid_to_real_number(
-            contact=standard_message.phone_number, 
-            agent_id=agent_id, 
-            channel="whatsapp", 
-            supabase=supabase
-        )
-    
-        logger.info(f"🚀 [ROUTING] Using resolved ID: '{contact_id}'")
-
+        contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
         sender_name = standard_message.sender_name
-        logger.info(f"🚀 [ROUTING START] Searching for customer with ID: '{contact_id}'")
-        # Attempt to resolve name if it's a LID or just to be sure, but KEEP the contact_id for replying
+        
+        if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
 
-        # Clean the resolved number (remove @c.us) to match DB format
-        if "@c.us" in contact_id:
-            contact_id = contact_id.split("@")[0]
-        if "@" in contact_id:
-             # Just logging, we don't change contact_id because we need the original ID to reply
-             logger.info(f"📩 Received message from ID: {contact_id}")
-
-        # Route Message
         result = await process_webhook_message(
             agent=agent,
             channel="whatsapp",
@@ -954,32 +934,24 @@ async def whatsapp_unofficial_webhook(
                 "message_type": standard_message.message_type,
                 "timestamp": standard_message.timestamp,
                 "is_lid": "@lid" in contact_id,
+                "media_url": standard_message.media_url,
                 **standard_message.metadata
             },
-            customer_metadata={
-                "whatsapp_name": sender_name,
-                "whatsapp_lid": contact_id if "@lid" in contact_id else None
-            },
+            customer_metadata={"whatsapp_name": sender_name, "whatsapp_lid": contact_id if "@lid" in contact_id else None},
             supabase=supabase
         )
 
         return WebhookRouteResponse(
-            success=True,
-            chat_id=result["chat_id"],
-            message_id=result["message_id"],
-            customer_id=result["customer_id"],
-            is_new_chat=result["is_new_chat"],
-            was_reopened=result["was_reopened"],
-            handled_by=result["handled_by"],
-            status=result["status"],
-            channel="whatsapp",
-            message=_generate_status_message(result)
+            success=True, chat_id=result["chat_id"], message_id=result["message_id"],
+            customer_id=result["customer_id"], is_new_chat=result["is_new_chat"],
+            was_reopened=result["was_reopened"], handled_by=result["handled_by"],
+            status=result["status"], channel="whatsapp", message=_generate_status_message(result)
         )
 
     except Exception as e:
         logger.error(f"❌ Unofficial Webhook Error: {e}")
         return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
-
+    
 # ============================================
 # TELEGRAM WEBHOOK
 # ============================================
@@ -1014,97 +986,6 @@ async def telegram_webhook(message: TelegramWebhookMessage, secret: str = Depend
     except Exception as e:
         logger.error(f"Telegram Error: {e}")
         raise HTTPException(500, str(e))
-
-@router.post("/telegram-userbot", response_model=WebhookRouteResponse)
-async def telegram_userbot_webhook(
-    payload: WhatsAppUnofficialWebhookMessage, 
-    secret: str = Depends(get_webhook_secret)
-):
-    """
-    Receive and route messages from a Telegram Userbot formatted as unofficial payloads.
-    Ensures correct identifier mapping to avoid duplicate customers in CRM.
-    """
-    try:
-        agent_id = payload.sessionId
-        data_wrapper = payload.data.get("message", {}) or {}
-        data_content = data_wrapper.get("_data", {}) or data_wrapper
-        
-        if not data_content: 
-            raise HTTPException(status_code=400, detail="Invalid JSON structure: missing message content")
-        
-        # 1. Idempotency Check (Prevent duplicate processing)
-        msg_id = data_content.get("id", {}).get("id")
-        supabase = get_supabase_client()
-        if msg_id and await check_telegram_idempotency(supabase, str(msg_id)):
-             return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
-
-        # 2. Extract Data
-        sender_id = str(data_content.get("from", ""))
-        message_text = data_content.get("body", "")
-        sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
-        timestamp_unix = data_content.get("t")
-        
-        # Handle Phone Extraction from Userbot metadata for identity mapping
-        raw_phone = data_content.get("phone")
-        final_phone = sender_id
-        if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
-            final_phone = str(raw_phone)
-
-        # 3. Agent Verification & Settings
-        agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data: 
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        agent = agent_res.data[0]
-        settings_data = await fetch_agent_settings(supabase, agent_id)
-        if settings_data: 
-            agent.update(settings_data)
-
-        # 4. Prepare Metadata for DB
-        msg_meta = {
-            "source_format": "wa_unofficial_json", 
-            "telegram_message_id": msg_id, 
-            "telegram_sender_id": sender_id, 
-            "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None
-        }
-        
-        cust_meta = {
-            "telegram_id": sender_id, 
-            "phone": final_phone,
-            "source": "telegram_userbot"
-        }
-
-        # 5. Routing
-        result = await process_webhook_message(
-            agent=agent, 
-            channel="telegram", 
-            contact=sender_id, 
-            message_content=message_text, 
-            customer_name=sender_display_name, 
-            message_metadata=msg_meta, 
-            customer_metadata=cust_meta, 
-            supabase=supabase
-        )
-        
-        return WebhookRouteResponse(
-            success=True, 
-            chat_id=result.get("chat_id"), 
-            message_id=result.get("message_id"), 
-            customer_id=result.get("customer_id"), 
-            is_new_chat=result.get("is_new_chat", False), 
-            was_reopened=result.get("was_reopened", False),
-            handled_by=result.get("handled_by", "ai"), 
-            status=result.get("status", "open"), 
-            channel="telegram", 
-            message=_generate_status_message(result)
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Userbot Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 # ============================================
 # EMAIL WEBHOOK
@@ -1321,25 +1202,32 @@ def _extract_phone_number(whatsapp_id: str) -> str:
 
 async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookMessage) -> WhatsAppWebhookMessage:
     """
-    Unified converter using DRY helper.
+    Unified converter that correctly routes data sources for Text vs Media.
     """
-    data = unofficial.data
-    wrapper = data.get("message", {}) or data.get("messageMedia", {})
-    msg_data = wrapper.get("_data", {}) or wrapper
+    raw_payload = unofficial.data
     
-    # Common Extraction
-    phone = _extract_phone_number(msg_data.get("from", ""))
-    to_num = _extract_phone_number(msg_data.get("to", ""))
-    sender = msg_data.get("notifyName") or phone
-    msg_id = msg_data.get("id", {}).get("id") if isinstance(msg_data.get("id"), dict) else None
-    ts = datetime.fromtimestamp(msg_data.get("t")).isoformat() if msg_data.get("t") else None
+    # 1. EXTRACT IDENTITY
+    wrapper = raw_payload.get("message", {}) or raw_payload.get("messageMedia", {})
+    identity_source = wrapper.get("_data", {}) or wrapper
     
-    # Unified Content Processing
+    phone = _extract_phone_number(identity_source.get("from", ""))
+    to_num = _extract_phone_number(identity_source.get("to", ""))
+    sender = identity_source.get("notifyName") or phone
+    msg_id = identity_source.get("id", {}).get("id") if isinstance(identity_source.get("id"), dict) else None
+    ts = datetime.fromtimestamp(identity_source.get("t")).isoformat() if identity_source.get("t") else None
+    
+    # 2. EXTRACT CONTENT
+    # [FIX] For Media, we need raw_payload. For Text, we prefer the inner identity_source.
+    if unofficial.dataType == "media":
+        content_source = raw_payload
+    else:
+        content_source = identity_source
+
     try:
-        text, type_str, url = await _handle_message_content(data, unofficial.dataType)
+        text, type_str, url = await _handle_message_content(content_source, unofficial.dataType)
     except Exception as e:
         logger.error(f"Content parse error: {e}")
-        text = "[Content Error]"
+        text = "" 
         type_str = "text"
         url = None
 
@@ -1348,6 +1236,122 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         message=text, message_id=msg_id, message_type=type_str,
         media_url=url, timestamp=ts, metadata={"session_id": unofficial.sessionId}
     )
+
+
+# app/api/webhook.py
+
+@router.post("/telegram-userbot", response_model=WebhookRouteResponse)
+async def telegram_userbot_webhook(
+    payload: WhatsAppUnofficialWebhookMessage, 
+    secret: str = Depends(get_webhook_secret)
+):
+    try:
+        agent_id = payload.sessionId
+        raw_data = payload.data
+        
+        if payload.dataType == "media":
+            logger.info(f"📸 Telegram Userbot: Received Media (Agent: {agent_id})")
+            content_source = raw_data
+            data_wrapper = raw_data.get("message", {}) or {}
+            data_content = data_wrapper.get("_data", {}) or data_wrapper
+        else:
+            logger.info(f"💬 Telegram Userbot: Received Text (Agent: {agent_id})")
+            data_wrapper = raw_data.get("message", {}) or {}
+            data_content = data_wrapper.get("_data", {}) or data_wrapper
+            content_source = raw_data
+
+        if not data_content and payload.dataType != "media": 
+            raise HTTPException(status_code=400, detail="Invalid JSON structure")
+        
+        # Idempotency
+        msg_id = data_content.get("id", {}).get("id")
+        supabase = get_supabase_client()
+        if msg_id and await check_telegram_idempotency(supabase, str(msg_id)):
+             return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
+
+        # Identity
+        sender_id = str(data_content.get("from", ""))
+        sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
+        timestamp_unix = data_content.get("t")
+        raw_phone = data_content.get("phone")
+        final_phone = sender_id
+        if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
+            final_phone = str(raw_phone)
+
+        # Agent & Settings
+        agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
+        if not agent_res.data: raise HTTPException(404, "Agent not found")
+        agent = agent_res.data[0]
+        settings_data = await fetch_agent_settings(supabase, agent_id)
+        if settings_data: agent.update(settings_data)
+
+        # Content Extraction
+        try:
+            message_text, msg_type, media_url = await _handle_message_content_for_telegram(content_source, payload.dataType)
+        except Exception as e:
+            logger.error(f"❌ Telegram Content Error: {e}")
+            message_text = ""
+            msg_type = "text"
+            media_url = None
+
+        msg_meta = {
+            "source_format": "wa_unofficial_json", 
+            "telegram_message_id": msg_id, 
+            "telegram_sender_id": sender_id, 
+            "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None,
+            "media_url": media_url,
+            "message_type": msg_type 
+        }
+        
+        cust_meta = { "telegram_id": sender_id, "phone": final_phone, "source": "telegram_userbot" }
+
+        result = await process_webhook_message(agent, "telegram", sender_id, message_text, sender_display_name, msg_meta, cust_meta, supabase)
+        
+        return WebhookRouteResponse(
+            success=True, chat_id=result.get("chat_id"), message_id=result.get("message_id"), 
+            customer_id=result.get("customer_id"), is_new_chat=result.get("is_new_chat", False),
+            was_reopened=result.get("was_reopened", False), handled_by=result.get("handled_by", "ai"), 
+            status=result.get("status", "open"), channel="telegram", message=_generate_status_message(result)
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Telegram Userbot Critical: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def _handle_message_content_for_telegram(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
+    """Safe Content Handler for Telegram"""
+    content = ""
+    msg_type = "text"
+    media_url = None
+    
+    if data_type == "media":
+        base64_data = message_data.get("data") or message_data.get("body")
+        if not base64_data: raise ValueError("Media data missing")
+
+        mime = message_data.get("mimetype", "application/octet-stream")
+        content = message_data.get("caption", "")
+
+        if "image" in mime: msg_type = "image"
+        elif "video" in mime: msg_type = "video"
+        elif "audio" in mime: msg_type = "audio"
+        elif "pdf" in mime: msg_type = "document"
+        else: msg_type = "file"
+
+        ext = "bin"
+        if "/" in mime: ext = mime.split("/")[-1].replace("jpeg", "jpg")
+        
+        media_url = await _upload_media_to_supabase(base64_data, mime, ext)
+    else:
+        # Text
+        data_wrapper = message_data.get("message", {}) or {}
+        data_content = data_wrapper.get("_data", {}) or data_wrapper
+        content = data_content.get("body", "")
+        msg_type = "text"
+
+    return content, msg_type, media_url
+
 
 
 

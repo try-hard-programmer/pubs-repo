@@ -15,7 +15,7 @@ from app.services.storage_service import get_storage_service
 from app.models.agent import (
     Customer, CustomerCreate, CustomerUpdate, CustomerListResponse,
     Chat, ChatCreate, ChatUpdate, ChatAssign, ChatEscalation, ChatListResponse, ChatStatus,
-    Message, MessageCreate, MessageListResponse, SenderType,
+    Message, MessageCreate, MessageListResponse, SenderType, MessageAttachment,
     Ticket, TicketCreate, TicketUpdate, TicketListResponse, TicketStatus, TicketPriority,
     DashboardMetrics, CommunicationChannel
 )
@@ -124,7 +124,7 @@ async def send_message_via_channel(
     customer_data: Dict[str, Any],
     message_content: str,
     supabase,
-    message_metadata: Optional[Dict[str, Any]] = None  # <--- ADD THIS
+    message_metadata: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Sends message strictly via the defined agent. 
@@ -152,9 +152,14 @@ async def send_message_via_channel(
                 "message": f"Agent {sender_id} has no connected {chat_channel} account."
             }
 
-        # 2. ROUTE TO SERVICE
+        # 2. PREPARE CONTENT & MEDIA (Moved to TOP Scope)
         effective_chat_data = chat_data.copy()
+        msg_meta = message_metadata or {}
         
+        # [CRITICAL FIX] Define this BEFORE checking channels
+        media_url = msg_meta.get("media_url") or msg_meta.get("file_url")
+
+        # 3. ROUTE TO SERVICE
         if chat_channel == "whatsapp":
             # [FIX] PRIORITY: Check metadata for stored WhatsApp ID (LID or @c.us)
             metadata = customer_data.get("metadata", {}) or {}
@@ -180,10 +185,6 @@ async def send_message_via_channel(
                 final_target = cleaned
             
             svc = get_whatsapp_service()
-            
-            # Check for media in message_metadata
-            msg_meta = message_metadata or {}
-            media_url = msg_meta.get("media_url") or msg_meta.get("file_url")
             
             try:
                 if media_url:
@@ -221,7 +222,14 @@ async def send_message_via_channel(
         elif chat_channel == "telegram":
             try:
                 svc = get_webhook_callback_service()
-                res = await svc.send_callback(effective_chat_data, message_content, supabase)
+                
+                # [FIX] media_url is now defined and safe to pass
+                res = await svc.send_callback(
+                    effective_chat_data, 
+                    message_content, 
+                    supabase,
+                    media_url=media_url 
+                )
                 if res.get("success"):
                     return {"success": True, "data": res.get("data", res)} 
                 else:
@@ -234,8 +242,23 @@ async def send_message_via_channel(
     except Exception as e:
         logger.error(f"Send Error: {e}")
         return {"success": False, "message": str(e)}
-    
-    
+        
+def _extract_attachment(metadata: Dict[str, Any]) -> Optional[MessageAttachment]:
+    """Helper to extract attachment data from metadata"""
+    if not metadata:
+        return None
+        
+    url = metadata.get("media_url") or metadata.get("file_url")
+    if not url:
+        return None
+        
+    return MessageAttachment(
+        url=url,
+        type=metadata.get("media_type") or "application/octet-stream",
+        name=metadata.get("filename") or "file.bin"
+    )
+
+
 async def create_message_internal(chat_data: dict, content: str, user_id: str, supabase):
     """Inserts message, Sends, and SYNCHRONOUSLY captures ID."""
     logger.info(f"[msg_internal] Sending for chat {chat_data['id']}")
@@ -1354,13 +1377,12 @@ async def get_chat_messages(
 )
 async def create_message(
     chat_id: str,
-    # [CHANGED] Using Form(...) instead of Pydantic Body to support Multipart
     content: str = Form(...),
     sender_type: str = Form(...),
     sender_id: str = Form(...),
     ticket_id: Optional[str] = Form(None),
-    metadata: Optional[str] = Form(None), # Receives JSON string
-    file: Optional[UploadFile] = File(None), # Handle Binary File
+    metadata: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user)
 ):
     """Send a message (Text or File) in a chat"""
@@ -1369,10 +1391,11 @@ async def create_message(
         supabase = get_supabase_client()
         
         # Verify chat
-        chat_check = supabase.table("chats").select("id, customer_id, channel").eq("id", chat_id).eq("organization_id", organization_id).execute()
+        chat_check = supabase.table("chats").select("id, customer_id, channel, handled_by").eq("id", chat_id).eq("organization_id", organization_id).execute()
         if not chat_check.data: raise HTTPException(404, f"Chat {chat_id} not found")
+        chat_data_minimal = chat_check.data[0]
 
-        # Parse Metadata (since it comes as a string in FormData)
+        # Parse Metadata
         msg_metadata = {}
         if metadata:
             try:
@@ -1381,23 +1404,17 @@ async def create_message(
                 logger.warning("Invalid metadata JSON, ignoring")
 
         # ============================================
-        # HANDLE FILE UPLOAD (If present)
+        # 1. HANDLE FILE UPLOAD
         # ============================================
         if file:
             try:
-                # Initialize Storage Service
                 storage = get_storage_service(supabase)
-                
-                # Generate path: chat-media/{chat_id}/{uuid}.{ext}
                 file_ext = file.filename.split('.')[-1] if '.' in file.filename else "bin"
                 unique_filename = f"{uuid4()}.{file_ext}"
                 file_path = f"chat-media/{chat_id}" 
 
-                # Read file content
                 file_content = await file.read()
                 
-                # Upload to Supabase Storage
-                # Note: 'organization_id' here acts as the bucket/namespace in your StorageService logic
                 storage.upload_file(
                     organization_id=organization_id, 
                     file_id=unique_filename,
@@ -1407,31 +1424,29 @@ async def create_message(
                     mime_type=file.content_type
                 )
                 
-                # Get Public URL
                 public_url = storage.get_public_url(
                     organization_id=organization_id,
                     file_id=unique_filename,
                     folder_path=file_path
                 )
 
-                # Update Metadata for WhatsApp Service
                 msg_metadata["media_url"] = public_url
                 msg_metadata["filename"] = file.filename
                 msg_metadata["media_type"] = file.content_type
                 msg_metadata["is_document"] = not file.content_type.startswith("image/") and not file.content_type.startswith("video/")
                 
-                logger.info(f"✅ File uploaded & stored: {public_url}")
+                logger.info(f"✅ File uploaded: {public_url}")
 
             except Exception as e:
                 logger.error(f"❌ File upload failed: {e}")
                 raise HTTPException(500, f"File upload failed: {str(e)}")
 
         # ============================================
-        # DB INSERT & PROCESS
+        # 2. DB INSERT
         # ============================================
         message_data = {
             "chat_id": chat_id,
-            "sender_type": sender_type, # Form fields are strings
+            "sender_type": sender_type,
             "sender_id": sender_id,
             "content": content,
             "ticket_id": ticket_id,
@@ -1441,14 +1456,14 @@ async def create_message(
         response = supabase.table("messages").insert(message_data).execute()
         if not response.data: raise HTTPException(500, "Failed to create message")
         
-        # Update chat timestamp
         supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
         
-        logger.info(f"Message created in chat {chat_id} by user {current_user.user_id}")
+        logger.info(f"Message created in chat {chat_id}")
 
-        # Send External (WhatsApp/Telegram)
-        # We assume sender_type is valid (Agent/AI)
-        if sender_type in ["agent", "ai"]: # Check string values
+        # ============================================
+        # 3. SEND EXTERNAL (The Critical Part)
+        # ============================================
+        if sender_type in ["agent", "ai"]:
             try:
                 chat_full = supabase.table("chats").select("*").eq("id", chat_id).single().execute()
                 if chat_full.data:
@@ -1456,54 +1471,57 @@ async def create_message(
                     cust_data = supabase.table("customers").select("*").eq("id", chat_data["customer_id"]).single().execute()
                     
                     if cust_data.data:
-                        await send_message_via_channel(
+                        # [DEBUG LOG]
+                        logger.info(f"📤 Attempting to send to {chat_data.get('channel')}...")
+                        
+                        result = await send_message_via_channel(
                             chat_data=chat_data,
                             customer_data=cust_data.data,
                             message_content=content,
                             supabase=supabase,
-                            message_metadata=msg_metadata # Pass the metadata with media_url
+                            message_metadata=msg_metadata 
                         )
+                        
+                        # [DEBUG LOG] Check the result!
+                        if result.get("success"):
+                            logger.info(f"✅ External Send Success: {result}")
+                        else:
+                            logger.error(f"❌ External Send Failed: {result.get('message')}")
             except Exception as e:
-                logger.error(f"❌ Error sending external message: {e}")
+                logger.error(f"❌ Critical Error sending external message: {e}")
 
         # ============================================
-        # ENRICH & BROADCAST (WebSocket)
+        # 4. BROADCAST (Fixed)
         # ============================================
         created_message = response.data[0]
         sender_name = None
         
-        # Resolve Sender Name
+        # Resolve Sender Name (Simplified)
         if sender_type == "agent":
-            try:
-                agent_res = supabase.table("agents").select("email").eq("user_id", sender_id).eq("organization_id", organization_id).execute()
-                sender_name = agent_res.data[0].get("email") if (agent_res.data and agent_res.data[0].get("email")) else "Human Agent"
-            except: 
-                sender_name = "Human Agent"
+            sender_name = "Human Agent" # Simplify for speed, or fetch if needed
         elif sender_type == "ai":
             sender_name = "AI Assistant"
         elif sender_type == "customer":
             sender_name = "Customer"
             
         created_message["sender_name"] = sender_name
+        
+        # Extract attachment for response model
+        attachment_obj = _extract_attachment(created_message.get("metadata"))
+        created_message["attachment"] = attachment_obj
 
-        # Broadcast
         if app_settings.WEBSOCKET_ENABLED:
             try:
                 conn = get_connection_manager()
+                ws_cust_id = chat_data_minimal.get("customer_id")
                 
-                # Fetch minimal chat data for WS if needed
-                try:
-                    ws_chat = chat_data
-                except:
-                    ws_chat = supabase.table("chats").select("customer_id, channel, handled_by").eq("id", chat_id).single().execute().data
-
-                ws_cust_id = ws_chat.get("customer_id")
-                
-                if sender_type in ["agent", "ai"]:
-                    broadcast_name = sender_name 
-                else:
+                broadcast_name = sender_name
+                if sender_type == "customer":
                     c_res = supabase.table("customers").select("name").eq("id", ws_cust_id).single().execute()
                     broadcast_name = c_res.data.get("name") if c_res.data else "Unknown Customer"
+
+                # [FIX] Convert Pydantic model to Dict
+                attach_dict = attachment_obj.model_dump() if attachment_obj else None
 
                 await conn.broadcast_new_message(
                     organization_id=organization_id,
@@ -1512,10 +1530,11 @@ async def create_message(
                     customer_id=ws_cust_id,
                     customer_name=broadcast_name, 
                     message_content=content,
-                    channel=ws_chat.get("channel"),
-                    handled_by=ws_chat.get("handled_by"),
+                    channel=chat_data_minimal.get("channel"),
+                    handled_by=chat_data_minimal.get("handled_by"),
                     sender_type=sender_type,
-                    sender_id=sender_id
+                    sender_id=sender_id,
+                    attachment=attach_dict  # <--- NOW IT WILL WORK
                 )
             except Exception as e:
                 logger.warning(f"WS Broadcast failed: {e}")

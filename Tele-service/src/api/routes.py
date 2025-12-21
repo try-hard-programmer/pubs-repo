@@ -48,6 +48,12 @@ class SendMessageRequest(BaseModel):
     chat_id: str
     text: str
 
+class MessagePayload(BaseModel):
+    agent_id: str
+    chat_id: str
+    text: Optional[str] = ""
+    media_url: Optional[str] = None
+
 # --- SESSION MANAGEMENT (Stateless) ---
 
 @router.post("/sessions/start")
@@ -213,46 +219,30 @@ async def get_history(account_id: str, chat_id: str):
 
 # [CRITICAL ENDPOINT FOR YOUR FIX]
 @router.post("/webhook/send")
-async def webhook_send_message(req: WebhookSendRequest):
-    """
-    The 'Catcher' endpoint. 
-    Main API thinks it's hitting a generic webhook, but we catch it 
-    and use Telethon to send the reply.
-    """
-    logger.info(f"🪝 Webhook received reply for account: {req.agent_id} -> user: {req.chat_id}")
-    
+async def send_message(payload: MessagePayload):
     try:
-        # [FIX] Pass media_url to manager
+        logger.info(f"📥 API Received Send Request. Media: {payload.media_url}")
+        
+        # [FIX] Pass media_url to the manager
         result = await telegram_manager.send_message(
-            account_id=req.agent_id,
-            chat_id=req.chat_id,
-            text=req.text,
-            media_url=req.media_url
+            account_id=payload.agent_id,
+            chat_id=payload.chat_id,
+            text=payload.text,
+            media_url=payload.media_url
         )
         
         if not result:
-             raise HTTPException(500, "Failed to send message (client active?)")
-             
-        msg_id, resolved_chat_id = result
-
-        # Optional: Save to local DB History (Outgoing)
-        await db.save_message(
-            telegram_account_id=req.agent_id,
-            chat_id=str(resolved_chat_id),
-            message_id=str(msg_id),
-            direction="outgoing",
-            text=req.text or "[MEDIA]",
-            status="sent"
-        )
-
+            # If result is None, it means client wasn't found or connection failed
+            raise HTTPException(status_code=500, detail="Failed to send message (client active?)")
+            
         return {
             "status": "success", 
-            "message_id": msg_id, 
-            "resolved_chat_id": str(resolved_chat_id),
-            "detail": "Sent via Userbot Loopback"
+            "message_id": result[0],
+            "resolved_chat_id": str(result[1])
         }
-
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ Webhook send failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))    
-
+        logger.error(f"Error in /webhook/send: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

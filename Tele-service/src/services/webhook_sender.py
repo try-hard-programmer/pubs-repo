@@ -18,7 +18,16 @@ async def forward_to_main_service(message_data: dict):
             "Content-Type": "application/json"
         }
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # Helper to find ID in nested structure
+        msg_id = "unknown"
+        try:
+            # Try finding ID in the new nested structure
+            msg_id = message_data.get("data", {}).get("message", {}).get("_data", {}).get("id", {}).get("id")
+            # Fallback for older flat structure
+            if not msg_id: msg_id = message_data.get("message_id")
+        except: pass
+
+        async with httpx.AsyncClient(timeout=30.0) as client: # Increased timeout for media
             response = await client.post(
                 MAIN_SERVICE_URL,
                 json=message_data,
@@ -28,7 +37,7 @@ async def forward_to_main_service(message_data: dict):
             if response.status_code != 200:
                 logger.warning(f"⚠️ Main service returned {response.status_code}: {response.text}")
             else:
-                logger.info(f"🚀 Forwarded message {message_data.get('message_id', 'unknown')} to Main Service")
+                logger.info(f"🚀 Forwarded message {msg_id} to Main Service")
                 
     except Exception as e:
         logger.error(f"Failed to forward message to Main Service: {e}")

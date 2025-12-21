@@ -713,7 +713,12 @@ class DashboardMetrics(BaseModel):
 # ============================================
 # LIST RESPONSE MODELS
 # ============================================
-
+class MessageAttachment(BaseModel):
+    """Schema for standardized attachment object"""
+    url: str = Field(..., description="Public URL of the file")
+    type: str = Field(..., description="MIME type of the file (e.g. image/png)")
+    name: Optional[str] = Field(None, description="Original filename")
+    
 class AgentListResponse(BaseModel):
     """Response for list of agents"""
     agents: List[Agent]
