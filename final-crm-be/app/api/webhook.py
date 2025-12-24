@@ -585,23 +585,38 @@ async def process_webhook_message(
         except: pass
 
     # 3. BROADCAST TO FRONTEND
-    # [FIX] Removed try/except pass so we can see errors. Added logging.
     if app_settings.WEBSOCKET_ENABLED:
         try:
-            # Now passing metadata is safe because we updated websocket_service.py
+            # [FIX] Prepare Attachment Object for Frontend
+            # The frontend needs this explicit structure to render images live
+            attachment_data = None
+            if message_metadata.get("media_url"):
+                attachment_data = {
+                    "url": message_metadata["media_url"],
+                    "type": message_metadata.get("message_type", "image"), # Default to image if missing
+                    "name": "Media Attachment"
+                }
+
             await get_connection_manager().broadcast_new_message(
-                organization_id=org_id, chat_id=chat_id, message_id=msg_id,
-                customer_id=cust_id, customer_name=customer_name or "Unknown",
-                message_content=message_content, channel=channel, handled_by=res["handled_by"],
-                sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
+                organization_id=org_id, 
+                chat_id=chat_id, 
+                message_id=msg_id,
+                customer_id=cust_id, 
+                customer_name=customer_name or "Unknown",
+                message_content=message_content, 
+                channel=channel, 
+                handled_by=res["handled_by"],
+                sender_type="customer", 
+                sender_id=cust_id, 
+                is_new_chat=res["is_new_chat"],
                 was_reopened=res.get("was_reopened", False),
-                metadata=message_metadata 
+                metadata=message_metadata,
+                attachment=attachment_data # <--- PASS THIS for images/media
             )
         except Exception as e: 
             logger.error(f"❌ WS Broadcast Failed: {e}")
 
     # 4. STOP HERE IF MERGED (Prevent Double Auto-Reply)
-    # [FIX] We moved this check DOWN so the broadcast above still happens.
     if res.get("is_merged_event"):
         logger.info(f"🛑 Skipping AI/Auto-Reply for merged message event (ID: {msg_id})")
         return res
@@ -611,7 +626,6 @@ async def process_webhook_message(
     # ==================================================================
 
     # 5. BUSY CHECK
-    # BUSY CHECK
     if agent.get("status") == "busy":
         msg = "Maaf, saat ini kami sedang sibuk."
         contact_info = {"phone": contact, "telegram_id": contact}

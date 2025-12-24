@@ -315,6 +315,212 @@ class MessageRouterService:
         except Exception as e:
             logger.error(f"❌ Metadata sync error: {e}")
 
+    async def route_incoming_message(
+        self,
+        agent: Dict[str, Any],
+        channel: str,
+        contact: str,
+        message_content: str,
+        customer_name: Optional[str] = None,
+        message_metadata: Optional[Dict[str, Any]] = None,
+        customer_metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Route incoming message to correct chat or create new chat.
+        [FIX] Uses .contains() for robust JSONB lookup and returns 'is_merged_event' flag.
+        """
+        try:
+            # Extract agent information
+            organization_id = agent["organization_id"]
+            agent_id = agent["id"]
+            agent_name = agent["name"]
+            is_ai_agent = agent["user_id"] is None
+
+            logger.info(
+                f"🚀 Routing message: org={organization_id}, agent={agent_name} "
+                f"(is_ai={is_ai_agent}), channel={channel}, contact={contact}"
+            )
+
+            # Step 1: Find or create customer
+            customer = await self.find_or_create_customer(
+                organization_id=organization_id,
+                channel=channel,
+                contact=contact,
+                customer_name=customer_name,
+                metadata=customer_metadata
+            )
+
+            customer_id = customer["id"]
+
+            # Step 2: Find active chat
+            active_chat = await self.find_active_chat(
+                customer_id=customer_id,
+                channel=channel,
+                organization_id=organization_id
+            )
+
+            # Initialize result variables
+            chat_id = None
+            message_id = None
+            is_new_chat = False
+            was_reopened = False
+            handled_by = "unassigned"
+            chat_status = "open"
+            is_merged_event = False  # <--- [NEW FLAG]
+
+            # [FIX START] Robust Duplicate Check
+            # Use .contains() to find existing message by WhatsApp ID (Fixes Duplicate Rows)
+            wa_msg_id = (message_metadata or {}).get("whatsapp_message_id")
+            existing_message = None
+            
+            if active_chat and wa_msg_id:
+                try:
+                    check_res = self.supabase.table("messages") \
+                        .select("id, content, metadata") \
+                        .eq("chat_id", active_chat["id"]) \
+                        .contains("metadata", {"whatsapp_message_id": wa_msg_id}) \
+                        .execute()
+                    
+                    if check_res.data:
+                        existing_message = check_res.data[0]
+                except Exception as e:
+                    logger.warning(f"⚠️ Metadata lookup warning: {e}")
+            # [FIX END]
+
+            if active_chat:
+                # Chat exists
+                chat_id = active_chat["id"]
+                chat_status = active_chat["status"]
+                handled_by = active_chat.get("handled_by", "unassigned")
+
+                if existing_message:
+                    # [FIX] UPDATE PATH (Merge split events)
+                    logger.info(f"🔄 Merging split message events for ID: {wa_msg_id}")
+                    message_id = existing_message["id"]
+                    is_merged_event = True  # <--- Set Flag to prevent Double Reply
+                    
+                    # Merge Metadata
+                    current_meta = existing_message.get("metadata") or {}
+                    new_meta = message_metadata or {}
+                    merged_meta = {**current_meta, **new_meta}
+                    
+                    update_data = {"metadata": merged_meta}
+                    
+                    # Merge Content: Only overwrite if we have new content and existing was empty
+                    # (e.g. Media came first with empty body, now Text comes with caption)
+                    if message_content and not existing_message.get("content"):
+                        update_data["content"] = message_content
+                        
+                    self.supabase.table("messages").update(update_data).eq("id", message_id).execute()
+                    
+                else:
+                    # INSERT PATH (New Message)
+                    logger.info(f"📥 Adding message to existing chat: {chat_id}")
+
+                    # Auto-reopen resolved chats
+                    if chat_status == "resolved":
+                        logger.info(f"♻️  Reopening resolved chat: {chat_id}")
+                        if handled_by == "ai": new_status = "open"
+                        elif handled_by == "human": new_status = "assigned"
+                        else: new_status = "open"
+
+                        self.supabase.table("chats").update({
+                            "status": new_status,
+                            "last_message_at": datetime.utcnow().isoformat()
+                        }).eq("id", chat_id).execute()
+
+                        chat_status = new_status
+                        was_reopened = True
+
+                    message_data = {
+                        "chat_id": chat_id,
+                        "sender_type": "customer",
+                        "sender_id": customer_id,
+                        "content": message_content,
+                        "metadata": message_metadata or {}
+                    }
+
+                    message_response = self.supabase.table("messages").insert(message_data).execute()
+                    if message_response.data:
+                        message_id = message_response.data[0]["id"]
+                        logger.info(f"✅ Message added to chat: {message_id}")
+                        
+                        # Update timestamp
+                        self.supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
+
+            else:
+                # No active chat - create new chat
+                logger.info(f"📝 Creating new chat for customer: {customer_id}")
+
+                chat_data = {
+                    "organization_id": organization_id,
+                    "customer_id": customer_id,
+                    "channel": channel,
+                    "sender_agent_id": agent_id,
+                    "unread_count": 1,
+                    "last_message_at": datetime.utcnow().isoformat()
+                }
+
+                if is_ai_agent:
+                    chat_data.update({"ai_agent_id": agent_id, "assigned_agent_id": agent_id, "handled_by": "ai", "status": "open"})
+                    handled_by = "ai"
+                else:
+                    chat_data.update({"human_agent_id": agent_id, "assigned_agent_id": agent_id, "handled_by": "human", "status": "assigned"})
+                    handled_by = "human"
+
+                chat_response = self.supabase.table("chats").insert(chat_data).execute()
+
+                if chat_response.data:
+                    chat_id = chat_response.data[0]["id"]
+                    is_new_chat = True
+                    logger.info(f"✅ New chat created: {chat_id}")
+
+                    # Create initial message
+                    message_data = {
+                        "chat_id": chat_id,
+                        "sender_type": "customer",
+                        "sender_id": customer_id,
+                        "content": message_content,
+                        "metadata": message_metadata or {}
+                    }
+
+                    message_response = self.supabase.table("messages").insert(message_data).execute()
+                    if message_response.data:
+                        message_id = message_response.data[0]["id"]
+                        logger.info(f"✅ Initial message created: {message_id}")
+
+            # Step 3: Update customer metadata
+            await self.update_customer_metadata(
+                customer_id=customer_id,
+                channel=channel,
+                organization_id=organization_id,
+                new_metadata=customer_metadata
+            )
+
+            # [FIX] Return is_merged_event flag
+            result = {
+                "success": True,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "customer_id": customer_id,
+                "is_new_chat": is_new_chat,
+                "was_reopened": was_reopened,
+                "handled_by": handled_by,
+                "status": chat_status,
+                "channel": channel,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "organization_id": organization_id,
+                "is_merged_event": is_merged_event # <--- Check this in webhook.py
+            }
+
+            logger.info(f"✅ Message routed successfully: chat={chat_id}")
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ Error routing message: {e}")
+            raise
+
 
     def _extract_name_from_contact(self, contact: str, channel: str) -> str:
         """

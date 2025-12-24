@@ -164,7 +164,8 @@ class ConnectionManager:
         sender_name: str = None,
         is_new_chat: bool = False,
         was_reopened: bool = False,
-        attachment: Dict[str, Any] = None  # <--- NEW ARGUMENT
+        metadata: Dict[str, Any] = None,  # <--- Added missing parameter
+        attachment: Dict[str, Any] = None
     ):
         """
         Broadcast new incoming message notification to all organization members.
@@ -185,12 +186,12 @@ class ConnectionManager:
                 "sender_name": sender_name,
                 "is_new_chat": is_new_chat,
                 "was_reopened": was_reopened,
-                "attachment": attachment  # <--- Send this to Frontend
+                "metadata": metadata,  # <--- Include metadata in payload
+                "attachment": attachment
             }
         }
 
-        await self.broadcast_to_organization(notification, organization_id)
-               
+        await self.broadcast_to_organization(notification, organization_id)          
 
     async def broadcast_chat_update(
         self,
