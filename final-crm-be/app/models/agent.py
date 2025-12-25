@@ -672,7 +672,7 @@ class Ticket(BaseModel):
     updated_at: dt = Field(..., description="Last update timestamp")
     resolved_at: Optional[dt] = Field(None, description="Resolution timestamp")
     closed_at: Optional[dt] = Field(None, description="Close timestamp")
-    
+    channel: Optional[str] = None
     # [FIX] Add these fields so the Frontend receives the data
     customer_name: Optional[str] = Field(None, description="Joined Customer Name")
     customer: Optional[Dict[str, Any]] = Field(None, description="Full Customer Object")

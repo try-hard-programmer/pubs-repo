@@ -103,6 +103,7 @@ class Ticket(BaseModel):
     closed_at: Optional[datetime]
     customer_name: Optional[str] = None
     customer: Optional[Dict[str, Any]] = None
+    channel: Optional[str] = None
 
     class Config:
         from_attributes = True

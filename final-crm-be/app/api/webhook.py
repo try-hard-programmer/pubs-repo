@@ -572,58 +572,38 @@ async def process_webhook_message(
     if agent.get("status") == "inactive":
         return {"success": False, "status": "dropped_inactive"}
 
-    # 1. ROUTING (Upsert Logic)
+    # 1. ROUTING
     router = get_message_router_service(supabase)
     res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
-    
-    # Extract IDs safely
     chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
 
-    # 2. UPDATE PHONE (If needed)
+    # 2. UPDATE PHONE
     if customer_metadata.get("phone") and cust_id:
         try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
         except: pass
 
-    # 3. BROADCAST TO FRONTEND
+    # 3. BROADCAST
     if app_settings.WEBSOCKET_ENABLED:
         try:
-            # [FIX] Prepare Attachment Object for Frontend
-            # The frontend needs this explicit structure to render images live
             attachment_data = None
             if message_metadata.get("media_url"):
                 attachment_data = {
                     "url": message_metadata["media_url"],
-                    "type": message_metadata.get("message_type", "image"), # Default to image if missing
+                    "type": message_metadata.get("message_type", "image"),
                     "name": "Media Attachment"
                 }
 
             await get_connection_manager().broadcast_new_message(
-                organization_id=org_id, 
-                chat_id=chat_id, 
-                message_id=msg_id,
-                customer_id=cust_id, 
-                customer_name=customer_name or "Unknown",
-                message_content=message_content, 
-                channel=channel, 
-                handled_by=res["handled_by"],
-                sender_type="customer", 
-                sender_id=cust_id, 
-                is_new_chat=res["is_new_chat"],
-                was_reopened=res.get("was_reopened", False),
-                metadata=message_metadata,
-                attachment=attachment_data # <--- PASS THIS for images/media
+                organization_id=org_id, chat_id=chat_id, message_id=msg_id,
+                customer_id=cust_id, customer_name=customer_name or "Unknown",
+                message_content=message_content, channel=channel, handled_by=res["handled_by"],
+                sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
+                was_reopened=res.get("was_reopened", False), metadata=message_metadata,
+                attachment=attachment_data
             )
-        except Exception as e: 
-            logger.error(f"❌ WS Broadcast Failed: {e}")
+        except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
 
-    # 4. STOP HERE IF MERGED (Prevent Double Auto-Reply)
-    if res.get("is_merged_event"):
-        logger.info(f"🛑 Skipping AI/Auto-Reply for merged message event (ID: {msg_id})")
-        return res
-
-    # ==================================================================
-    # LOGIC BELOW ONLY RUNS FOR NEW MESSAGES (Not Merges)
-    # ==================================================================
+    if res.get("is_merged_event"): return res
 
     # 5. BUSY CHECK
     if agent.get("status") == "busy":
@@ -635,12 +615,10 @@ async def process_webhook_message(
 
     # ACTIVE TICKET CHECK
     active_ticket = None
-    ticket_query = supabase.table("tickets").select("id, status, priority, assigned_agent_id").eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
-    
+    ticket_query = supabase.table("tickets").select("id, assigned_agent_id").eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
     if ticket_query.data:
         active_ticket = ticket_query.data[0]
         if active_ticket.get("assigned_agent_id"):
-            logger.info(f"🎫 Active Ticket Found (Human Assigned). Stopping AI.")
             return {**res, "handled_by": "human_ticket"}
 
     # SCHEDULE CHECK
@@ -669,8 +647,15 @@ async def process_webhook_message(
         if prio_str == "low":
             logger.info(f"🛡️ Low Priority ({reason}). Sending Greeting & Stopping AI.")
             resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
+            
+            # [FIX] CLEAN NAME FOR GREETING
+            display_name = customer_name or 'Kak'
+            if "@lid" in str(display_name) or "User" in str(display_name):
+                # Fallback to phone number if name is ugly
+                display_name = str(resolved_contact).split("@")[0]
+
             greeting_msg = (
-                f"Halo {customer_name or 'Kak'}! 👋\n\n"
+                f"Halo {display_name}! 👋\n\n"
                 "Pesan Anda telah kami terima melalui platform Syntra.\n"
                 "Silakan jelaskan permasalahan yang Anda alami secara lebih rinci agar kami dapat membantu Anda dengan lebih baik."
             )
@@ -704,11 +689,49 @@ async def process_webhook_message(
 
             if active_ticket:
                 try:
-                    supabase.table("tickets").update({
-                        "title": ticket_title, "priority": final_prio, "category": final_cat,
-                        "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
+                    # 1. Update Ticket
+                    updated_at = datetime.now(ZoneInfo("UTC")).isoformat()
+                    upd_res = supabase.table("tickets").update({
+                        "title": ticket_title, 
+                        "priority": final_prio, 
+                        "category": final_cat,
+                        "updated_at": updated_at
                     }).eq("id", active_ticket["id"]).execute()
-                except: pass
+
+                    # 2. Log Activity (System Action)
+                    if upd_res.data:
+                        new_t = upd_res.data[0]
+                        # Only log if something important changed
+                        if active_ticket["priority"] != final_prio:
+                            try:
+                                supabase.table("ticket_activities").insert({
+                                    "ticket_id": active_ticket["id"],
+                                    "action": "updated",
+                                    "description": f"AI updated priority: {active_ticket['priority']} -> {final_prio}",
+                                    "actor_type": "system",
+                                    "created_at": updated_at
+                                }).execute()
+                            except: pass
+
+                        # 3. Broadcast to Frontend
+                        if app_settings.WEBSOCKET_ENABLED:
+                            try:
+                                await get_connection_manager().broadcast_chat_update(
+                                    organization_id=org_id,
+                                    chat_id=chat_id,
+                                    update_type="ticket_updated",
+                                    data={
+                                        "ticket_id": new_t["id"],
+                                        "ticket_number": new_t["ticket_number"],
+                                        "status": new_t["status"],
+                                        "priority": new_t["priority"],
+                                        "changes": ["AI Auto-Update"]
+                                    }
+                                )
+                            except: pass
+                except Exception as e:
+                    logger.error(f"❌ AI Ticket Update Failed: {e}")
+                    
             elif ticket_config.get("autoCreateTicket"):
                 ticket_svc = get_ticket_service()
                 ticket_data = TicketCreate(
@@ -879,62 +902,134 @@ async def whatsapp_unofficial_webhook(
     secret: str = Depends(get_webhook_secret)
 ):
     try:
-        # PHASE A: SYSTEM EVENTS
-        agent_id = message.sessionId
         supabase = get_supabase_client()
-        logger.info(f"📡 [3. WEBHOOK ENTRY] Session: {message.sessionId}, Data: {message.dataType}")
+        agent_id = message.sessionId
+
+        # ==================================================================
+        # 1. VISIBILITY LAYER (Make the Invisible Visible)
+        # ==================================================================
+        # We log the raw payload structure so you can see exactly what the "Zombie" sends.
+        import json
+        try:
+            # Truncate huge base64 strings for cleaner logs
+            debug_payload = message.data.copy() if isinstance(message.data, dict) else {}
+            if "body" in debug_payload and len(str(debug_payload["body"])) > 200:
+                debug_payload["body"] = "[BASE64_DATA_TRUNCATED]"
+            
+            logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType} | Payload Keys: {list(debug_payload.keys())}")
+        except: 
+            logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType}")
+
+        # ==================================================================
+        # 2. SYSTEM EVENT FILTER (Dynamic)
+        # ==================================================================
+        # Hard system events that we know are not user messages
+        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
         
-        # [FIX] Added 'message_ack' to ignored events to stop Double Processing
-        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke"]
         if message.dataType in system_events:
-            logger.info(f"📡 WhatsApp System Event: {message.dataType}")
+            logger.info(f"📡 System Event ({message.dataType}) - Ignored")
+            # Broadcast status updates to frontend if needed
             agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
             if agent_res.data and app_settings.WEBSOCKET_ENABLED:
                 org_id = agent_res.data[0]["organization_id"]
                 await get_connection_manager().broadcast_to_organization(
-                    message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType, "data": message.data}},
+                    message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType}},
                     organization_id=org_id
                 )
             return JSONResponse(content={"success": True, "status": "processed_system_event"})
 
-        # PHASE B: IDEMPOTENCY
+        # ==================================================================
+        # 3. STRUCTURAL VALIDATION (The "Dynamic" Guard)
+        # ==================================================================
+        # Extract the inner data structure dynamically
         data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
         data_content = data_wrapper.get("_data", {}) or data_wrapper 
-        if data_content.get("id", {}).get("fromMe", False):
+        
+        # A valid message MUST have an ID. If not, it's garbage/ghost data.
+        whatsapp_id = data_content.get("id", {}).get("id")
+        if not whatsapp_id:
+             # Sometimes the ID is at the root level in certain events
+             whatsapp_id = message.data.get("id", {}).get("id")
+
+        if not whatsapp_id and message.dataType not in ["ready", "authenticated"]:
+             logger.warning("🗑️ Dropping Event: Malformed Structure (No Message ID found)")
+             return JSONResponse(content={"status": "ignored", "reason": "malformed_structure"})
+
+        # Check Flags (Status Updates, Broadcasts, Self-Messages)
+        if data_content.get("isStatus") is True or data_content.get("isNotification") is True:
+             return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
+        
+        if data_content.get("id", {}).get("fromMe", False) or data_content.get("fromMe", False):
              return JSONResponse(content={"status": "ignored", "reason": "from_me"})
 
-        whatsapp_id = data_content.get("id", {}).get("id")
-        if whatsapp_id:
-            # [FIX] Smart Cache: Split keys by type to allow Merge
-            dedup_key = f"{whatsapp_id}_{message.dataType}"
-            if dedup_cache.is_duplicate(dedup_key):
-                logger.info(f"⚡ Fast Dedup: Skipping duplicate {dedup_key}")
-                return JSONResponse(content={"status": "ignored", "reason": "duplicate_fast_cache"})
+        # ==================================================================
+        # 4. CONTENT INTEGRITY CHECK (Stop Empty Spam)
+        # ==================================================================
+        msg_body = data_content.get("body", "")
+        has_media = message.dataType == "media" or data_content.get("mimetype") or message.data.get("mimetype")
 
-            # [FIX] Bypass DB check for media to allow Router Upsert
-            if message.dataType != "media":
-                existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
-                if existing.data:
-                    return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
+        # If it has NO text content AND NO media, it is a Ghost Event (e.g. typing status, battery sync)
+        if not str(msg_body).strip() and not has_media:
+            logger.warning(f"👻 Ghost Message Detected (Empty Body + No Media). Rejection triggered.")
+            return JSONResponse(content={"status": "ignored", "reason": "zero_information_payload"})
 
-        # ... (Rest of function remains unchanged) ...
-        # PHASE C: VERIFICATION
+        # ==================================================================
+        # 5. DEDUPLICATION
+        # ==================================================================
+        dedup_key = f"{whatsapp_id}_{message.dataType}"
+        if dedup_cache.is_duplicate(dedup_key):
+            logger.info(f"⚡ Fast Dedup: Skipping duplicate {dedup_key}")
+            return JSONResponse(content={"status": "ignored", "reason": "duplicate_fast_cache"})
+
+        if message.dataType != "media":
+            existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
+            if existing.data:
+                return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
+
+        # ==================================================================
+        # 6. AGENT VERIFICATION
+        # ==================================================================
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data: return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
+        if not agent_res.data: 
+            return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
         agent = agent_res.data[0]
 
         integration_res = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
         if not integration_res.data or integration_res.data[0].get("enabled") is False:
             return JSONResponse(content={"status": "ignored", "reason": "integration_disabled"})
 
-        # PHASE D: ROUTING
+        # ==================================================================
+        # 7. STANDARDIZATION & ZOMBIE TIME CHECK
+        # ==================================================================
         settings_data = await fetch_agent_settings(supabase, agent_id)
         if settings_data: agent.update(settings_data)
 
         standard_message = await _convert_unofficial_to_standard(message)
-        contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
-        sender_name = standard_message.sender_name
         
+        # [ZOMBIE PROTECTION]: Ignore messages older than 2 minutes
+        if standard_message.timestamp:
+            try:
+                msg_time = datetime.fromisoformat(standard_message.timestamp)
+                if msg_time.tzinfo is None: msg_time = msg_time.replace(tzinfo=timezone.utc)
+                
+                age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
+                if age_seconds > 120:
+                    logger.warning(f"⏳ Ignoring Old Message (Age: {int(age_seconds)}s). Zombie History Sync Protection.")
+                    return JSONResponse(content={"status": "ignored", "reason": "too_old"})
+            except Exception: pass
+
+        # ==================================================================
+        # 8. LID RESOLUTION & ROUTING
+        # ==================================================================
+        # Resolve LID to Real Number
+        contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
+        
+        # Fix Name Display
+        sender_name = standard_message.sender_name
+        if sender_name and ("@lid" in sender_name or not sender_name.strip()):
+             sender_name = contact_id # Fallback to number if name is ugly/empty
+        
+        # Clean ID
         if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
 
         result = await process_webhook_message(
@@ -947,11 +1042,11 @@ async def whatsapp_unofficial_webhook(
                 "whatsapp_message_id": standard_message.message_id,
                 "message_type": standard_message.message_type,
                 "timestamp": standard_message.timestamp,
-                "is_lid": "@lid" in contact_id,
+                "is_lid": "@lid" in standard_message.phone_number,
                 "media_url": standard_message.media_url,
                 **standard_message.metadata
             },
-            customer_metadata={"whatsapp_name": sender_name, "whatsapp_lid": contact_id if "@lid" in contact_id else None},
+            customer_metadata={"whatsapp_name": sender_name},
             supabase=supabase
         )
 
@@ -963,9 +1058,9 @@ async def whatsapp_unofficial_webhook(
         )
 
     except Exception as e:
-        logger.error(f"❌ Unofficial Webhook Error: {e}")
+        logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
         return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
-    
+            
 # ============================================
 # TELEGRAM WEBHOOK
 # ============================================

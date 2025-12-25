@@ -34,30 +34,22 @@ class MessageRouterService:
     ) -> Dict[str, Any]:
         """
         Find existing customer or create new one based on contact info.
-
-        Strategy:
-        - WhatsApp: Find by phone number
-        - Telegram: Find by telegram_id in metadata
-        - Email: Find by email address
-
-        Args:
-            organization_id: Organization UUID
-            channel: Communication channel (whatsapp, telegram, email)
-            contact: Contact identifier (phone/email/telegram_id)
-            customer_name: Optional customer name for creation
-            metadata: Optional metadata for customer
-
-        Returns:
-            Customer data dict with id, name, and other fields
-
-        Raises:
-            Exception: If customer lookup/creation fails
+        [FIX] Now blocks creation of customers with empty/invalid contact info.
         """
         try:
+            # =========================================================
+            # 1. STRICT VALIDATION (Prevent Ghost Data)
+            # =========================================================
+            if not contact or str(contact).strip() == "" or str(contact).lower() == "none":
+                logger.warning(f"🛑 [ROUTER] Aborting: Empty contact identifier received for {channel}")
+                # Return None or raise error to stop processing
+                raise ValueError(f"Cannot create customer with empty contact for {channel}")
+
             logger.info(f"🔍 Finding customer: channel={channel}, contact={contact}")
-            logger.info(f"🔍 [4. ROUTER LOOKUP] Searching DB for: '{contact}' (Channel: {channel})")
-            logger.info(f"🔍 [DB LOOKUP] Table: customers, Query: organization_id={organization_id} AND phone='{contact}'")
-            # Build query based on channel type
+
+            # =========================================================
+            # 2. BUILD QUERY
+            # =========================================================
             if channel == "whatsapp":
                 # Find by phone number
                 query = self.supabase.table("customers") \
@@ -67,7 +59,6 @@ class MessageRouterService:
 
             elif channel == "telegram":
                 # Find by telegram_id in metadata
-                # Using jsonb operator ->>
                 query = self.supabase.table("customers") \
                     .select("*") \
                     .eq("organization_id", organization_id) \
@@ -81,100 +72,80 @@ class MessageRouterService:
                     .eq("email", contact)
 
             elif channel == "web":
-                # For web, we might use session_id or user_id
-                # This is a placeholder - adjust based on your needs
                 query = self.supabase.table("customers") \
                     .select("*") \
                     .eq("organization_id", organization_id) \
                     .eq("metadata->>session_id", contact)
 
             else:
-                logger.warning(f"❌ [4. ROUTER LOOKUP] No match for '{contact}'. Creating duplicate entry.")
                 raise ValueError(f"Unsupported channel: {channel}")
 
             # Execute query
             response = query.execute()
 
-            # If customer found, check if we need to update the name
+            # =========================================================
+            # 3. EXISTING CUSTOMER FOUND
+            # =========================================================
             if response.data:
                 customer = response.data[0]
                 current_name = customer.get('name', 'Unknown')
                 
-                # Helper function to check if a string is a phone number
+                # Check if name update is needed
                 def is_phone_number(value: str) -> bool:
-                    """Check if value looks like a phone number (starts with country code digits)"""
-                    if not value:
-                        return False
-                    # Indonesian phone numbers typically start with 62, 08, or +62
-                    # International phone numbers start with + or country code
+                    if not value: return False
                     return value.replace("+", "").replace("-", "").replace(" ", "").isdigit()
 
-                # Update customer name if:
-                # 1. Current name is "Unknown" OR looks like phone number AND
-                # 2. New customer_name is provided AND is a real name (not Unknown, not phone number)
                 should_update = (
-                    (current_name == "Unknown" or is_phone_number(current_name)) and
+                    (current_name == "Unknown" or is_phone_number(current_name) or "WhatsApp" in current_name) and
                     customer_name and
                     customer_name != "Unknown" and
                     not is_phone_number(customer_name)
                 )
 
                 if should_update:
-                    # Update customer name
-                    update_response = self.supabase.table("customers") \
+                    self.supabase.table("customers") \
                         .update({"name": customer_name}) \
                         .eq("id", customer["id"]) \
                         .execute()
+                    logger.info(f"✅ Customer name updated: '{current_name}' -> '{customer_name}'")
 
-                    if update_response.data:
-                        customer = update_response.data[0]
-                        logger.info(f"✅ Customer name updated successfully: {customer['id']} -> '{customer_name}'")
-                    else:
-                        logger.warning(f"⚠️ Failed to update customer name for {customer['id']}")
-
-                logger.info(f"✅ Customer found: {customer['id']} ({customer.get('name', 'Unknown')})")
                 return customer
-            else:
-                # 📝 ADD THIS: This confirms why the duplicate is made
-                logger.warning(f"❌ [DB MISMATCH] No customer found for '{contact}'. Creating NEW record.")
-      
-            # [FIXED LOGIC]
-            # 1. Phone Logic
-            phone_val = None
-            if channel == "whatsapp":
-                phone_val = contact  # WhatsApp contact IS the phone
-            elif channel == "telegram":
-                phone_val = (metadata or {}).get("phone") # Telegram phone is in metadata
 
-            # 2. Email Logic
-            email_val = None
-            if channel == "email":
-                email_val = contact  # Email contact IS the email address
-            elif channel == "telegram":
-                # NEVER use 'contact' (ID) as email for Telegram
-                email_val = (metadata or {}).get("email")
+            # =========================================================
+            # 4. CREATE NEW CUSTOMER
+            # =========================================================
+            logger.info(f"📝 Creating NEW customer for '{contact}'")
+            
+            # Prepare Fields
+            phone_val = contact if channel == "whatsapp" else (metadata or {}).get("phone")
+            email_val = contact if channel == "email" else (metadata or {}).get("email")
+            
+            # Generate Name if missing
+            final_name = customer_name
+            if not final_name or final_name == "Unknown":
+                final_name = self._extract_name_from_contact(contact, channel)
 
             customer_data = {
                 "organization_id": organization_id,
-                "name": customer_name or self._extract_name_from_contact(contact, channel),
+                "name": final_name,
                 "phone": phone_val,
                 "email": email_val,
                 "metadata": metadata or {}
             }
 
-            # Add channel-specific metadata
+            # Enforce channel metadata
             if channel == "telegram":
                 customer_data["metadata"]["telegram_id"] = contact
             elif channel == "web":
                 customer_data["metadata"]["session_id"] = contact
 
-            # Add tracking metadata
+            # Tracking Fields
             customer_data["metadata"]["first_contact_at"] = datetime.utcnow().isoformat()
             customer_data["metadata"]["first_contact_channel"] = channel
             customer_data["metadata"]["message_count"] = 0
             customer_data["metadata"]["channels_used"] = [channel]
 
-            # Create customer
+            # Insert
             create_response = self.supabase.table("customers").insert(customer_data).execute()
 
             if not create_response.data:
@@ -186,9 +157,10 @@ class MessageRouterService:
             return customer
 
         except Exception as e:
-            logger.error(f"❌ Error in find_or_create_customer: {e}")
+            logger.error(f"❌ Customer lookup/creation failed: {e}")
             raise
 
+        
     async def find_active_chat(
         self,
         customer_id: str,

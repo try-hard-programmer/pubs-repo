@@ -4,7 +4,7 @@ CRM Chats & Messages API Endpoints
 Provides HTTP endpoints for chat management, customer management, messaging, and ticketing.
 """
 
-from fastapi import APIRouter, HTTPException, Query, Depends, status, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, Query, Depends, status, File, UploadFile, Form, Response
 from typing import Optional, List, Dict, Any
 import logging
 import re
@@ -258,7 +258,6 @@ def _extract_attachment(metadata: Dict[str, Any]) -> Optional[MessageAttachment]
         name=metadata.get("filename") or "file.bin"
     )
 
-
 async def create_message_internal(chat_data: dict, content: str, user_id: str, supabase):
     """Inserts message, Sends, and SYNCHRONOUSLY captures ID."""
     logger.info(f"[msg_internal] Sending for chat {chat_data['id']}")
@@ -294,6 +293,92 @@ async def create_message_internal(chat_data: dict, content: str, user_id: str, s
                     logger.info(f"🔗 Capturing ID {resolved_id}")
                     current_meta[channel_key] = str(resolved_id)
                     supabase.table("customers").update({"metadata": current_meta}).eq("id", chat_data["customer_id"]).execute()
+
+
+async def create_ticket(
+        self, 
+        data: TicketCreate, 
+        organization_id: str, 
+        ticket_config: Dict = None, 
+        actor_id: Optional[str] = None,
+        actor_type: ActorType = ActorType.SYSTEM
+    ) -> Ticket:
+        
+        # 1. Generate Number
+        ticket_num = await self._generate_ticket_number(organization_id, ticket_config)
+        logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
+
+        # [FIX] Resolve Customer Name explicitly from DB
+        customer_name = "Unknown Customer"
+        if data.customer_id:
+            try:
+                cust_res = self.supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
+                if cust_res.data:
+                    customer_name = cust_res.data.get("name") or "Unknown Customer"
+            except Exception as e:
+                logger.warning(f"Failed to resolve customer name: {e}")
+
+        # [FIX] Smart Title Generation
+        # If title is missing or generic (UNKNOWN), regenerate it using the real name
+        final_title = data.title
+        is_placeholder = final_title and ("UNKNOWN" in final_title or "New Ticket" in final_title)
+        
+        if not final_title or is_placeholder:
+            priority_val = data.priority.value if hasattr(data.priority, "value") else str(data.priority)
+            
+            # Create description snippet
+            desc_text = data.description or "No Content"
+            snippet = desc_text[:30] + "..." if len(desc_text) > 30 else desc_text
+            
+            # Format: [LOW] John Doe - Issue Description...
+            final_title = f"[{priority_val.upper()}] {customer_name} - {snippet}"
+
+        # 2. Insert Data
+        insert_data = {
+            "organization_id": organization_id,
+            "customer_id": data.customer_id,
+            "chat_id": data.chat_id,
+            "ticket_number": ticket_num,
+            "title": final_title,  # <--- Using the fixed title
+            "description": data.description,
+            "category": data.category,
+            "priority": data.priority.value if hasattr(data.priority, "value") else data.priority,
+            "status": TicketStatus.OPEN.value,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        res = self.supabase.table("tickets").insert(insert_data).execute()
+        if not res.data: 
+            raise Exception("Failed to insert ticket")
+        
+        new_ticket = Ticket(**res.data[0])
+
+        # 3. Log & Broadcast
+        await self.log_activity(
+            ticket_id=new_ticket.id, 
+            action="created", 
+            description=f"Ticket created by {actor_type.value}", 
+            actor_id=actor_id, 
+            actor_type=actor_type
+        )
+
+        try:
+            conn = get_connection_manager()
+            await conn.broadcast_chat_update(
+                organization_id=organization_id,
+                chat_id=new_ticket.chat_id,
+                update_type="ticket_created",  
+                data={
+                    "ticket_id": new_ticket.id,
+                    "ticket_number": new_ticket.ticket_number,
+                    "status": new_ticket.status,
+                    "priority": new_ticket.priority
+                }
+            )
+        except Exception: pass
+
+        return new_ticket
 
 # ============================================
 # CUSTOMER ENDPOINTS
@@ -1555,7 +1640,7 @@ async def create_message(
     "/tickets",
     response_model=TicketListResponse,
     summary="Get all tickets",
-    description="Retrieve all tickets with optional filtering, joined with Customer data."
+    description="Retrieve all tickets with optional filtering, joined with Customer and Channel data."
 )
 async def get_tickets(
     status_filter: Optional[TicketStatus] = Query(None, description="Filter by ticket status"),
@@ -1572,17 +1657,17 @@ async def get_tickets(
     limit: int = Query(50, ge=1, le=100),
     current_user: User = Depends(get_current_user)
 ):
-    """Get all tickets with filters and Customer Join"""
+    """Get all tickets with filters, Customer Join, and Channel Join"""
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # [FIX] JOIN: Fetch tickets AND the related customer name
+        # [FIX 1] JOIN: Added ', chats(channel)' to get the source channel
         query = supabase.table("tickets") \
-            .select("*, customers(id, name, email)", count="exact") \
+            .select("*, customers(id, name, email), chats(channel)", count="exact") \
             .eq("organization_id", organization_id)
 
-        # Filters
+        # Filters (Kept exactly as you had them)
         if status_filter: query = query.eq("status", status_filter.value)
         if priority: query = query.eq("priority", priority.value)
         if category: query = query.eq("category", category)
@@ -1600,20 +1685,28 @@ async def get_tickets(
 
         response = query.execute()
 
-        # [FIX] Map data & Log it
+        # [FIX 2] Map data (Customer Name + Channel)
         tickets_with_customer = []
         for ticket_data in response.data:
+            # 1. Handle Customer
             customer_obj = ticket_data.get("customers")
-            
-            # Populate fields
             if customer_obj:
                 ticket_data["customer_name"] = customer_obj.get("name")
                 ticket_data["customer"] = customer_obj 
             else:
                 ticket_data["customer_name"] = "Unknown Customer"
 
-            # [LOG] Debugging: Print the name to the console
-            logger.info(f"🎫 Ticket {ticket_data.get('ticket_number')} -> Customer: {ticket_data.get('customer_name')}")
+            # 2. Handle Channel (Flatten it)
+            chat_obj = ticket_data.get("chats")
+            if chat_obj:
+                # Extract 'channel' from nested object to root 'channel' field
+                ticket_data["channel"] = chat_obj.get("channel")
+            
+            # Remove nested objects to keep response clean (optional, but good for Pydantic)
+            ticket_data.pop("chats", None)
+
+            # [LOG] Debugging
+            logger.info(f"🎫 Ticket {ticket_data.get('ticket_number')} -> Customer: {ticket_data.get('customer_name')} | Channel: {ticket_data.get('channel')}")
 
             tickets_with_customer.append(Ticket(**ticket_data))
 
@@ -1630,9 +1723,7 @@ async def get_tickets(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch tickets"
         )
-
-
-
+    
 @router.get(
     "/tickets/{ticket_id}",
     response_model=Ticket,
@@ -1672,33 +1763,89 @@ async def get_ticket_by_id(
     response_model=Ticket,
     status_code=status.HTTP_201_CREATED,
     summary="Create new ticket",
-    description="Create a new support ticket (Auto-logs creation activity)"
+    description="Create a new support ticket (Checks for active tickets first)"
 )
-async def create_ticket(
-        self, 
-        data: TicketCreate, 
-        organization_id: str, 
-        ticket_config: Dict = None, 
-        actor_id: Optional[str] = None,
-        actor_type: ActorType = ActorType.SYSTEM
-    ) -> Ticket:
+async def create_ticket_client(
+    data: TicketCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Create a new ticket.
+    
+    Logic:
+    1. Check for ACTIVE ticket (Open/In Progress) for this chat.
+       - If found -> Return 409 CONFLICT (Error).
+    2. If not found -> Create NEW ticket (201 Created).
+    """
+    try:
+        # 0. Setup Dependencies
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+        actor_id = current_user.user_id
+        actor_type = ActorType.HUMAN
+
+        # ==================================================================
+        # 1. CHECK FOR EXISTING ACTIVE TICKET (Anti-Duplicate)
+        # ==================================================================
+        if data.chat_id:
+            # Look for tickets that are NOT resolved AND NOT closed
+            existing_check = supabase.table("tickets") \
+                .select("*") \
+                .eq("organization_id", organization_id) \
+                .eq("chat_id", data.chat_id) \
+                .neq("status", "resolved") \
+                .neq("status", "closed") \
+                .execute()
+
+            if existing_check.data:
+                existing_ticket = existing_check.data[0]
+                logger.info(f"♻️ Found existing active ticket {existing_ticket['ticket_number']} for Chat {data.chat_id}")
+                
+                # [FIX] Return 409 Conflict so frontend knows it FAILED to create
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"An active ticket ({existing_ticket['ticket_number']}) already exists for this chat."
+                )
+
+        # ==================================================================
+        # 2. GENERATE NUMBER
+        # ==================================================================
+        prefix = "TKT-"
+        res = supabase.table("tickets") \
+            .select("ticket_number") \
+            .eq("organization_id", organization_id) \
+            .ilike("ticket_number", f"{prefix}%") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        next_num = 1
+        if res.data:
+            last_ticket = res.data[0]["ticket_number"]
+            try:
+                number_part = last_ticket.replace(prefix, "")
+                next_num = int(number_part) + 1
+            except ValueError:
+                next_num = 1
         
-        # 1. Generate Number
-        ticket_num = await self._generate_ticket_number(organization_id, ticket_config)
+        ticket_num = f"{prefix}{next_num:03d}"
         logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
 
-        # [FIX] Resolve Customer Name explicitly from DB
+        # ==================================================================
+        # 3. RESOLVE CUSTOMER NAME
+        # ==================================================================
         customer_name = "Unknown Customer"
         if data.customer_id:
             try:
-                cust_res = self.supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
+                cust_res = supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
                 if cust_res.data:
                     customer_name = cust_res.data.get("name") or "Unknown Customer"
             except Exception as e:
                 logger.warning(f"Failed to resolve customer name: {e}")
 
-        # [FIX] Smart Title Generation
-        # If title is missing or generic (UNKNOWN), regenerate it using the real name
+        # ==================================================================
+        # 4. SMART TITLE GENERATION
+        # ==================================================================
         final_title = data.title
         is_placeholder = final_title and ("UNKNOWN" in final_title or "New Ticket" in final_title)
         
@@ -1712,13 +1859,15 @@ async def create_ticket(
             # Format: [LOW] John Doe - Issue Description...
             final_title = f"[{priority_val.upper()}] {customer_name} - {snippet}"
 
-        # 2. Insert Data
+        # ==================================================================
+        # 5. INSERT DATA
+        # ==================================================================
         insert_data = {
             "organization_id": organization_id,
             "customer_id": data.customer_id,
             "chat_id": data.chat_id,
             "ticket_number": ticket_num,
-            "title": final_title,  # <--- Using the fixed title
+            "title": final_title, 
             "description": data.description,
             "category": data.category,
             "priority": data.priority.value if hasattr(data.priority, "value") else data.priority,
@@ -1727,21 +1876,31 @@ async def create_ticket(
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
 
-        res = self.supabase.table("tickets").insert(insert_data).execute()
+        res = supabase.table("tickets").insert(insert_data).execute()
         if not res.data: 
             raise Exception("Failed to insert ticket")
         
         new_ticket = Ticket(**res.data[0])
 
-        # 3. Log & Broadcast
-        await self.log_activity(
-            ticket_id=new_ticket.id, 
-            action="created", 
-            description=f"Ticket created by {actor_type.value}", 
-            actor_id=actor_id, 
-            actor_type=actor_type
-        )
+        # ==================================================================
+        # 6. LOG ACTIVITY
+        # ==================================================================
+        try:
+            log_data = {
+                "ticket_id": new_ticket.id,
+                "action": "created",
+                "description": f"Ticket created by {actor_type.value}",
+                "actor_type": actor_type.value,
+                "human_actor_id": actor_id,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            supabase.table("ticket_activities").insert(log_data).execute()
+        except Exception as e:
+            logger.error(f"Failed to log activity: {e}")
 
+        # ==================================================================
+        # 7. BROADCAST
+        # ==================================================================
         try:
             conn = get_connection_manager()
             await conn.broadcast_chat_update(
@@ -1759,6 +1918,15 @@ async def create_ticket(
 
         return new_ticket
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating ticket: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create ticket: {str(e)}"
+        )
+    
 @router.put(
     "/tickets/{ticket_id}",
     response_model=Ticket,
@@ -1770,30 +1938,116 @@ async def update_ticket(
     ticket_update: TicketUpdate,
     current_user: User = Depends(get_current_user)
 ):
-    """Update an existing ticket using TicketService"""
+    """Update an existing ticket directly"""
     try:
-        # Use the Service to handle Update + Logging automatically
-        ticket_service = get_ticket_service()
+        # 0. Setup Dependencies
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+        actor_id = current_user.user_id
+        actor_type = ActorType.HUMAN
+
+        # ==================================================================
+        # 1. FETCH EXISTING TICKET (Verify Ownership)
+        # ==================================================================
+        # We need the old data to compare changes (for activity logs)
+        res = supabase.table("tickets") \
+            .select("*") \
+            .eq("id", ticket_id) \
+            .eq("organization_id", organization_id) \
+            .execute()
+            
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Ticket not found")
         
-        updated_ticket = await ticket_service.update_ticket(
-            ticket_id=ticket_id,
-            update_data=ticket_update,
-            actor_id=current_user.user_id,
-            actor_type=ActorType.HUMAN
-        )
+        old_ticket = Ticket(**res.data[0])
 
-        return updated_ticket
+        # ==================================================================
+        # 2. PREPARE UPDATE DATA
+        # ==================================================================
+        # exclude_unset=True ensures we don't accidentally set fields to null
+        update_data = ticket_update.dict(exclude_unset=True)
+        
+        if not update_data:
+            return old_ticket # Nothing to update
 
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        # ==================================================================
+        # 3. EXECUTE UPDATE
+        # ==================================================================
+        update_res = supabase.table("tickets") \
+            .update(update_data) \
+            .eq("id", ticket_id) \
+            .eq("organization_id", organization_id) \
+            .execute()
+
+        if not update_res.data:
+            raise HTTPException(status_code=500, detail="Database update failed")
+            
+        new_ticket = Ticket(**update_res.data[0])
+
+        # ==================================================================
+        # 4. DETECT CHANGES & LOG ACTIVITY
+        # ==================================================================
+        changes = []
+        if old_ticket.status != new_ticket.status:
+            changes.append(f"Status: {old_ticket.status} -> {new_ticket.status}")
+        
+        if old_ticket.priority != new_ticket.priority:
+            changes.append(f"Priority: {old_ticket.priority} -> {new_ticket.priority}")
+            
+        if old_ticket.assigned_agent_id != new_ticket.assigned_agent_id:
+            # You could fetch agent names here if you wanted to be fancy, 
+            # but usually IDs or just "Reassigned" is enough for the log
+            changes.append("Agent reassigned")
+
+        activity_desc = "Ticket updated"
+        if changes:
+            activity_desc = "Updated: " + ", ".join(changes)
+
+        try:
+            log_data = {
+                "ticket_id": new_ticket.id,
+                "action": "updated",
+                "description": f"{activity_desc} by {actor_type.value}",
+                "actor_type": actor_type.value,
+                "human_actor_id": actor_id,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            supabase.table("ticket_activities").insert(log_data).execute()
+        except Exception as e:
+            logger.error(f"Failed to log activity: {e}")
+
+        # ==================================================================
+        # 5. BROADCAST UPDATE
+        # ==================================================================
+        try:
+            conn = get_connection_manager()
+            await conn.broadcast_chat_update(
+                organization_id=organization_id,
+                chat_id=new_ticket.chat_id,
+                update_type="ticket_updated",
+                data={
+                    "ticket_id": new_ticket.id,
+                    "ticket_number": new_ticket.ticket_number,
+                    "status": new_ticket.status,
+                    "priority": new_ticket.priority,
+                    "changes": changes
+                }
+            )
+        except Exception: pass
+
+        return new_ticket
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error updating ticket {ticket_id}: {e}")
-        # Map service errors to HTTP errors
-        if "not found" in str(e).lower():
-             raise HTTPException(status_code=404, detail="Ticket not found")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update ticket: {str(e)}"
         )
-
+    
 @router.get(
     "/tickets/{ticket_id}/activities",
     response_model=List[TicketActivityResponse],
