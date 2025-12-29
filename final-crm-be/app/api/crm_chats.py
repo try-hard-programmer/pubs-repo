@@ -259,7 +259,7 @@ def _extract_attachment(metadata: Dict[str, Any]) -> Optional[MessageAttachment]
     )
 
 async def create_message_internal(chat_data: dict, content: str, user_id: str, supabase):
-    """Inserts message, Sends, and SYNCHRONOUSLY captures ID."""
+    """Inserts message, Sends, and SYNCHRONOUSLY captures ID. Deletes on failure."""
     logger.info(f"[msg_internal] Sending for chat {chat_data['id']}")
     
     msg_data = {
@@ -269,18 +269,32 @@ async def create_message_internal(chat_data: dict, content: str, user_id: str, s
         "content": content, 
         "metadata": {"source": "new_chat_modal"}
     }
-    supabase.table("messages").insert(msg_data).execute()
     
+    # 1. Insert Message (Optimistic Save)
+    res = supabase.table("messages").insert(msg_data).execute()
+    if not res.data:
+        raise HTTPException(500, "Failed to insert message")
+    
+    new_message_id = res.data[0]["id"]
+    
+    # 2. Get Customer Data
     cust_res = supabase.table("customers").select("*").eq("id", chat_data["customer_id"]).single().execute()
     if cust_res.data:
+        # 3. Send External (WhatsApp/Telegram)
         result = await send_message_via_channel(chat_data, cust_res.data, content, supabase)
         
+        # 4. CHECK FAILURE & ROLLBACK
         if not result.get("success"):
             error_msg = result.get("message", "")
-            logger.error(f"❌ Send Failed: {error_msg}")
+            logger.error(f"❌ Send Failed: {error_msg} -> Rolling back DB message {new_message_id}")
+            
+            # [FIX] DELETE the message we just inserted so it doesn't stay in DB
+            supabase.table("messages").delete().eq("id", new_message_id).execute()
+            
             raise HTTPException(400, f"Message Failed: {error_msg}")
         
         else:
+            # 5. Success Handling (Capture ID)
             data = result.get("data", {})
             resolved_id = None
             if isinstance(data, dict):
@@ -293,7 +307,6 @@ async def create_message_internal(chat_data: dict, content: str, user_id: str, s
                     logger.info(f"🔗 Capturing ID {resolved_id}")
                     current_meta[channel_key] = str(resolved_id)
                     supabase.table("customers").update({"metadata": current_meta}).eq("id", chat_data["customer_id"]).execute()
-
 
 async def create_ticket(
         self, 
@@ -813,13 +826,12 @@ async def get_chat(
             detail="Failed to fetch chat"
         )
 
-
 @router.post(
     "/chats",
     response_model=Chat,
     status_code=status.HTTP_201_CREATED,
     summary="Create new chat",
-    description="Atomic: Metadata Priority -> UUID Agent -> Force Reuse -> Send"
+    description="Atomic: Verify Sender -> Resolve Customer -> Create Chat -> Send"
 )
 async def create_chat(
     chat: ChatCreate,
@@ -837,99 +849,62 @@ async def create_chat(
         # Normalize Channel Value safely
         channel_val = chat.channel.value if hasattr(chat.channel, "value") else chat.channel
 
-        # ---------------------------------------------------------
-        # 1. RESOLVE CUSTOMER (PRIORITY: METADATA ID)
-        # ---------------------------------------------------------
-        customer_id = chat.customer_id
-        
-        if not customer_id:
-            if not chat.contact: raise HTTPException(400, "Contact required")
-            
-            clean_input = re.sub(r'[^\d]', '', chat.contact)
-            
-            # A. Check Metadata First (Search by ID)
-            if channel_val == "telegram":
-                meta_q = supabase.table("customers").select("id").eq("organization_id", organization_id).contains("metadata", {"telegram_id": clean_input}).execute()
-                if meta_q.data:
-                    customer_id = meta_q.data[0]["id"]
-
-            elif channel_val == "whatsapp":
-                meta_q = supabase.table("customers").select("id").eq("organization_id", organization_id).contains("metadata", {"whatsapp_id": clean_input}).execute()
-                if meta_q.data:
-                    customer_id = meta_q.data[0]["id"]
-
-            # B. Check Phone/Email Column
-            if not customer_id:
-                query = supabase.table("customers").select("id").eq("organization_id", organization_id)
-                
-                if "@" in chat.contact:
-                    # It's an email
-                    existing = query.eq("email", chat.contact).execute()
-                else:
-                    # It's a phone or ID
-                    # Try exact match, then various prefix formats
-                    no_prefix = clean_input[2:] if clean_input.startswith('62') else clean_input
-                    or_query = f"phone.eq.{chat.contact},phone.eq.{clean_input},phone.eq.0{no_prefix},phone.eq.62{no_prefix}"
-                    existing = query.or_(or_query).execute()
-
-                if existing.data:
-                    customer_id = existing.data[0]["id"]
-
-            # C. Create New Customer (If not found)
-            if not customer_id:
-                # [FIX] Prepare Metadata & Fallback Phone
-                cust_metadata = {"source": "dashboard_create"}
-                final_phone = None
-                final_email = None
-
-                if "@" in chat.contact:
-                    final_email = chat.contact
-                else:
-                    # Logic: If Telegram and not email, assume the input IS the ID/Phone
-                    # We store it in 'phone' column to satisfy strict requirements
-                    final_phone = chat.contact
-                    
-                    # [STRICT GUARD] Only inject telegram_id metadata if channel is Telegram
-                    if channel_val == "telegram":
-                        cust_metadata["telegram_id"] = clean_input
-
-                new_cust = supabase.table("customers").insert({
-                    "organization_id": organization_id,
-                    "name": chat.customer_name or "New Customer",
-                    "phone": final_phone,
-                    "email": final_email,
-                    "metadata": cust_metadata
-                }).execute()
-                
-                if new_cust.data:
-                    customer_id = new_cust.data[0]["id"]
-                else:
-                    raise HTTPException(500, "Failed to create customer")
-
-        # ---------------------------------------------------------
-        # 2. RESOLVE AGENT (Supports UUID natively)
-        # ---------------------------------------------------------
+        # ==============================================================================
+        # 1. RESOLVE AGENT & SENDER FIRST (READ ONLY - NO WRITES YET)
+        # ==============================================================================
         ai_agent_id, human_agent_id = None, None
         assigned_agent_id, sender_agent_id = None, None
         handled_by = "unassigned"
         status_value = "open"
 
+        # A. Resolve Gateway (The Pipe) - SMART LOGIC
+        if chat.using_agent_integration_id:
+            target_id = chat.using_agent_integration_id
+            logger.info(f"🔌 Resolving Gateway for: {target_id}")
+            
+            # 1. Try by Integration ID
+            int_res = supabase.table("agent_integrations") \
+                .select("agent_id, channel, enabled") \
+                .eq("id", target_id) \
+                .execute()
+            
+            # 2. Fallback: Try by Agent ID
+            if not int_res.data:
+                logger.info("...ID not found, trying as Agent ID...")
+                int_res = supabase.table("agent_integrations") \
+                    .select("agent_id, channel, enabled") \
+                    .eq("agent_id", target_id) \
+                    .eq("channel", channel_val) \
+                    .execute()
+
+            if int_res.data and len(int_res.data) > 0:
+                integration = int_res.data[0]
+                if integration["channel"] != channel_val:
+                    raise HTTPException(400, f"Integration supports {integration['channel']}, but chat is {channel_val}")
+                if not integration["enabled"]:
+                     raise HTTPException(400, "Selected integration is disabled")
+                
+                # SET SENDER AGENT
+                sender_agent_id = integration["agent_id"]
+                logger.info(f"✅ Gateway Resolved: Agent {sender_agent_id} via {channel_val}")
+            else:
+                logger.warning(f"Gateway {target_id} not found")
+                raise HTTPException(404, "Gateway Integration not found")
+
+        # B. Resolve Default AI (Read Only)
         default_ai = None
         ai_res = supabase.table("agents").select("id").eq("organization_id", organization_id).is_("user_id", "null").eq("status", "active").limit(1).execute()
         if ai_res.data: default_ai = ai_res.data[0]["id"]
 
+        # C. Resolve Handler (The Person)
         if chat.assigned_agent_id:
             target_id = chat.assigned_agent_id
             
-            # 'Me' shortcut
             if target_id == "me":
                 me_res = supabase.table("agents").select("id").eq("user_id", current_user.user_id).eq("organization_id", organization_id).execute()
-                if me_res.data:
-                    target_id = me_res.data[0]["id"]
-                else:
-                    raise HTTPException(400, "You do not have an Agent profile.")
+                if me_res.data: target_id = me_res.data[0]["id"]
+                else: raise HTTPException(400, "You do not have an Agent profile.")
 
-            # Validate Agent
             agent_check = supabase.table("agents").select("id", "user_id").eq("organization_id", organization_id).eq("id", target_id).execute()
             
             if agent_check.data:
@@ -942,28 +917,92 @@ async def create_chat(
                     status_value = "assigned"
                     if default_ai: ai_agent_id = default_ai
                     
-                    # STRICT INTEGRATION CHECK
-                    int_check = supabase.table("agent_integrations").select("id").eq("agent_id", assigned_agent_id).eq("channel", channel_val).eq("enabled", True).execute()
-                    if int_check.data:
-                        sender_agent_id = assigned_agent_id 
-                    else:
-                        raise HTTPException(400, f"Selected Agent has no connected {channel_val} account.")
+                    # [GATEWAY LOGIC] Only check personal integration if Gateway NOT set
+                    if not sender_agent_id:
+                        int_check = supabase.table("agent_integrations").select("id").eq("agent_id", assigned_agent_id).eq("channel", channel_val).eq("enabled", True).execute()
+                        if int_check.data:
+                            sender_agent_id = assigned_agent_id 
+                        else:
+                            raise HTTPException(400, f"Agent has no personal {channel_val} account. Please select a Gateway Integration.")
                 else: # AI
                     ai_agent_id = assigned_agent_id
-                    sender_agent_id = assigned_agent_id
                     handled_by = "ai"
+                    status_value = "assigned"
+                    if not sender_agent_id: sender_agent_id = assigned_agent_id
             else:
                 raise HTTPException(404, "Assigned Agent not found")
 
-        # Fallback to AI
-        if not assigned_agent_id and default_ai:
-            assigned_agent_id = default_ai
-            sender_agent_id = default_ai
-            handled_by = "ai"
+        # D. Fallback Logic
+        if not assigned_agent_id:
+            if sender_agent_id:
+                # Gateway + No Agent -> Shared Inbox
+                status_value = "open"
+                handled_by = "unassigned"
+            elif default_ai:
+                # No Gateway + Default AI -> Assigned to AI
+                assigned_agent_id = default_ai
+                handled_by = "ai"
+                status_value = "assigned"
+                sender_agent_id = default_ai
+            else:
+                raise HTTPException(400, "No valid Sender (Integration) available.")
 
-        # ---------------------------------------------------------
+        # ==============================================================================
+        # 2. RESOLVE CUSTOMER (SAFE NOW)
+        # ==============================================================================
+        customer_id = chat.customer_id
+        
+        if not customer_id:
+            if not chat.contact: raise HTTPException(400, "Contact required")
+            
+            clean_input = re.sub(r'[^\d]', '', chat.contact)
+            
+            # A. Check Metadata
+            if channel_val == "telegram":
+                meta_q = supabase.table("customers").select("id").eq("organization_id", organization_id).contains("metadata", {"telegram_id": clean_input}).execute()
+                if meta_q.data: customer_id = meta_q.data[0]["id"]
+            elif channel_val == "whatsapp":
+                meta_q = supabase.table("customers").select("id").eq("organization_id", organization_id).contains("metadata", {"whatsapp_id": clean_input}).execute()
+                if meta_q.data: customer_id = meta_q.data[0]["id"]
+
+            # B. Check Columns
+            if not customer_id:
+                query = supabase.table("customers").select("id").eq("organization_id", organization_id)
+                if "@" in chat.contact:
+                    existing = query.eq("email", chat.contact).execute()
+                else:
+                    no_prefix = clean_input[2:] if clean_input.startswith('62') else clean_input
+                    or_query = f"phone.eq.{chat.contact},phone.eq.{clean_input},phone.eq.0{no_prefix},phone.eq.62{no_prefix}"
+                    existing = query.or_(or_query).execute()
+                if existing.data: customer_id = existing.data[0]["id"]
+
+            # C. Create New
+            if not customer_id:
+                cust_metadata = {"source": "dashboard_create"}
+                final_phone = None
+                final_email = None
+
+                if "@" in chat.contact:
+                    final_email = chat.contact
+                else:
+                    final_phone = chat.contact
+                    if channel_val == "telegram": cust_metadata["telegram_id"] = clean_input
+                    elif channel_val == "whatsapp": cust_metadata["whatsapp_id"] = clean_input
+
+                new_cust = supabase.table("customers").insert({
+                    "organization_id": organization_id,
+                    "name": chat.customer_name or "New Customer",
+                    "phone": final_phone,
+                    "email": final_email,
+                    "metadata": cust_metadata
+                }).execute()
+                
+                if new_cust.data: customer_id = new_cust.data[0]["id"]
+                else: raise HTTPException(500, "Failed to create customer")
+
+        # ==============================================================================
         # 3. REUSE OR CREATE CHAT
-        # ---------------------------------------------------------
+        # ==============================================================================
         active_chat = supabase.table("chats").select("*").eq("customer_id", customer_id).eq("channel", channel_val).neq("status", "resolved").neq("status", "closed").execute()
         
         chat_obj = None
@@ -971,15 +1010,24 @@ async def create_chat(
             chat_obj = active_chat.data[0]
             logger.info(f"♻️ Reusing Chat {chat_obj['id']}")
             
-            # FORCE UPDATE STATUS
-            upd = {
-                "status": status_value,
-                "handled_by": handled_by,
-                "human_agent_id": human_agent_id,
-                "ai_agent_id": ai_agent_id,
-                "assigned_agent_id": assigned_agent_id,
-                "sender_agent_id": sender_agent_id
-            }
+            upd = {"sender_agent_id": sender_agent_id}
+            
+            if assigned_agent_id:
+                upd.update({
+                    "status": status_value,
+                    "handled_by": handled_by,
+                    "assigned_agent_id": assigned_agent_id
+                })
+                if human_agent_id: upd["human_agent_id"] = human_agent_id
+                if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
+            elif handled_by == "unassigned":
+                upd.update({
+                    "status": "open",
+                    "handled_by": "unassigned",
+                    "assigned_agent_id": None,
+                    "human_agent_id": None
+                })
+            
             supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
             chat_obj.update(upd)
         else:
@@ -992,21 +1040,52 @@ async def create_chat(
             res = supabase.table("chats").insert(new_chat_data).execute()
             chat_obj = res.data[0]
 
-        # ---------------------------------------------------------
-        # 4. SEND MESSAGE
-        # ---------------------------------------------------------
+        # ==============================================================================
+        # 4. SEND MESSAGE & BROADCAST
+        # ==============================================================================
         if chat.initial_message:
             await create_message_internal(chat_obj, chat.initial_message, current_user.user_id, supabase)
+
+        # 5. WEBSOCKET BROADCAST
+        if app_settings.WEBSOCKET_ENABLED:
+            try:
+                conn = get_connection_manager()
+                if chat.initial_message:
+                    sender_name = "AI Assistant"
+                    if handled_by == "human": sender_name = "Human Agent"
+                    
+                    await conn.broadcast_new_message(
+                        organization_id=organization_id,
+                        chat_id=chat_obj["id"],
+                        message_id=uuid4().hex,
+                        customer_id=customer_id,
+                        customer_name=chat.customer_name or "Customer",
+                        message_content=chat.initial_message,
+                        channel=channel_val,
+                        handled_by=handled_by,
+                        sender_type="agent",
+                        sender_id=sender_agent_id or current_user.user_id,
+                        sender_name=sender_name,
+                        is_new_chat=True,
+                        was_reopened=False
+                    )
+                else:
+                    await conn.broadcast_chat_update(
+                        organization_id=organization_id,
+                        chat_id=chat_obj["id"],
+                        update_type="chat_created",
+                        data=chat_obj
+                    )
+            except Exception as e:
+                logger.warning(f"WS Broadcast failed: {e}")
 
         chat_obj["last_message"] = None
         return Chat(**chat_obj)
 
-    except HTTPException as he:
-        raise he
+    except HTTPException as he: raise he
     except Exception as e:
         logger.error(f"Create chat error: {e}", exc_info=True)
         raise HTTPException(500, "Failed to create chat")
-
 
 @router.put(
     "/chats/{chat_id}/assign",

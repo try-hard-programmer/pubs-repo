@@ -524,8 +524,9 @@ class ChatCreate(BaseModel):
     customer_name: Optional[str] = Field(None, description="Customer name for findOrCreate")
     contact: Optional[str] = Field(None, description="Customer contact (phone/email) for findOrCreate")
     channel: CommunicationChannel = Field(..., description="Communication channel")
-    assigned_agent_id: Optional[str] = Field(None, description="Assigned agent UUID")
     initial_message: Optional[str] = Field(None, description="Initial message content")
+    assigned_agent_id: Optional[str] = Field(None, description="Assigned agent UUID")
+    using_agent_integration_id: Optional[str] = Field(None, description="Force specific integration ID for sending")
 
 
 class ChatUpdate(BaseModel):

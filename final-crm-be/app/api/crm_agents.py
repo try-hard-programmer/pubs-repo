@@ -137,42 +137,46 @@ def get_auth_user_id_by_email(supabase, email: str) -> Optional[str]:
     "/",
     response_model=AgentListResponse,
     summary="Get all agents",
-    description="Retrieve agents. Hides 'Deleted' agents (Inactive + No User ID). Shows 'Offline' agents (Inactive + Has User ID)."
+    description="Retrieve agents. Hides 'Archived' agents (Inactive + No User ID). Shows 'Offline' agents (Inactive + Has User ID)."
 )
 async def get_agents(
-    status_filter: Optional[AgentStatus] = Query(None, description="Filter by agent status"),
+    status_filter: Optional[AgentStatus] = Query(None, description="Filter by status"),
     search: Optional[str] = Query(None, description="Search by name or email"),
-    show_deleted: bool = Query(False, description="Include deleted agents"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
     current_user: User = Depends(get_current_user)
 ):
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        query = supabase.table("agents").select("*", count="exact").eq("organization_id", organization_id)
+        # [FIX] Filter OUT 'archived' right here in the base query
+        query = supabase.table("agents") \
+            .select("*", count="exact") \
+            .eq("organization_id", organization_id) \
+            .neq("status", "archived")
 
+        # 1. Additional Status Filter (Optional)
         if status_filter:
             query = query.eq("status", status_filter.value)
-        
-        elif not show_deleted:
-            query = query.or_("status.neq.inactive,user_id.not.is.null")
 
+        # 2. Search
         if search:
             query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
 
-        response = query.order("created_at", desc=True).execute()
-
-        agents = [Agent(**agent) for agent in response.data]
+        # 3. Execute
+        response = query.range(skip, skip + limit - 1).order("created_at", desc=True).execute()
 
         return AgentListResponse(
-            agents=agents,
-            total=response.count or len(agents)
+            agents=[Agent(**agent) for agent in response.data],
+            total=response.count or 0
         )
 
     except Exception as e:
         logger.error(f"Error fetching agents: {e}")
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to fetch agents")
-
+        raise HTTPException(500, "Failed to fetch agents")
+	
+	
 @router.get(
 	"/{agent_id}",
 	response_model=Agent,
