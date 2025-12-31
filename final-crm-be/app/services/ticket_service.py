@@ -176,24 +176,105 @@ class TicketService:
         except Exception as e:
             logger.error(f"Failed to log activity: {e}")
 
-    async def update_ticket(self, ticket_id: str, update_data: TicketUpdate, actor_id: str, actor_type: ActorType = ActorType.HUMAN) -> Ticket:
-        old_res = self.supabase.table("tickets").select("*").eq("id", ticket_id).single().execute()
-        if not old_res.data: raise Exception("Ticket not found")
-        old_ticket = old_res.data
+    async def update_ticket(
+        self, 
+        ticket_id: str, 
+        update_data: TicketUpdate, 
+        actor_id: str, 
+        actor_type: ActorType = ActorType.HUMAN
+    ) -> Ticket:
+        # [DEBUG] Force log to confirm function entry and data
+        logger.info(f"🟢 [TicketService] Update Request for {ticket_id}")
+        logger.info(f"📦 [TicketService] Incoming Data: {update_data}")
 
+        # 1. Fetch Old Ticket
+        old_res = self.supabase.table("tickets").select("*").eq("id", ticket_id).single().execute()
+        if not old_res.data: 
+            raise Exception("Ticket not found")
+        old_ticket = old_res.data
+        old_status_str = str(old_ticket.get("status", "")).lower().strip()
+
+        # 2. Prepare Payload
         payload = update_data.model_dump(exclude_unset=True)
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         
-        if payload.get("status") == TicketStatus.RESOLVED:
+        # --- ROBUST STATUS EXTRACTION ---
+        # 1. Try to get from dumped payload
+        new_status_raw = payload.get("status")
+        
+        # 2. Fallback: Try to get directly from the input object if missing in payload
+        if new_status_raw is None and getattr(update_data, 'status', None) is not None:
+             new_status_raw = update_data.status
+             # Ensure it's in the payload for the DB update
+             payload["status"] = new_status_raw
+
+        # 3. Normalize to string
+        new_status_str = ""
+        if new_status_raw is not None:
+            val = new_status_raw.value if hasattr(new_status_raw, "value") else new_status_raw
+            new_status_str = str(val).lower().strip()
+
+        # [DEBUG] Confirm we detected the status
+        logger.info(f"🧐 [TicketService] Status Check: Old='{old_status_str}' New='{new_status_str}'")
+
+        # Handle Timestamps
+        if new_status_str == "resolved":
             payload["resolved_at"] = datetime.now(timezone.utc).isoformat()
-        elif payload.get("status") == TicketStatus.CLOSED:
+        elif new_status_str == "closed":
             payload["closed_at"] = datetime.now(timezone.utc).isoformat()
 
+        # 3. Update the Ticket in DB
         res = self.supabase.table("tickets").update(payload).eq("id", ticket_id).execute()
-        if not res.data: raise Exception("Failed to update ticket")
+        if not res.data: 
+            raise Exception("Failed to update ticket")
         updated_ticket = res.data[0]
 
-        if payload.get("status") and payload["status"] != old_ticket["status"]:
+        # ==============================================================================
+        # [AUTO-RELEASE LOGIC]
+        # Trigger: Status is "closed" or "resolved" -> Release Chat
+        # ==============================================================================
+        
+        if new_status_str in ["closed", "resolved"] and new_status_str != old_status_str:
+            try:
+                chat_id = old_ticket.get("chat_id")
+                if chat_id:
+                    # A. Fetch Chat
+                    chat_res = self.supabase.table("chats").select("*").eq("id", chat_id).single().execute()
+                    
+                    if chat_res.data:
+                        chat = chat_res.data
+                        
+                        # Only release if currently handled by human
+                        if chat.get("handled_by") == "human" or chat.get("human_agent_id"):
+                            logger.info(f"🔄 Ticket Closed: Releasing Chat {chat_id} from Human...")
+                            
+                            ai_agent_id = chat.get("ai_agent_id")
+                            
+                            # RESET CHAT STATE
+                            chat_update = {
+                                "status": "open",               # Force Open
+                                "human_agent_id": None,         # Remove Human
+                                "handled_by": "unassigned",     # Default
+                                "updated_at": datetime.now(timezone.utc).isoformat()
+                            }
+                            
+                            # Assign back to AI if possible
+                            if ai_agent_id:
+                                chat_update["handled_by"] = "ai"
+                                chat_update["assigned_agent_id"] = ai_agent_id
+                                logger.info(f"🤖 Chat assigned back to AI: {ai_agent_id}")
+                            else:
+                                chat_update["assigned_agent_id"] = None
+                                logger.info(f"⚠️ Chat Unassigned (No AI Agent)")
+
+                            self.supabase.table("chats").update(chat_update).eq("id", chat_id).execute()
+                        else:
+                            logger.info(f"ℹ️ Chat {chat_id} already released/not human handled.")
+            except Exception as e:
+                logger.error(f"❌ Failed to auto-release chat: {e}")
+
+        # 4. Activity Logging
+        if payload.get("status") and str(payload["status"]) != str(old_ticket["status"]):
             await self.log_activity(ticket_id, "status_change", f"Status changed to {payload['status']}", actor_id, actor_type)
         
         if payload.get("priority") and payload["priority"] != old_ticket["priority"]:
@@ -204,7 +285,8 @@ class TicketService:
              await self.log_activity(ticket_id, "assignment_change", f"Assigned to {new_agent}", actor_id, actor_type)
 
         return Ticket(**updated_ticket)
-
+    
+    
     async def get_ticket_history(self, ticket_id: str) -> List[TicketActivityResponse]:
         res = self.supabase.table("ticket_activities").select("*").eq("ticket_id", ticket_id).order("created_at", desc=True).execute()
         resolved_logs = []

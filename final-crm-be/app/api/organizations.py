@@ -5,6 +5,7 @@ Provides HTTP endpoints for managing organizations and members.
 """
 from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional
+import secrets
 import logging
 
 from app.auth.dependencies import get_current_user
@@ -22,6 +23,7 @@ from app.models.organization import (
 from app.services.organization_service import get_organization_service
 from app.services.role_service import get_role_service
 from datetime import datetime
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -514,46 +516,102 @@ async def invite_user(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Sends an invitation email to a user and links them to the inviter.
-
-    **Authentication:** Requires valid JWT token
-
-    Args:
-        invite_data: Data containing email and inviter ID
-        current_user: Authenticated user from JWT token
-
-    Returns:
-        Success message and invitation ID
+    Robust Invitation with Correct Redirect Link.
     """
-    try:
-        # Security Check: Ensure the user is inviting on their own behalf
-        # (Optional: remove this if admins can invite on behalf of others)
-        if invite_data.invited_by != current_user.user_id:
-             raise HTTPException(
-                 status_code=403, 
-                 detail="You can only send invitations on your own behalf"
-             )
+    request_id = secrets.token_hex(4)
+    logger.info(f"[{request_id}] 🚀 Starting invitation process for {invite_data.email}")
 
-        org_service = get_organization_service()
+    try:
+        # 1. Security Check (Identity)
+        if invite_data.invited_by != current_user.user_id:
+             raise HTTPException(status_code=403, detail="You can only send invitations on your own behalf")
+
+        client = get_organization_service().client
+
+        # 2. Security Check (Organization Permission)
+        if invite_data.organization_id:
+            perm_check = client.table("organization_members")\
+                .select("role")\
+                .eq("user_id", current_user.user_id)\
+                .eq("organization_id", invite_data.organization_id)\
+                .execute()
+            
+            if not perm_check.data:
+                 raise HTTPException(status_code=403, detail="You are not a member of this organization.")
+
+        # 3. Pre-check Profile
+        try:
+            profile_check = client.table("profiles").select("id").eq("email", invite_data.email).execute()
+            if profile_check.data and len(profile_check.data) > 0:
+                raise HTTPException(status_code=409, detail=f"User {invite_data.email} is already registered.")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+        # 4. Prepare Data
+        token = secrets.token_urlsafe(32)
+        db_data = {
+            "invited_email": invite_data.email,
+            "invited_by": invite_data.invited_by,
+            "invitation_token": token,
+            "status": "pending"
+        }
         
-        # Create Invitation
-        invitation_id = await org_service.create_user_invitation(
-            email=invite_data.email,
-            invited_by=invite_data.invited_by
-        )
+        # 5. DB Operation
+        logger.info(f"[{request_id}] 💾 Inserting record into 'user_invitations'...")
+        response = client.table("user_invitations").insert(db_data).execute()
+        if not response.data:
+            raise RuntimeError("Failed to create invitation record")
+        invitation_id = response.data[0]["id"]
         
+        # 6. Auth Operation: Trigger Supabase Email
+        logger.info(f"[{request_id}] 📧 Calling Supabase Admin Invite...")
+        
+        try:
+            base_url = getattr(settings, "FRONTEND_URL", "http://localhost:8080")
+            
+            # [FIXED]: Redirect to 'accept-invitation' with the DB token
+            redirect_url = f"{base_url}/accept-invitation?token={token}"
+            
+            client.auth.admin.invite_user_by_email(
+                invite_data.email,
+                options={
+                    "data": { 
+                        "custom_invitation_id": invitation_id, 
+                        "organization_id": invite_data.organization_id
+                    },
+                    "redirect_to": redirect_url 
+                }
+            )
+            logger.info(f"[{request_id}] ✅ Supabase Invite Sent. Redirect Target: {redirect_url}")
+            
+        except Exception as auth_error:
+            # Error Handling / Rollback Logic
+            error_msg = str(auth_error)
+            logger.warning(f"[{request_id}] ⚠️ Auth Error: {error_msg}")
+            
+            if "already" in error_msg:
+                 try:
+                    client.table("user_invitations").delete().eq("id", invitation_id).execute()
+                 except: 
+                    pass
+                 raise HTTPException(status_code=409, detail="User is already registered.")
+            
+            raise HTTPException(status_code=500, detail=f"Failed to send email: {error_msg}")
+
         return InvitationResponse(
             success=True,
-            message="Invitation sent successfully",
+            message="Invitation processed.",
             data=InvitationData(invitation_id=invitation_id)
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Invitation failed: {e}")
+        logger.error(f"[{request_id}] 💥 Critical Failure: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 # ============ Organization Member Endpoints ============
 
 @router.get("/{org_id}/members", response_model=OrganizationMemberListResponse)

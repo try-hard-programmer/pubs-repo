@@ -43,26 +43,38 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 
 
 class SimpleCache:
-    """Simple dictionary-based cache with TTL for deduplication"""
-    def __init__(self, ttl_seconds=60):
+    """
+    Optimized dictionary-based cache with TTL for deduplication.
+    [FIX] Performance optimized to avoid O(N) scan on every request.
+    """
+    def __init__(self, ttl_seconds=300): 
         self.cache = {}
         self.ttl = ttl_seconds
+        self.last_cleanup = time.time()
 
     def is_duplicate(self, key):
-        self._cleanup()
+        now = time.time()
+        
+        if now - self.last_cleanup > 60:
+            self._cleanup(now)
+
         if key in self.cache:
+            if now - self.cache[key] > self.ttl:
+                self.cache[key] = now # Refresh and treat as new
+                return False
             return True
-        self.cache[key] = time.time()
+        
+        self.cache[key] = now
         return False
 
-    def _cleanup(self):
-        now = time.time()
-        # Remove expired keys
+    def _cleanup(self, now):
+        self.last_cleanup = now
         keys_to_remove = [k for k, t in self.cache.items() if now - t > self.ttl]
         for k in keys_to_remove:
             del self.cache[k]
 
-dedup_cache = SimpleCache(ttl_seconds=45)
+dedup_cache = SimpleCache(ttl_seconds=300)
+
 # ============================================
 # HELPER FUNCTIONS
 # ============================================

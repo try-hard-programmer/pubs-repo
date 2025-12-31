@@ -454,51 +454,7 @@ class OrganizationService:
         except Exception as e:
             logger.error(f"Error fetching children for user {user_id}: {e}")
             return []
-    
-    async def create_user_invitation(self, email: str, invited_by: str) -> str:
-        """
-        Create a new user invitation record.
-        Generates a unique token and inserts into user_invitations table.
 
-        Args:
-            email: Email of the invited user
-            invited_by: UUID of the user sending the invite
-
-        Returns:
-            Created invitation ID
-        
-        Raises:
-            RuntimeError: If creation fails
-        """
-        try:
-            import secrets
-            # Generate a secure random token for the invitation link
-            token = secrets.token_urlsafe(32)
-            
-            data = {
-                "invited_email": email,
-                "invited_by": invited_by,
-                "invitation_token": token,
-                "status": "pending"
-            }
-            
-            # Insert into Supabase
-            response = self.client.table("user_invitations").insert(data).execute()
-            
-            if not response.data:
-                raise RuntimeError("Failed to create invitation record")
-                
-            invitation_id = response.data[0]["id"]
-            logger.info(f"Created invitation {invitation_id} for {email} by {invited_by}")
-            
-            # TODO: Integrate with Email Service here to send the actual email
-            # e.g., await email_service.send_invitation_email(email, token)
-            
-            return invitation_id
-            
-        except Exception as e:
-            logger.error(f"Error creating invitation: {e}")
-            raise RuntimeError(f"Failed to create invitation: {str(e)}")
 
 # Global organization service instance
 _organization_service: Optional[OrganizationService] = None

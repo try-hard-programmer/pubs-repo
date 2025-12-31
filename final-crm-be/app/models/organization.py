@@ -395,7 +395,8 @@ class InvitationRequest(BaseModel):
     """Schema for sending an invitation"""
     email: str = Field(..., description="Email address to invite")
     invited_by: str = Field(..., description="User UUID of the inviter (upline)")
-
+    organization_id: Optional[str] = Field(None, description="Organization context")
+    
     class Config:
         json_schema_extra = {
             "example": {

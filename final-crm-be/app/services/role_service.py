@@ -245,37 +245,68 @@ class RoleService:
     ) -> List[OrganizationMemberWithRole]:
         """
         Get all members of organization with their roles.
-
-        Args:
-            organization_id: UUID of organization
-
-        Returns:
-            List of members with role information
+        
+        Fixed: 
+        1. Performs manual join between organization_members and user_roles.
+        2. Fetches emails from 'profiles' table to populate user details.
         """
         try:
-            # Query organization_members joined with user_roles
-            response = self.client.table("organization_members") \
-                .select(
-                    "user_id, joined_at, is_owner, "
-                    "user_roles(role, assigned_by)"
-                ) \
+            # 1. Fetch all members first
+            members_response = self.client.table("organization_members") \
+                .select("user_id, joined_at, is_owner") \
                 .eq("organization_id", organization_id) \
                 .execute()
 
+            if not members_response.data:
+                return []
+            
+            members_data = members_response.data
+            
+            # Extract user IDs for batch querying
+            user_ids = [m["user_id"] for m in members_data]
+
+            # 2. Fetch all custom roles for this organization
+            roles_response = self.client.table("user_roles") \
+                .select("user_id, role, assigned_by") \
+                .eq("organization_id", organization_id) \
+                .execute()
+            
+            # 3. Fetch user profiles (emails)
+            # We use the 'profiles' table which should be synced with auth.users
+            profiles_response = self.client.table("profiles") \
+                .select("id, email, full_name") \
+                .in_("id", user_ids) \
+                .execute()
+
+            # Create lookup dictionaries
+            roles_map = {r["user_id"]: r for r in roles_response.data}
+            profiles_map = {p["id"]: p for p in profiles_response.data}
+
             members = []
-            for member_data in response.data:
-                # Get role from joined data
-                role_data = member_data.get("user_roles")
-                role = AppRole.USER  # Default
+            for member_data in members_data:
+                user_id = member_data["user_id"]
+                
+                # Default role values
+                role = AppRole.USER
                 assigned_by = None
 
-                if role_data and len(role_data) > 0:
-                    role = AppRole(role_data[0]["role"])
-                    assigned_by = role_data[0].get("assigned_by")
+                # Look up role
+                if user_id in roles_map:
+                    role_entry = roles_map[user_id]
+                    try:
+                        role = AppRole(role_entry["role"])
+                        assigned_by = role_entry["assigned_by"]
+                    except ValueError:
+                        pass
+                
+                # Look up email/profile
+                email = None
+                if user_id in profiles_map:
+                    email = profiles_map[user_id].get("email")
 
                 members.append(OrganizationMemberWithRole(
-                    user_id=member_data["user_id"],
-                    email=None,  # TODO: Fetch from auth.users
+                    user_id=user_id,
+                    email=email,  # Populated from profiles
                     role=role,
                     is_owner=member_data["is_owner"],
                     joined_at=member_data["joined_at"],
@@ -288,7 +319,7 @@ class RoleService:
         except Exception as e:
             logger.error(f"Error fetching organization members with roles: {e}")
             return []
-
+            
     async def get_role_details(
         self,
         user_id: str,
