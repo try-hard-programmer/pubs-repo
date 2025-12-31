@@ -389,3 +389,37 @@ class OrganizationMembersWithRolesResponse(BaseModel):
                 "organization": {}
             }
         }
+
+
+class InvitationRequest(BaseModel):
+    """Schema for sending an invitation"""
+    email: str = Field(..., description="Email address to invite")
+    invited_by: str = Field(..., description="User UUID of the inviter (upline)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "email": "user@example.com",
+                "invited_by": "uuid-of-the-inviter"
+            }
+        }
+
+class InvitationData(BaseModel):
+    invitation_id: str
+
+class InvitationResponse(BaseModel):
+    """Response after sending invitation"""
+    success: bool = Field(True, description="Operation success status")
+    message: str = Field(..., description="Status message")
+    data: InvitationData
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": True,
+                "message": "Invitation sent successfully",
+                "data": {
+                    "invitation_id": "invitation-uuid-123"
+                }
+            }
+        }

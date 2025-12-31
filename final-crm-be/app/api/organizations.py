@@ -16,7 +16,8 @@ from app.models.organization import (
     UserParent, UserChild, UserChildrenResponse,
     RoleAssignRequest, RoleAssignResponse, AppRole,
     UserRoleInfo, UserOrganizationsWithRolesResponse,
-    OrganizationMembersWithRolesResponse
+    OrganizationMembersWithRolesResponse,
+    InvitationRequest, InvitationResponse, InvitationData
 )
 from app.services.organization_service import get_organization_service
 from app.services.role_service import get_role_service
@@ -505,6 +506,54 @@ async def delete_organization(
         raise HTTPException(status_code=500, detail="Failed to delete organization")
 
 
+# ============ Invitation Endpoints ============
+
+@router.post("/invite", response_model=InvitationResponse)
+async def invite_user(
+    invite_data: InvitationRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Sends an invitation email to a user and links them to the inviter.
+
+    **Authentication:** Requires valid JWT token
+
+    Args:
+        invite_data: Data containing email and inviter ID
+        current_user: Authenticated user from JWT token
+
+    Returns:
+        Success message and invitation ID
+    """
+    try:
+        # Security Check: Ensure the user is inviting on their own behalf
+        # (Optional: remove this if admins can invite on behalf of others)
+        if invite_data.invited_by != current_user.user_id:
+             raise HTTPException(
+                 status_code=403, 
+                 detail="You can only send invitations on your own behalf"
+             )
+
+        org_service = get_organization_service()
+        
+        # Create Invitation
+        invitation_id = await org_service.create_user_invitation(
+            email=invite_data.email,
+            invited_by=invite_data.invited_by
+        )
+        
+        return InvitationResponse(
+            success=True,
+            message="Invitation sent successfully",
+            data=InvitationData(invitation_id=invitation_id)
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Invitation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
 # ============ Organization Member Endpoints ============
 
 @router.get("/{org_id}/members", response_model=OrganizationMemberListResponse)
