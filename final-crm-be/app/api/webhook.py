@@ -36,6 +36,7 @@ from app.services.ticket_service import get_ticket_service
 from app.api.crm_chats import send_message_via_channel
 from app.utils.ml_guard import ml_guard
 from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
+from app.services.dynamic_ai_service import process_dynamic_ai_response_async
 
 logger = logging.getLogger(__name__)
 
@@ -723,7 +724,7 @@ async def process_webhook_message(
                 await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
 
     if should_trigger_ai:
-        asyncio.create_task(process_ai_response_async(chat_id, msg_id, supabase))
+        asyncio.create_task(process_dynamic_ai_response_async(chat_id, msg_id, supabase))
         return {**res, "handled_by": "ai"}
     
     return res
