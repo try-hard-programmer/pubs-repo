@@ -2,9 +2,19 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 const fs = require("fs");
 const path = require("path");
 const sessions = new Map();
-const { execSync } = require("child_process"); // <--- ADD THIS LINE
-// [FIX] Track restoring state to prevent double-restarts (Zombies)
+const { execSync } = require("child_process");
+
 const restoringSessions = new Set();
+
+const processedMessages = new Set();
+const DEDUP_WINDOW_MS = 60000; // 1 Minute
+
+const isDuplicateMessage = (messageId) => {
+  if (processedMessages.has(messageId)) return true;
+  processedMessages.add(messageId);
+  setTimeout(() => processedMessages.delete(messageId), DEDUP_WINDOW_MS);
+  return false;
+};
 
 const {
   baseWebhookURL,
@@ -140,6 +150,9 @@ const setupSession = (sessionId) => {
           "--disable-setuid-sandbox",
           "--disable-gpu",
           "--disable-dev-shm-usage",
+          "--disk-cache-size=0",
+          "--disable-application-cache",
+          "--disable-offline-load-stale-cache",
         ],
       },
       userAgent:
@@ -219,10 +232,9 @@ const initializeEvents = (client, sessionId) => {
     waitForNestedObject(client, "pupPage")
       .then(() => {
         const restartSession = async (sessionId) => {
-          // [FIX] Check if already restoring to prevent Double-Restarts (Zombie Clients)
           if (restoringSessions.has(sessionId)) {
             console.log(
-              `⚠️ Session ${sessionId} is already restoring. Skipping duplicate restart request.`
+              `⚠️ Session ${sessionId} is already restoring. Skipping.`
             );
             return;
           }
@@ -231,37 +243,35 @@ const initializeEvents = (client, sessionId) => {
           console.log(`♻️ Restarting session ${sessionId}...`);
 
           try {
-            // Remove from active map immediately
             sessions.delete(sessionId);
 
-            // Force destroy with timeout
+            // [FIX] Aggressive Process Killing (Zombie Protection)
+            const browserProcess = client.pupBrowser
+              ? client.pupBrowser.process()
+              : null;
+            const pid = browserProcess ? browserProcess.pid : null;
+
             if (client) {
-              // Try graceful destroy
-              await Promise.race([
-                client.destroy(),
-                new Promise((resolve) => setTimeout(resolve, 5000)), // Force continue after 5s
-              ]).catch((e) =>
-                console.log("Destroy error (ignored):", e.message)
-              );
+              await client
+                .destroy()
+                .catch((e) =>
+                  console.log("Destroy error (ignored):", e.message)
+                );
             }
 
-            // Additional cleanup: Ensure browser process is actually dead
-            if (client.pupBrowser && client.pupBrowser.isConnected()) {
+            // Force Kill OS Process
+            if (pid) {
               try {
-                const childProcess = client.pupBrowser.process();
-                if (childProcess) childProcess.kill("SIGKILL");
+                process.kill(pid, "SIGKILL");
+                console.log(`🔫 Killed browser process PID: ${pid}`);
               } catch (e) {
-                /* ignore */
+                /* Process already gone */
               }
             }
           } catch (e) {
-            console.log(
-              `Error during session cleanup for ${sessionId}:`,
-              e.message
-            );
+            console.log(`Error cleanup ${sessionId}:`, e.message);
           }
 
-          // Wait a bit before restarting
           await new Promise((resolve) => setTimeout(resolve, 3000));
 
           setupSession(sessionId);
@@ -355,6 +365,11 @@ const initializeEvents = (client, sessionId) => {
 
   checkIfEventisEnabled("message").then((_) => {
     client.on("message", async (message) => {
+      if (isDuplicateMessage(message.id.id)) {
+        console.log(`Skipping duplicate message: ${message.id.id}`);
+        return;
+      }
+
       triggerWebhook(sessionWebhook, sessionId, "message", { message });
       if (message.hasMedia && message._data?.size < maxAttachmentSize) {
         // custom service event
