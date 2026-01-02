@@ -28,7 +28,12 @@ from app.middleware.webhook_auth import get_webhook_secret
 from app.services.message_router_service import get_message_router_service
 from app.services.agent_finder_service import get_agent_finder_service
 from app.services.websocket_service import get_connection_manager
+
+# [CHANGE] Import the V2 AI Trigger
+from app.services.dynamic_ai_service_v2 import process_dynamic_ai_response_v2 
+# Keep V1 for backward compatibility if needed
 from app.services.ai_response_service import process_ai_response_async
+
 from app.config import settings as app_settings
 from app.models.webhook import WhatsAppUnofficialWebhookMessage, WebhookRouteResponse, WhatsAppEventPayload
 from app.models.ticket import TicketCreate, ActorType, TicketPriority, TicketDecision
@@ -872,175 +877,176 @@ async def whatsapp_webhook(
 # WHATSAPP UNOFFICIAL WEBHOOK
 # ============================================
 
-@router.post(
-    "/wa-unofficial",
-    response_model=WebhookRouteResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Receive WhatsApp message (Unofficial API)"
-)
-async def whatsapp_unofficial_webhook(
-    message: WhatsAppUnofficialWebhookMessage,
-    secret: str = Depends(get_webhook_secret)
-):
-    try:
-        supabase = get_supabase_client()
-        agent_id = message.sessionId
+# Reworking
+# @router.post(
+#     "/wa-unofficial",
+#     response_model=WebhookRouteResponse,
+#     status_code=status.HTTP_200_OK,
+#     summary="Receive WhatsApp message (Unofficial API)"
+# )
+# async def whatsapp_unofficial_webhook(
+#     message: WhatsAppUnofficialWebhookMessage,
+#     secret: str = Depends(get_webhook_secret)
+# ):
+#     try:
+#         supabase = get_supabase_client()
+#         agent_id = message.sessionId
 
-        # ==================================================================
-        # 1. VISIBILITY LAYER (Make the Invisible Visible)
-        # ==================================================================
-        # We log the raw payload structure so you can see exactly what the "Zombie" sends.
-        import json
-        try:
-            # Truncate huge base64 strings for cleaner logs
-            debug_payload = message.data.copy() if isinstance(message.data, dict) else {}
-            if "body" in debug_payload and len(str(debug_payload["body"])) > 200:
-                debug_payload["body"] = "[BASE64_DATA_TRUNCATED]"
+#         # ==================================================================
+#         # 1. VISIBILITY LAYER (Make the Invisible Visible)
+#         # ==================================================================
+#         # We log the raw payload structure so you can see exactly what the "Zombie" sends.
+#         import json
+#         try:
+#             # Truncate huge base64 strings for cleaner logs
+#             debug_payload = message.data.copy() if isinstance(message.data, dict) else {}
+#             if "body" in debug_payload and len(str(debug_payload["body"])) > 200:
+#                 debug_payload["body"] = "[BASE64_DATA_TRUNCATED]"
             
-            logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType} | Payload Keys: {list(debug_payload.keys())}")
-        except: 
-            logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType}")
+#             logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType} | Payload Keys: {list(debug_payload.keys())}")
+#         except: 
+#             logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType}")
 
-        # ==================================================================
-        # 2. SYSTEM EVENT FILTER (Dynamic)
-        # ==================================================================
-        # Hard system events that we know are not user messages
-        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
+#         # ==================================================================
+#         # 2. SYSTEM EVENT FILTER (Dynamic)
+#         # ==================================================================
+#         # Hard system events that we know are not user messages
+#         system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
         
-        if message.dataType in system_events:
-            logger.info(f"📡 System Event ({message.dataType}) - Ignored")
-            # Broadcast status updates to frontend if needed
-            agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
-            if agent_res.data and app_settings.WEBSOCKET_ENABLED:
-                org_id = agent_res.data[0]["organization_id"]
-                await get_connection_manager().broadcast_to_organization(
-                    message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType}},
-                    organization_id=org_id
-                )
-            return JSONResponse(content={"success": True, "status": "processed_system_event"})
+#         if message.dataType in system_events:
+#             logger.info(f"📡 System Event ({message.dataType}) - Ignored")
+#             # Broadcast status updates to frontend if needed
+#             agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
+#             if agent_res.data and app_settings.WEBSOCKET_ENABLED:
+#                 org_id = agent_res.data[0]["organization_id"]
+#                 await get_connection_manager().broadcast_to_organization(
+#                     message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType}},
+#                     organization_id=org_id
+#                 )
+#             return JSONResponse(content={"success": True, "status": "processed_system_event"})
 
-        # ==================================================================
-        # 3. STRUCTURAL VALIDATION (The "Dynamic" Guard)
-        # ==================================================================
-        # Extract the inner data structure dynamically
-        data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
-        data_content = data_wrapper.get("_data", {}) or data_wrapper 
+#         # ==================================================================
+#         # 3. STRUCTURAL VALIDATION (The "Dynamic" Guard)
+#         # ==================================================================
+#         # Extract the inner data structure dynamically
+#         data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
+#         data_content = data_wrapper.get("_data", {}) or data_wrapper 
         
-        # A valid message MUST have an ID. If not, it's garbage/ghost data.
-        whatsapp_id = data_content.get("id", {}).get("id")
-        if not whatsapp_id:
-             # Sometimes the ID is at the root level in certain events
-             whatsapp_id = message.data.get("id", {}).get("id")
+#         # A valid message MUST have an ID. If not, it's garbage/ghost data.
+#         whatsapp_id = data_content.get("id", {}).get("id")
+#         if not whatsapp_id:
+#              # Sometimes the ID is at the root level in certain events
+#              whatsapp_id = message.data.get("id", {}).get("id")
 
-        if not whatsapp_id and message.dataType not in ["ready", "authenticated"]:
-             logger.warning("🗑️ Dropping Event: Malformed Structure (No Message ID found)")
-             return JSONResponse(content={"status": "ignored", "reason": "malformed_structure"})
+#         if not whatsapp_id and message.dataType not in ["ready", "authenticated"]:
+#              logger.warning("🗑️ Dropping Event: Malformed Structure (No Message ID found)")
+#              return JSONResponse(content={"status": "ignored", "reason": "malformed_structure"})
 
-        # Check Flags (Status Updates, Broadcasts, Self-Messages)
-        if data_content.get("isStatus") is True or data_content.get("isNotification") is True:
-             return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
+#         # Check Flags (Status Updates, Broadcasts, Self-Messages)
+#         if data_content.get("isStatus") is True or data_content.get("isNotification") is True:
+#              return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
         
-        if data_content.get("id", {}).get("fromMe", False) or data_content.get("fromMe", False):
-             return JSONResponse(content={"status": "ignored", "reason": "from_me"})
+#         if data_content.get("id", {}).get("fromMe", False) or data_content.get("fromMe", False):
+#              return JSONResponse(content={"status": "ignored", "reason": "from_me"})
 
-        # ==================================================================
-        # 4. CONTENT INTEGRITY CHECK (Stop Empty Spam)
-        # ==================================================================
-        msg_body = data_content.get("body", "")
-        has_media = message.dataType == "media" or data_content.get("mimetype") or message.data.get("mimetype")
+#         # ==================================================================
+#         # 4. CONTENT INTEGRITY CHECK (Stop Empty Spam)
+#         # ==================================================================
+#         msg_body = data_content.get("body", "")
+#         has_media = message.dataType == "media" or data_content.get("mimetype") or message.data.get("mimetype")
 
-        # If it has NO text content AND NO media, it is a Ghost Event (e.g. typing status, battery sync)
-        if not str(msg_body).strip() and not has_media:
-            logger.warning(f"👻 Ghost Message Detected (Empty Body + No Media). Rejection triggered.")
-            return JSONResponse(content={"status": "ignored", "reason": "zero_information_payload"})
+#         # If it has NO text content AND NO media, it is a Ghost Event (e.g. typing status, battery sync)
+#         if not str(msg_body).strip() and not has_media:
+#             logger.warning(f"👻 Ghost Message Detected (Empty Body + No Media). Rejection triggered.")
+#             return JSONResponse(content={"status": "ignored", "reason": "zero_information_payload"})
 
-        # ==================================================================
-        # 5. DEDUPLICATION
-        # ==================================================================
-        dedup_key = f"{whatsapp_id}_{message.dataType}"
-        if dedup_cache.is_duplicate(dedup_key):
-            logger.info(f"⚡ Fast Dedup: Skipping duplicate {dedup_key}")
-            return JSONResponse(content={"status": "ignored", "reason": "duplicate_fast_cache"})
+#         # ==================================================================
+#         # 5. DEDUPLICATION
+#         # ==================================================================
+#         dedup_key = f"{whatsapp_id}_{message.dataType}"
+#         if dedup_cache.is_duplicate(dedup_key):
+#             logger.info(f"⚡ Fast Dedup: Skipping duplicate {dedup_key}")
+#             return JSONResponse(content={"status": "ignored", "reason": "duplicate_fast_cache"})
 
-        if message.dataType != "media":
-            existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
-            if existing.data:
-                return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
+#         if message.dataType != "media":
+#             existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
+#             if existing.data:
+#                 return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
 
-        # ==================================================================
-        # 6. AGENT VERIFICATION
-        # ==================================================================
-        agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data: 
-            return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
-        agent = agent_res.data[0]
+#         # ==================================================================
+#         # 6. AGENT VERIFICATION
+#         # ==================================================================
+#         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
+#         if not agent_res.data: 
+#             return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
+#         agent = agent_res.data[0]
 
-        integration_res = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
-        if not integration_res.data or integration_res.data[0].get("enabled") is False:
-            return JSONResponse(content={"status": "ignored", "reason": "integration_disabled"})
+#         integration_res = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
+#         if not integration_res.data or integration_res.data[0].get("enabled") is False:
+#             return JSONResponse(content={"status": "ignored", "reason": "integration_disabled"})
 
-        # ==================================================================
-        # 7. STANDARDIZATION & ZOMBIE TIME CHECK
-        # ==================================================================
-        settings_data = await fetch_agent_settings(supabase, agent_id)
-        if settings_data: agent.update(settings_data)
+#         # ==================================================================
+#         # 7. STANDARDIZATION & ZOMBIE TIME CHECK
+#         # ==================================================================
+#         settings_data = await fetch_agent_settings(supabase, agent_id)
+#         if settings_data: agent.update(settings_data)
 
-        standard_message = await _convert_unofficial_to_standard(message)
+#         standard_message = await _convert_unofficial_to_standard(message)
         
-        # [ZOMBIE PROTECTION]: Ignore messages older than 2 minutes
-        if standard_message.timestamp:
-            try:
-                msg_time = datetime.fromisoformat(standard_message.timestamp)
-                if msg_time.tzinfo is None: msg_time = msg_time.replace(tzinfo=timezone.utc)
+#         # [ZOMBIE PROTECTION]: Ignore messages older than 2 minutes
+#         if standard_message.timestamp:
+#             try:
+#                 msg_time = datetime.fromisoformat(standard_message.timestamp)
+#                 if msg_time.tzinfo is None: msg_time = msg_time.replace(tzinfo=timezone.utc)
                 
-                age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
-                if age_seconds > 120:
-                    logger.warning(f"⏳ Ignoring Old Message (Age: {int(age_seconds)}s). Zombie History Sync Protection.")
-                    return JSONResponse(content={"status": "ignored", "reason": "too_old"})
-            except Exception: pass
+#                 age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
+#                 if age_seconds > 120:
+#                     logger.warning(f"⏳ Ignoring Old Message (Age: {int(age_seconds)}s). Zombie History Sync Protection.")
+#                     return JSONResponse(content={"status": "ignored", "reason": "too_old"})
+#             except Exception: pass
 
-        # ==================================================================
-        # 8. LID RESOLUTION & ROUTING
-        # ==================================================================
-        # Resolve LID to Real Number
-        contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
+#         # ==================================================================
+#         # 8. LID RESOLUTION & ROUTING
+#         # ==================================================================
+#         # Resolve LID to Real Number
+#         contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
         
-        # Fix Name Display
-        sender_name = standard_message.sender_name
-        if sender_name and ("@lid" in sender_name or not sender_name.strip()):
-             sender_name = contact_id # Fallback to number if name is ugly/empty
+#         # Fix Name Display
+#         sender_name = standard_message.sender_name
+#         if sender_name and ("@lid" in sender_name or not sender_name.strip()):
+#              sender_name = contact_id # Fallback to number if name is ugly/empty
         
-        # Clean ID
-        if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
+#         # Clean ID
+#         if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
 
-        result = await process_webhook_message(
-            agent=agent,
-            channel="whatsapp",
-            contact=contact_id,
-            message_content=standard_message.message,
-            customer_name=sender_name or contact_id,
-            message_metadata={
-                "whatsapp_message_id": standard_message.message_id,
-                "message_type": standard_message.message_type,
-                "timestamp": standard_message.timestamp,
-                "is_lid": "@lid" in standard_message.phone_number,
-                "media_url": standard_message.media_url,
-                **standard_message.metadata
-            },
-            customer_metadata={"whatsapp_name": sender_name},
-            supabase=supabase
-        )
+#         result = await process_webhook_message(
+#             agent=agent,
+#             channel="whatsapp",
+#             contact=contact_id,
+#             message_content=standard_message.message,
+#             customer_name=sender_name or contact_id,
+#             message_metadata={
+#                 "whatsapp_message_id": standard_message.message_id,
+#                 "message_type": standard_message.message_type,
+#                 "timestamp": standard_message.timestamp,
+#                 "is_lid": "@lid" in standard_message.phone_number,
+#                 "media_url": standard_message.media_url,
+#                 **standard_message.metadata
+#             },
+#             customer_metadata={"whatsapp_name": sender_name},
+#             supabase=supabase
+#         )
 
-        return WebhookRouteResponse(
-            success=True, chat_id=result["chat_id"], message_id=result["message_id"],
-            customer_id=result["customer_id"], is_new_chat=result["is_new_chat"],
-            was_reopened=result["was_reopened"], handled_by=result["handled_by"],
-            status=result["status"], channel="whatsapp", message=_generate_status_message(result)
-        )
+#         return WebhookRouteResponse(
+#             success=True, chat_id=result["chat_id"], message_id=result["message_id"],
+#             customer_id=result["customer_id"], is_new_chat=result["is_new_chat"],
+#             was_reopened=result["was_reopened"], handled_by=result["handled_by"],
+#             status=result["status"], channel="whatsapp", message=_generate_status_message(result)
+#         )
 
-    except Exception as e:
-        logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+#     except Exception as e:
+#         logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
+#         return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
             
 # ============================================
 # TELEGRAM WEBHOOK
@@ -1327,8 +1333,337 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         media_url=url, timestamp=ts, metadata={"session_id": unofficial.sessionId}
     )
 
+async def _handle_message_content_for_telegram(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
+    """Safe Content Handler for Telegram"""
+    content = ""
+    msg_type = "text"
+    media_url = None
+    
+    if data_type == "media":
+        base64_data = message_data.get("data") or message_data.get("body")
+        if not base64_data: raise ValueError("Media data missing")
+
+        mime = message_data.get("mimetype", "application/octet-stream")
+        content = message_data.get("caption", "")
+
+        if "image" in mime: msg_type = "image"
+        elif "video" in mime: msg_type = "video"
+        elif "audio" in mime: msg_type = "audio"
+        elif "pdf" in mime: msg_type = "document"
+        else: msg_type = "file"
+
+        ext = "bin"
+        if "/" in mime: ext = mime.split("/")[-1].replace("jpeg", "jpg")
+        
+        media_url = await _upload_media_to_supabase(base64_data, mime, ext)
+    else:
+        # Text
+        data_wrapper = message_data.get("message", {}) or {}
+        data_content = data_wrapper.get("_data", {}) or data_wrapper
+        content = data_content.get("body", "")
+        msg_type = "text"
+
+    return content, msg_type, media_url
 
 # app/api/webhook.py
+# Reworking
+# @router.post("/telegram-userbot", response_model=WebhookRouteResponse)
+# async def telegram_userbot_webhook(
+#     payload: WhatsAppUnofficialWebhookMessage, 
+#     secret: str = Depends(get_webhook_secret)
+# ):
+#     try:
+#         agent_id = payload.sessionId
+#         raw_data = payload.data
+        
+#         if payload.dataType == "media":
+#             logger.info(f"📸 Telegram Userbot: Received Media (Agent: {agent_id})")
+#             content_source = raw_data
+#             data_wrapper = raw_data.get("message", {}) or {}
+#             data_content = data_wrapper.get("_data", {}) or data_wrapper
+#         else:
+#             logger.info(f"💬 Telegram Userbot: Received Text (Agent: {agent_id})")
+#             data_wrapper = raw_data.get("message", {}) or {}
+#             data_content = data_wrapper.get("_data", {}) or data_wrapper
+#             content_source = raw_data
+
+#         if not data_content and payload.dataType != "media": 
+#             raise HTTPException(status_code=400, detail="Invalid JSON structure")
+        
+#         # Idempotency
+#         msg_id = data_content.get("id", {}).get("id")
+#         supabase = get_supabase_client()
+#         if msg_id and await check_telegram_idempotency(supabase, str(msg_id)):
+#              return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
+
+#         # Identity
+#         sender_id = str(data_content.get("from", ""))
+#         sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
+#         timestamp_unix = data_content.get("t")
+#         raw_phone = data_content.get("phone")
+#         final_phone = sender_id
+#         if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
+#             final_phone = str(raw_phone)
+
+#         # Agent & Settings
+#         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
+#         if not agent_res.data: raise HTTPException(404, "Agent not found")
+#         agent = agent_res.data[0]
+#         settings_data = await fetch_agent_settings(supabase, agent_id)
+#         if settings_data: agent.update(settings_data)
+
+#         # Content Extraction
+#         try:
+#             message_text, msg_type, media_url = await _handle_message_content_for_telegram(content_source, payload.dataType)
+#         except Exception as e:
+#             logger.error(f"❌ Telegram Content Error: {e}")
+#             message_text = ""
+#             msg_type = "text"
+#             media_url = None
+
+#         msg_meta = {
+#             "source_format": "wa_unofficial_json", 
+#             "telegram_message_id": msg_id, 
+#             "telegram_sender_id": sender_id, 
+#             "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None,
+#             "media_url": media_url,
+#             "message_type": msg_type 
+#         }
+        
+#         cust_meta = { "telegram_id": sender_id, "phone": final_phone, "source": "telegram_userbot" }
+
+#         result = await process_webhook_message(agent, "telegram", sender_id, message_text, sender_display_name, msg_meta, cust_meta, supabase)
+        
+#         return WebhookRouteResponse(
+#             success=True, chat_id=result.get("chat_id"), message_id=result.get("message_id"), 
+#             customer_id=result.get("customer_id"), is_new_chat=result.get("is_new_chat", False),
+#             was_reopened=result.get("was_reopened", False), handled_by=result.get("handled_by", "ai"), 
+#             status=result.get("status", "open"), channel="telegram", message=_generate_status_message(result)
+#         )
+        
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"❌ Telegram Userbot Critical: {e}")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+async def process_webhook_message_v2(
+    agent: Dict, channel: str, contact: str, message_content: str,
+    customer_name: Optional[str], message_metadata: Dict, customer_metadata: Dict, supabase
+) -> Dict:
+    """
+    V2 Processor: Uses Local Proxy V2 for AI Responses.
+    Strictly follows legacy logic for Routing, Phone Update, WS Broadcast, and Checks.
+    """
+    agent_id = agent["id"]
+    org_id = agent["organization_id"]
+
+    if agent.get("status") == "inactive":
+        return {"success": False, "status": "dropped_inactive"}
+
+    # 1. ROUTING (Save to DB)
+    router = get_message_router_service(supabase)
+    res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
+    chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
+
+    # 2. UPDATE PHONE
+    if customer_metadata.get("phone") and cust_id:
+        try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
+        except: pass
+
+    # 3. BROADCAST TO FRONTEND
+    if app_settings.WEBSOCKET_ENABLED:
+        try:
+            attachment_data = None
+            if message_metadata.get("media_url"):
+                attachment_data = {
+                    "url": message_metadata["media_url"],
+                    "type": message_metadata.get("message_type", "image"),
+                    "name": "Media Attachment"
+                }
+
+            await get_connection_manager().broadcast_new_message(
+                organization_id=org_id, chat_id=chat_id, message_id=msg_id,
+                customer_id=cust_id, customer_name=customer_name or "Unknown",
+                message_content=message_content, channel=channel, handled_by=res["handled_by"],
+                sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
+                was_reopened=res.get("was_reopened", False), metadata=message_metadata,
+                attachment=attachment_data
+            )
+        except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
+
+    if res.get("is_merged_event"): return res
+
+    # 4. STOP IF HANDLED BY HUMAN
+    if res.get("handled_by") == "human":
+        logger.info(f"🛑 Chat {chat_id} is handled by Human. AI V2 stopped.")
+        return res
+
+    # 5. BUSY CHECK
+    if agent.get("status") == "busy":
+        msg = "Maaf, saat ini kami sedang sibuk."
+        contact_info = {"phone": contact, "telegram_id": contact}
+        await send_auto_reply(supabase, channel, agent_id, contact_info, msg)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel, agent_name=agent["name"])
+        return {**res, "handled_by": "system_busy"}
+
+    # 6. SCHEDULE CHECK
+    schedule = await get_agent_schedule_config(agent_id, supabase)
+    is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
+    if not is_within:
+        msg = "Maaf kami sedang tutup saat ini."
+        # Update metadata to flag out of schedule
+        try: supabase.table("messages").update({"metadata": {**message_metadata, "out_of_schedule": True}}).eq("id", msg_id).execute()
+        except: pass
+        
+        chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
+        cust_data = {"phone": contact, "metadata": {"telegram_id": contact}}
+        await send_message_via_channel(chat_data, cust_data, msg, supabase)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
+        return {**res, "handled_by": "ooo_system"}
+
+    # 7. TRIGGER AI V2 (LOCAL PROXY)
+    # [CRITICAL CHANGE] This calls your new V2 Manager
+    logger.info(f"⚡ Triggering AI V2 (Local Proxy) for Chat {chat_id}")
+    asyncio.create_task(process_dynamic_ai_response_v2(chat_id, msg_id, supabase))
+    
+    return {**res, "handled_by": "ai_v2"}
+
+# ============================================
+# 2. WHATSAPP UNOFFICIAL WEBHOOK (Updated)
+# ============================================
+@router.post(
+    "/wa-unofficial",
+    response_model=WebhookRouteResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Receive WhatsApp message (Unofficial API)"
+)
+async def whatsapp_unofficial_webhook(
+    message: WhatsAppUnofficialWebhookMessage,
+    secret: str = Depends(get_webhook_secret)
+):
+    try:
+        supabase = get_supabase_client()
+        agent_id = message.sessionId
+
+        # System Events
+        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
+        if message.dataType in system_events:
+            logger.info(f"📡 System Event ({message.dataType}) - Ignored")
+            agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
+            if agent_res.data and app_settings.WEBSOCKET_ENABLED:
+                org_id = agent_res.data[0]["organization_id"]
+                await get_connection_manager().broadcast_to_organization(
+                    message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType}},
+                    organization_id=org_id
+                )
+            return JSONResponse(content={"success": True, "status": "processed_system_event"})
+
+        # Structure Check
+        data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
+        data_content = data_wrapper.get("_data", {}) or data_wrapper 
+        whatsapp_id = data_content.get("id", {}).get("id")
+        if not whatsapp_id:
+             whatsapp_id = message.data.get("id", {}).get("id")
+
+        if not whatsapp_id and message.dataType not in ["ready", "authenticated"]:
+             return JSONResponse(content={"status": "ignored", "reason": "malformed_structure"})
+
+        if data_content.get("isStatus") is True or data_content.get("isNotification") is True:
+             return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
+        
+        if data_content.get("id", {}).get("fromMe", False) or data_content.get("fromMe", False):
+             return JSONResponse(content={"status": "ignored", "reason": "from_me"})
+
+        # Content Check
+        msg_body = data_content.get("body", "")
+        has_media = message.dataType == "media" or data_content.get("mimetype") or message.data.get("mimetype")
+
+        if not str(msg_body).strip() and not has_media:
+            return JSONResponse(content={"status": "ignored", "reason": "zero_information_payload"})
+
+        # Dedup
+        dedup_key = f"{whatsapp_id}_{message.dataType}"
+        if dedup_cache.is_duplicate(dedup_key):
+            logger.info(f"⚡ Fast Dedup: Skipping duplicate {dedup_key}")
+            return JSONResponse(content={"status": "ignored", "reason": "duplicate_fast_cache"})
+
+        if message.dataType != "media":
+            existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
+            if existing.data:
+                return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
+
+        # Agent Verify
+        agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
+        if not agent_res.data: 
+            return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
+        agent = agent_res.data[0]
+
+        integration_res = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
+        if not integration_res.data or integration_res.data[0].get("enabled") is False:
+            return JSONResponse(content={"status": "ignored", "reason": "integration_disabled"})
+
+        # Settings & Standardize
+        settings_data = await fetch_agent_settings(supabase, agent_id)
+        if settings_data: agent.update(settings_data)
+
+        standard_message = await _convert_unofficial_to_standard(message)
+        
+        # Zombie Check
+        if standard_message.timestamp:
+            try:
+                msg_time = datetime.fromisoformat(standard_message.timestamp)
+                if msg_time.tzinfo is None: msg_time = msg_time.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
+                if age_seconds > 120:
+                    logger.warning(f"⏳ Ignoring Old Message (Age: {int(age_seconds)}s). Zombie History Sync Protection.")
+                    return JSONResponse(content={"status": "ignored", "reason": "too_old"})
+            except Exception: pass
+
+        # Resolve LID
+        contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
+        sender_name = standard_message.sender_name
+        if sender_name and ("@lid" in sender_name or not sender_name.strip()):
+             sender_name = contact_id
+        if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
+
+        # [CHANGE] Use V2 Processor
+        result = await process_webhook_message_v2(
+            agent=agent,
+            channel="whatsapp",
+            contact=contact_id,
+            message_content=standard_message.message,
+            customer_name=sender_name or contact_id,
+            message_metadata={
+                "whatsapp_message_id": standard_message.message_id,
+                "message_type": standard_message.message_type,
+                "timestamp": standard_message.timestamp,
+                "is_lid": "@lid" in standard_message.phone_number,
+                "media_url": standard_message.media_url,
+                **standard_message.metadata
+            },
+            customer_metadata={"whatsapp_name": sender_name},
+            supabase=supabase
+        )
+
+        return WebhookRouteResponse(
+            success=True, chat_id=result["chat_id"], message_id=result["message_id"],
+            customer_id=result["customer_id"], is_new_chat=result["is_new_chat"],
+            was_reopened=result["was_reopened"], handled_by=result["handled_by"],
+            status=result["status"], channel="whatsapp", message=_generate_status_message(result)
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
+        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+
+
+# ============================================
+# 3. TELEGRAM USERBOT WEBHOOK (Updated)
+# ============================================
 
 @router.post("/telegram-userbot", response_model=WebhookRouteResponse)
 async def telegram_userbot_webhook(
@@ -1372,6 +1707,7 @@ async def telegram_userbot_webhook(
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
         if not agent_res.data: raise HTTPException(404, "Agent not found")
         agent = agent_res.data[0]
+        
         settings_data = await fetch_agent_settings(supabase, agent_id)
         if settings_data: agent.update(settings_data)
 
@@ -1395,12 +1731,22 @@ async def telegram_userbot_webhook(
         
         cust_meta = { "telegram_id": sender_id, "phone": final_phone, "source": "telegram_userbot" }
 
-        result = await process_webhook_message(agent, "telegram", sender_id, message_text, sender_display_name, msg_meta, cust_meta, supabase)
+        # [CHANGE] Use V2 Processor
+        result = await process_webhook_message_v2(
+            agent=agent, 
+            channel="telegram", 
+            contact=sender_id, 
+            message_content=message_text, 
+            customer_name=sender_display_name, 
+            message_metadata=msg_meta, 
+            customer_metadata=cust_meta, 
+            supabase=supabase
+        )
         
         return WebhookRouteResponse(
             success=True, chat_id=result.get("chat_id"), message_id=result.get("message_id"), 
             customer_id=result.get("customer_id"), is_new_chat=result.get("is_new_chat", False),
-            was_reopened=result.get("was_reopened", False), handled_by=result.get("handled_by", "ai"), 
+            was_reopened=result.get("was_reopened", False), handled_by=result.get("handled_by", "ai_v2"), 
             status=result.get("status", "open"), channel="telegram", message=_generate_status_message(result)
         )
         
@@ -1410,37 +1756,7 @@ async def telegram_userbot_webhook(
         logger.error(f"❌ Telegram Userbot Critical: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def _handle_message_content_for_telegram(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
-    """Safe Content Handler for Telegram"""
-    content = ""
-    msg_type = "text"
-    media_url = None
-    
-    if data_type == "media":
-        base64_data = message_data.get("data") or message_data.get("body")
-        if not base64_data: raise ValueError("Media data missing")
 
-        mime = message_data.get("mimetype", "application/octet-stream")
-        content = message_data.get("caption", "")
-
-        if "image" in mime: msg_type = "image"
-        elif "video" in mime: msg_type = "video"
-        elif "audio" in mime: msg_type = "audio"
-        elif "pdf" in mime: msg_type = "document"
-        else: msg_type = "file"
-
-        ext = "bin"
-        if "/" in mime: ext = mime.split("/")[-1].replace("jpeg", "jpg")
-        
-        media_url = await _upload_media_to_supabase(base64_data, mime, ext)
-    else:
-        # Text
-        data_wrapper = message_data.get("message", {}) or {}
-        data_content = data_wrapper.get("_data", {}) or data_wrapper
-        content = data_content.get("body", "")
-        msg_type = "text"
-
-    return content, msg_type, media_url
 
 
 
