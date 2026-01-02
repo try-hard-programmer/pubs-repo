@@ -1449,7 +1449,6 @@ async def _handle_message_content_for_telegram(message_data: dict, data_type: st
 
 
 
-
 async def process_webhook_message_v2(
     agent: Dict, channel: str, contact: str, message_content: str,
     customer_name: Optional[str], message_metadata: Dict, customer_metadata: Dict, supabase
@@ -1515,7 +1514,6 @@ async def process_webhook_message_v2(
     is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
     if not is_within:
         msg = "Maaf kami sedang tutup saat ini."
-        # Update metadata to flag out of schedule
         try: supabase.table("messages").update({"metadata": {**message_metadata, "out_of_schedule": True}}).eq("id", msg_id).execute()
         except: pass
         
@@ -1525,12 +1523,54 @@ async def process_webhook_message_v2(
         await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
         return {**res, "handled_by": "ooo_system"}
 
-    # 7. TRIGGER AI V2 (LOCAL PROXY)
-    # [CRITICAL CHANGE] This calls your new V2 Manager
-    logger.info(f"⚡ Triggering AI V2 (Local Proxy) for Chat {chat_id}")
-    asyncio.create_task(process_dynamic_ai_response_v2(chat_id, msg_id, supabase))
+    # 7. INTELLIGENCE (AI GUARD V2)
+    prio_str = "medium" # Default priority
     
-    return {**res, "handled_by": "ai_v2"}
+    ticket_config = agent.get("ticketing_config") or {}
+    if isinstance(ticket_config, str):
+        try: ticket_config = json.loads(ticket_config)
+        except: ticket_config = {}
+
+    should_trigger_ai = True
+
+    if ticket_config.get("enabled"):
+        # Predict intent
+        should_ticket, pred_cat, prio_str, conf, reason, ticket_title = ml_guard.predict(message_content)
+        
+        # STOP IF GREETING / LOW PRIORITY
+        if prio_str == "low":
+            logger.info(f"🛡️ Guard V2: Low Priority ({reason}). Sending Greeting & Stopping AI.")
+            
+            # Resolve ID for sending (LID fix)
+            resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
+            
+            # Display Name
+            display_name = customer_name or 'Kak'
+            if "@lid" in str(display_name) or "User" in str(display_name):
+                display_name = str(resolved_contact).split("@")[0]
+
+            greeting_msg = (
+                f"Halo {display_name}! 👋\n\n"
+                "Pesan Anda telah kami terima melalui platform Syntra.\n"
+                "Silakan jelaskan permasalahan yang Anda alami secara lebih rinci agar kami dapat membantu Anda dengan lebih baik."
+            )
+            chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
+            cust_data = {"phone": resolved_contact, "metadata": {"telegram_id": resolved_contact}}
+            
+            await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
+            await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel, agent_name=agent["name"])
+            
+            should_trigger_ai = False
+            return {**res, "handled_by": "system_greeting"}
+
+    # 8. TRIGGER AI V2 (LOCAL PROXY)
+    if should_trigger_ai:
+        logger.info(f"⚡ Triggering AI V2 (Local Proxy) for Chat {chat_id} [Prio: {prio_str}]")
+        # [CHANGED] Passing prio_str to the service so the Agent knows the urgency
+        asyncio.create_task(process_dynamic_ai_response_v2(chat_id, msg_id, supabase, priority=prio_str))
+        return {**res, "handled_by": "ai_v2"}
+    
+    return res
 
 # ============================================
 # 2. WHATSAPP UNOFFICIAL WEBHOOK (Updated)

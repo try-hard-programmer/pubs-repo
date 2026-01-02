@@ -62,8 +62,7 @@ class DynamicCRMAgentV2:
                 "messages": messages,
                 "category": category,   # [KEPT]
                 "nameUser": name_user,  # [KEPT]
-                "temperature": 0.7      # Optional
-                # [REMOVED] "model" 
+                "temperature": 0.7      # Optional  
             }
 
             # 4. Send to Proxy V2 (No SSL, No Auth)
@@ -78,7 +77,7 @@ class DynamicCRMAgentV2:
                     if response.status != 200:
                         error_text = await response.text()
                         logger.error(f"❌ Speaker V2 Error {response.status}: {error_text}")
-                        return "Maaf, saya sedang istirahat sebentar. (Proxy Error)"
+                        return "Maaf, saya sedang istirahat sebentar."
                     
                     result = await response.json()
                     

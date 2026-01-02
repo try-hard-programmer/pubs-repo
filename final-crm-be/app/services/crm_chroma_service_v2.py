@@ -34,7 +34,7 @@ class LocalProxyEmbeddingFunction(EmbeddingFunction):
             return [item["embedding"] for item in data["data"]]
         except Exception as e:
             logger.error(f"❌ V2 Embedding Failed: {e}")
-            return [] # Fail safe return empty
+            raise Exception(f"Embedding Service Unavailable: {e}")
 
 # --- SERVICE ---
 class CRMChromaServiceV2:
@@ -105,7 +105,11 @@ class CRMChromaServiceV2:
             return ""
 
         except Exception as e:
-            logger.warning(f"⚠️ V2 Retrieval Error: {e}")
+            # [FIX] Gracefully handle the unavailability
+            if "Embedding Service Unavailable" in str(e) or "503" in str(e):
+                logger.warning(f"⚠️ RAG Skipped: Embedding Service Offline.")
+            else:
+                logger.warning(f"⚠️ V2 Retrieval Error: {e}")
             return ""
 
 # Singleton
