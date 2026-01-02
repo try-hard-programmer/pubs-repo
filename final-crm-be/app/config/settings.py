@@ -19,10 +19,6 @@ class Settings:
     OPENAI_MODEL: str = "text-embedding-3-large"
     GPT_MODEL: str = "gpt-3.5-turbo"
 
-    # [NEW] Proxy Configuration
-    PROXY_BASE_URL: str = os.getenv("PROXY_BASE_URL", "https://proxy.aigent.id/v1/chat/completions")
-    PLATFORM_KEY: str = os.getenv("PLATFORM_KEY", "")
-
     # Whisper Configuration (deprecated - now using external API)
     WHISPER_MODEL_NAME: str = os.getenv("WHISPER_MODEL_NAME", "large-v3")
 
