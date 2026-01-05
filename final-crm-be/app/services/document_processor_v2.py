@@ -21,8 +21,8 @@ from unstructured.partition.md import partition_md
 from unstructured.partition.pptx import partition_pptx
 from unstructured.partition.ppt import partition_ppt
 from unstructured.documents.elements import Text, Element
-
 from app.utils.text_processing import elements_to_clean_text
+from app.config import settings
 
 if TYPE_CHECKING:
     from app.services.storage_service import StorageService
@@ -36,7 +36,7 @@ class DocumentProcessorV2:
         self.logger.info("📦 Using Document Processor V2 (HTTP Localhost)")
 
         # [CHANGE] http instead of https
-        self.proxy_base_url = "http://localhost:6657/v2"
+        self.proxy_base_url = settings.PROXY_BASE_URL.rstrip("/")
         
         self.logger.info(f"🔗 V2 Proxy Target: {self.proxy_base_url}")
 

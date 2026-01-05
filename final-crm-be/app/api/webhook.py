@@ -1455,7 +1455,7 @@ async def process_webhook_message_v2(
 ) -> Dict:
     """
     V2 Processor: Uses Local Proxy V2 for AI Responses.
-    Strictly follows legacy logic for Routing, Phone Update, WS Broadcast, and Checks.
+    - [FIX] FORCE WA HIGH-RES: Polls DB to capture final image URL before broadcasting.
     """
     agent_id = agent["id"]
     org_id = agent["organization_id"]
@@ -1463,7 +1463,7 @@ async def process_webhook_message_v2(
     if agent.get("status") == "inactive":
         return {"success": False, "status": "dropped_inactive"}
 
-    # 1. ROUTING (Save to DB)
+    # 1. ROUTING & STORAGE
     router = get_message_router_service(supabase)
     res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
     chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
@@ -1473,14 +1473,40 @@ async def process_webhook_message_v2(
         try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
         except: pass
 
-    # 3. BROADCAST TO FRONTEND
+    # =========================================================================
+    # 3. BROADCAST TO FRONTEND (THE HIGH-RES FIX)
+    # =========================================================================
     if app_settings.WEBSOCKET_ENABLED:
         try:
+            fresh_metadata = message_metadata
+            
+            # [LOGIC] If WhatsApp Media -> Wait for High-Res (Max 3s)
+            if channel == "whatsapp" and message_metadata.get("message_type") in ["image", "video", "document"]:
+                initial_url = message_metadata.get("media_url")
+                logger.info(f"⏳ [WA-FIX] Waiting for High-Res Media for msg {msg_id}...")
+                
+                for attempt in range(6): # 6 attempts x 0.5s = 3 Seconds Max
+                    await asyncio.sleep(0.5) 
+                    try:
+                        # Fetch latest DB state
+                        msg_res = supabase.table("messages").select("metadata").eq("id", msg_id).single().execute()
+                        if msg_res.data and msg_res.data.get("metadata"):
+                            db_meta = msg_res.data["metadata"]
+                            
+                            # Check if URL changed (Thumbnail -> HighRes) OR if we just found a URL where there was none
+                            if db_meta.get("media_url") and db_meta.get("media_url") != initial_url:
+                                fresh_metadata = db_meta
+                                logger.info(f"✅ [WA-FIX] High-Res URL Captured! (Attempt {attempt+1})")
+                                break
+                    except Exception as poll_error:
+                        logger.debug(f"⚠️ [WA-FIX] Poll error: {poll_error}")
+
+            # Construct Attachment with Final URL
             attachment_data = None
-            if message_metadata.get("media_url"):
+            if fresh_metadata.get("media_url"):
                 attachment_data = {
-                    "url": message_metadata["media_url"],
-                    "type": message_metadata.get("message_type", "image"),
+                    "url": fresh_metadata["media_url"], 
+                    "type": fresh_metadata.get("message_type", "image"),
                     "name": "Media Attachment"
                 }
 
@@ -1489,7 +1515,8 @@ async def process_webhook_message_v2(
                 customer_id=cust_id, customer_name=customer_name or "Unknown",
                 message_content=message_content, channel=channel, handled_by=res["handled_by"],
                 sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
-                was_reopened=res.get("was_reopened", False), metadata=message_metadata,
+                was_reopened=res.get("was_reopened", False), 
+                metadata=fresh_metadata, # Sends the High-Res version
                 attachment=attachment_data
             )
         except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
@@ -1509,42 +1536,90 @@ async def process_webhook_message_v2(
         await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel, agent_name=agent["name"])
         return {**res, "handled_by": "system_busy"}
 
-    # 6. SCHEDULE CHECK
+    # ACTIVE TICKET CHECK
+    active_ticket = None
+    try:
+        ticket_query = supabase.table("tickets").select("id, ticket_number, assigned_agent_id, priority").eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
+        if ticket_query.data:
+            active_ticket = ticket_query.data[0]
+            if active_ticket.get("assigned_agent_id"):
+                return {**res, "handled_by": "human_ticket"}
+    except Exception as e:
+        logger.warning(f"⚠️ Ticket check failed: {e}")
+
+    # SCHEDULE CHECK
     schedule = await get_agent_schedule_config(agent_id, supabase)
     is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
     if not is_within:
         msg = "Maaf kami sedang tutup saat ini."
         try: supabase.table("messages").update({"metadata": {**message_metadata, "out_of_schedule": True}}).eq("id", msg_id).execute()
         except: pass
-        
         chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
         cust_data = {"phone": contact, "metadata": {"telegram_id": contact}}
         await send_message_via_channel(chat_data, cust_data, msg, supabase)
         await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
         return {**res, "handled_by": "ooo_system"}
 
-    # 7. INTELLIGENCE (AI GUARD V2)
-    prio_str = "medium" # Default priority
-    
+    # =========================================================================
+    # 5. INTELLIGENCE V2
+    # =========================================================================
     ticket_config = agent.get("ticketing_config") or {}
     if isinstance(ticket_config, str):
         try: ticket_config = json.loads(ticket_config)
         except: ticket_config = {}
 
     should_trigger_ai = True
+    prio_str = "medium"
 
-    if ticket_config.get("enabled"):
-        # Predict intent
+    # --- LOGIC BRANCH A: TICKET EXISTS ---
+    if active_ticket:
+        ticket_prio = str(active_ticket.get("priority", "medium")).lower()
+        logger.info(f"🎫 Active Ticket Found: {active_ticket['ticket_number']} (Current Prio: {ticket_prio})")
+
+        if ticket_prio == "low":
+            logger.info("🔍 Re-evaluating LOW priority ticket with new message...")
+            should_ticket, pred_cat, new_prio_str, conf, reason, _ = ml_guard.predict(message_content)
+            
+            if new_prio_str in ["high", "urgent", "medium"]:
+                logger.info(f"🚀 UPGRADING Ticket {active_ticket['ticket_number']} to {new_prio_str.upper()}")
+                try:
+                    from app.models.ticket import TicketUpdate, TicketPriority
+                    try: new_prio_enum = TicketPriority(new_prio_str)
+                    except: new_prio_enum = TicketPriority.MEDIUM
+
+                    ticket_svc = get_ticket_service()
+                    await ticket_svc.update_ticket(
+                        ticket_id=active_ticket["id"],
+                        update_data=TicketUpdate(priority=new_prio_enum),
+                        actor_id="system_guard_v2",
+                        actor_type=ActorType.SYSTEM
+                    )
+                    prio_str = new_prio_str
+                    should_trigger_ai = True 
+                except Exception as e:
+                    logger.error(f"❌ Failed to upgrade ticket priority: {e}")
+                    should_trigger_ai = False
+            else:
+                logger.info("📉 New message is still Low Priority. Keeping silent.")
+                should_trigger_ai = False
+                return {**res, "handled_by": "skipped_low_priority_ticket"}
+        else:
+            prio_str = ticket_prio
+            should_trigger_ai = True
+
+    # --- LOGIC BRANCH B: NO TICKET ---
+    elif ticket_config.get("enabled"):
         should_ticket, pred_cat, prio_str, conf, reason, ticket_title = ml_guard.predict(message_content)
-        
-        # STOP IF GREETING / LOW PRIORITY
+
+        # Force Category 'General' if unknown
+        if not pred_cat or str(pred_cat).lower() == "unknown":
+            pred_cat = "General"
+
+        # [CASE 1] LOW PRIORITY
         if prio_str == "low":
             logger.info(f"🛡️ Guard V2: Low Priority ({reason}). Sending Greeting & Stopping AI.")
-            
-            # Resolve ID for sending (LID fix)
             resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
             
-            # Display Name
             display_name = customer_name or 'Kak'
             if "@lid" in str(display_name) or "User" in str(display_name):
                 display_name = str(resolved_contact).split("@")[0]
@@ -1560,13 +1635,48 @@ async def process_webhook_message_v2(
             await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
             await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel, agent_name=agent["name"])
             
+            if ticket_config.get("autoCreateTicket"):
+                try: 
+                    try: final_prio = TicketPriority.LOW
+                    except: final_prio = "low"
+                    ticket_svc = get_ticket_service()
+                    ticket_data = TicketCreate(
+                        chat_id=chat_id, customer_id=cust_id,
+                        title=f"[LOW] {pred_cat.upper()} - {message_content[:40]}",
+                        description=f"Message: {message_content}\n\n[Auto-created by Guard V2 - Low Priority]",
+                        priority=final_prio, category=pred_cat
+                    )
+                    await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
+                except Exception as e: logger.error(f"❌ Failed to create low-prio ticket: {e}")
+
             should_trigger_ai = False
             return {**res, "handled_by": "system_greeting"}
 
-    # 8. TRIGGER AI V2 (LOCAL PROXY)
+        # [CASE 2] MED/HIGH PRIORITY
+        elif should_ticket:
+            logger.info(f"🎫 Guard V2: Ticket Intent Detected ({pred_cat}) - Prio: {prio_str}")
+            if ticket_config.get("autoCreateTicket"):
+                try:
+                    try: final_prio = TicketPriority(prio_str)
+                    except: final_prio = TicketPriority.MEDIUM
+                    
+                    final_cat = pred_cat
+                    if ticket_config.get("categories") and pred_cat not in ticket_config["categories"]:
+                         final_cat = ticket_config["categories"][0] if ticket_config["categories"] else "General"
+
+                    ticket_svc = get_ticket_service()
+                    ticket_data = TicketCreate(
+                        chat_id=chat_id, customer_id=cust_id,
+                        title=ticket_title or f"[{prio_str.upper()}] {final_cat} - {message_content[:40]}",
+                        description=f"Message: {message_content}\n\n[Auto-created by Guard V2]",
+                        priority=final_prio, category=final_cat
+                    )
+                    await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
+                except Exception as e: logger.error(f"❌ Failed to create auto-ticket in V2: {e}")
+
+    # 6. TRIGGER AI V2
     if should_trigger_ai:
         logger.info(f"⚡ Triggering AI V2 (Local Proxy) for Chat {chat_id} [Prio: {prio_str}]")
-        # [CHANGED] Passing prio_str to the service so the Agent knows the urgency
         asyncio.create_task(process_dynamic_ai_response_v2(chat_id, msg_id, supabase, priority=prio_str))
         return {**res, "handled_by": "ai_v2"}
     

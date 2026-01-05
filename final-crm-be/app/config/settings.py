@@ -19,6 +19,9 @@ class Settings:
     OPENAI_MODEL: str = "text-embedding-3-large"
     GPT_MODEL: str = "gpt-3.5-turbo"
 
+    # Centralized URL for the Local V2 Proxy Service
+    PROXY_BASE_URL: str = os.getenv("PROXY_BASE_URL", "http://localhost:6657/v2")
+
     # Whisper Configuration (deprecated - now using external API)
     WHISPER_MODEL_NAME: str = os.getenv("WHISPER_MODEL_NAME", "large-v3")
 

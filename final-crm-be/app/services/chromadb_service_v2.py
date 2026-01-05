@@ -22,8 +22,8 @@ class LocalProxyEmbeddingFunction(EmbeddingFunction):
     Custom Embedding Function that hits your Local Proxy directly via HTTP.
     """
     def __init__(self):
-        # [CHANGE] http instead of https
-        self.api_url = "http://localhost:6657/v2/embeddings"
+        base_url = settings.PROXY_BASE_URL.rstrip("/")
+        self.api_url = f"{base_url}/embeddings"
         logger.info(f"🧠 Initialized LocalProxyEmbeddingFunction -> {self.api_url}")
 
     def __call__(self, input: Documents) -> Embeddings:

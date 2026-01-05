@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 # --- CUSTOM V2 EMBEDDING FUNCTION (HTTP / NO MODEL) ---
 class LocalProxyEmbeddingFunction(EmbeddingFunction):
     def __init__(self):
-        self.api_url = "http://localhost:6657/v2/embeddings"
+        base_url = settings.PROXY_BASE_URL.rstrip("/")
+        self.api_url = f"{base_url}/embeddings"
 
     def __call__(self, input: Documents) -> Embeddings:
         try:

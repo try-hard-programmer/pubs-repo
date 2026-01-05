@@ -10,13 +10,14 @@ import logging
 import json
 import aiohttp
 from typing import List, Dict, Any
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
 class DynamicCRMAgentV2:
     def __init__(self):
-        # [HARDCODED] V2 Chat Endpoint
-        self.proxy_url = "http://localhost:6657/v2/chat/completions"
+        base_url = settings.PROXY_BASE_URL.rstrip("/")
+        self.proxy_url = f"{base_url}/chat"
 
     async def process_message(
         self,
@@ -90,7 +91,7 @@ class DynamicCRMAgentV2:
 
         except Exception as e:
             logger.error(f"❌ Speaker V2 Exception: {e}")
-            return "Maaf, terjadi kesalahan koneksi."
+            return "Maaf, Saat ini terjadi gangguan pada sistem kami, mohon untuk menunggu, terima kasih atas kesabarannya."
 
     def _parse_json(self, data: Any) -> Dict:
         if isinstance(data, dict): return data
