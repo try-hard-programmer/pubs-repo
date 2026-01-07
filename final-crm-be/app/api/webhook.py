@@ -41,6 +41,7 @@ from app.services.ticket_service import get_ticket_service
 from app.api.crm_chats import send_message_via_channel
 from app.utils.ml_guard import ml_guard
 from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
+from app.services.llm_queue_service import get_llm_queue
 
 logger = logging.getLogger(__name__)
 
@@ -1677,9 +1678,16 @@ async def process_webhook_message_v2(
 
     # 6. TRIGGER AI V2
     if should_trigger_ai:
-        logger.info(f"⚡ Triggering AI V2 (Local Proxy) for Chat {chat_id} [Prio: {prio_str}]")
-        asyncio.create_task(process_dynamic_ai_response_v2(chat_id, msg_id, supabase, priority=prio_str))
-        return {**res, "handled_by": "ai_v2"}
+        logger.info(f"⚡ Enqueueing AI V2 for Chat {chat_id} [Prio: {prio_str}]")
+        queue_svc = get_llm_queue()
+        await queue_svc.enqueue(
+            chat_id=chat_id, 
+            message_id=msg_id, 
+            supabase_client=supabase, 
+            priority=prio_str
+        )
+        
+        return {**res, "handled_by": "ai_v2_queued"}
     
     return res
 

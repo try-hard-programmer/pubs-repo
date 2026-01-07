@@ -29,10 +29,11 @@ class DynamicCRMAgentV2:
         customer_message: str,
         chat_history: List[Dict[str, Any]],
         agent_settings: Dict[str, Any],
+        organization_id: str, # [NEW] Required for Proxy Credit Tracking
         rag_context: str = "",
         category: str = "general",
         name_user: str = "Customer"
-    ) -> str:
+    ) -> Dict[str, Any]: # [CHANGED] Returns Dict with metadata
         try:
             persona = self._parse_json(agent_settings.get("persona_config", {}))
             advanced = self._parse_json(agent_settings.get("advanced_config", {}))
@@ -44,7 +45,6 @@ class DynamicCRMAgentV2:
             custom_instructions = persona.get("customInstructions", "")
 
             # B. Advanced Settings
-            # Map text temperature to float
             temp_setting = advanced.get("temperature", "balanced")
             temp_map = {"precise": 0.1, "balanced": 0.5, "creative": 0.8}
             temperature = temp_map.get(temp_setting, 0.5)
@@ -79,7 +79,6 @@ class DynamicCRMAgentV2:
             # --- BUILD MESSAGE CHAIN ---
             messages = [{"role": "system", "content": system_prompt}]
             
-            # History already limited by Service, but good to check emptiness
             for msg in chat_history:
                 role = "assistant" if msg.get("sender_type") == "ai" else "user"
                 content = msg.get("content") or msg.get("message_content", "")
@@ -93,7 +92,8 @@ class DynamicCRMAgentV2:
                 "messages": messages,
                 "category": category,
                 "nameUser": name_user,
-                "temperature": temperature
+                "temperature": temperature,
+                "organization_id": organization_id # [NEW] Pass ID for billing
             }
 
             async with aiohttp.ClientSession() as session:
@@ -107,18 +107,33 @@ class DynamicCRMAgentV2:
                     if response.status != 200:
                         error_text = await response.text()
                         logger.error(f"❌ Speaker V2 Error {response.status}: {error_text}")
-                        return "Maaf, saya sedang istirahat sebentar."
+                        return {
+                            "content": "Maaf, saya sedang istirahat sebentar.",
+                            "metadata": {},
+                            "usage": {}
+                        }
                     
                     result = await response.json()
                     
                     try:
-                        return result["choices"][0]["message"]["content"]
+                        content = result["choices"][0]["message"]["content"]
                     except (KeyError, IndexError):
-                        return result.get("reply") or result.get("content") or "Error parsing response."
+                        content = result.get("reply") or result.get("content") or "Error parsing response."
+
+                    # [CHANGED] Return full object to expose metadata
+                    return {
+                        "content": content,
+                        "metadata": result.get("metadata", {}),
+                        "usage": result.get("usage", {})
+                    }
 
         except Exception as e:
             logger.error(f"❌ Speaker V2 Exception: {e}")
-            return "Maaf, sistem sedang sibuk. Mohon coba lagi nanti."
+            return {
+                "content": "Maaf, sistem sedang sibuk. Mohon coba lagi nanti.",
+                "metadata": {},
+                "usage": {}
+            }
 
 # Singleton
 _dynamic_crm_agent_v2 = None
