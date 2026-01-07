@@ -967,107 +967,191 @@ async def get_agent_knowledge_documents(
 # 		)
 
 
+@router.post(
+    "/{agent_id}/knowledge-documents",
+    response_model=KnowledgeDocument,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload knowledge document (V2)",
+    description="Upload knowledge using V2 Processor (Proxy Vision/Audio + Local Text)"
+)
+async def create_knowledge_document(
+    agent_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    [V2 IMPLEMENTATION]
+    Upload a knowledge document for an agent.
+    """
+    from uuid import uuid4
+    from app.services.storage_service import StorageService
+    from app.services.document_processor_v2 import DocumentProcessorV2
+    from app.services.chromadb_service_v2 import ChromaDBServiceV2
+    from app.utils.chunking import split_into_chunks
+
+    file_id = None
+    storage_uploaded = False
+
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # Verify agent
+        agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not agent_check.data:
+            raise HTTPException(404, detail=f"Agent with ID {agent_id} not found")
+
+        # Read file
+        file_content = await file.read()
+        filename = file.filename
+        file_size_kb = len(file_content) // 1024
+        file_type = filename.rsplit(".", 1)[-1].upper() if "." in filename else "UNKNOWN"
+        file_id = str(uuid4())
+
+        logger.info(f"📤 [V2] Uploading knowledge document for agent {agent_id}: {filename} ({file_size_kb} KB)")
+
+        # Step 1: Upload to Supabase
+        agent_bucket_name = f"agent_{agent_id}"
+        storage_service = StorageService(supabase)
+
+        try:
+            buckets = supabase.storage.list_buckets()
+            if not any(b.name == agent_bucket_name for b in buckets):
+                supabase.storage.create_bucket(agent_bucket_name, options={"public": False})
+        except Exception:
+            pass # Proceed if bucket exists or error ignored
+
+        try:
+            supabase.storage.from_(agent_bucket_name).upload(
+                path=file_id,
+                file=file_content,
+                file_options={"content-type": file.content_type, "upsert": "false"}
+            )
+            storage_uploaded = True
+        except Exception as e:
+            raise HTTPException(500, detail=f"File upload failed: {str(e)}")
+
+        # Step 2: Process document
+        doc_processor = DocumentProcessorV2(storage_service)
+        try:
+            clean_text, _ = doc_processor.process_document(
+                content=file_content,
+                filename=filename,
+                folder_path=None,
+                organization_id=organization_id,
+                file_id=file_id
+            )
+            if not clean_text: raise ValueError("No text extracted")
+        except Exception as e:
+            if storage_uploaded: supabase.storage.from_(agent_bucket_name).remove([file_id])
+            raise HTTPException(500, detail=f"Document processing failed: {str(e)}")
+
+        # Step 3: Embed & Store (V2 Collection)
+        chromadb_service = ChromaDBServiceV2()
+        agent_collection_name = f"agent_{agent_id}_v2"
+
+        try:
+            chunks = split_into_chunks(text=clean_text, size=512, overlap=50)
+            
+            try:
+                collection = chromadb_service.client.get_collection(
+                    name=agent_collection_name,
+                    embedding_function=chromadb_service.embedding_function
+                )
+            except:
+                collection = chromadb_service.client.create_collection(
+                    name=agent_collection_name,
+                    embedding_function=chromadb_service.embedding_function,
+                    metadata={"agent_id": agent_id}
+                )
+
+            chunk_ids = [f"{file_id}-{i}" for i in range(len(chunks))]
+            chunk_metas = [{
+                "file_id": file_id,
+                "filename": filename,
+                "chunk_index": i,
+                "agent_id": agent_id,
+                "processor": "v2"
+            } for i in range(len(chunks))]
+
+            collection.add(documents=chunks, ids=chunk_ids, metadatas=chunk_metas)
+
+        except Exception as e:
+            if storage_uploaded: supabase.storage.from_(agent_bucket_name).remove([file_id])
+            raise HTTPException(500, detail=f"Embedding failed: {str(e)}")
+
+        # Step 4: Save Metadata
+        doc_data = {
+            "agent_id": agent_id,
+            "name": filename,
+            "file_url": f"storage://{agent_bucket_name}/{file_id}",
+            "file_type": file_type,
+            "file_size_kb": file_size_kb,
+            "metadata": {"file_id": file_id, "bucket": agent_bucket_name, "processor_version": "v2"}
+        }
+        response = supabase.table("knowledge_documents").insert(doc_data).execute()
+        
+        return KnowledgeDocument(**response.data[0])
+
+    except HTTPException: raise
+    except Exception as e:
+        if storage_uploaded and file_id:
+             supabase.storage.from_(f"agent_{agent_id}").remove([file_id])
+        raise HTTPException(500, detail=str(e))
+
 @router.delete(
-	"/{agent_id}/knowledge-documents/{doc_id}",
-	status_code=status.HTTP_204_NO_CONTENT,
-	summary="Delete knowledge document",
-	description="Delete a knowledge document from an agent, including storage and embeddings"
+    "/{agent_id}/knowledge-documents/{doc_id}",
+    status_code=status.HTTP_204_NO_CONTENT
 )
 async def delete_knowledge_document(
-		agent_id: str,
-		doc_id: str,
-		current_user: User = Depends(get_current_user)
+    agent_id: str,
+    doc_id: str,
+    current_user: User = Depends(get_current_user)
 ):
-	"""
-	Delete a knowledge document completely.
+    from app.services.chromadb_service import ChromaDBService
+    from app.services.chromadb_service_v2 import ChromaDBServiceV2
 
-	Process flow:
-	1. Retrieve document metadata to get file_id and bucket info
-	2. Delete embeddings from ChromaDB (collection: agent_{agent_id})
-	3. Delete file from Supabase Storage (bucket: agent_{agent_id})
-	4. Delete metadata from database
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
 
-	Args:
-		agent_id: Agent UUID
-		doc_id: Document UUID
-		current_user: Current authenticated user
-	"""
-	from app.services.chromadb_service import ChromaDBService
+        # Check Agent
+        if not supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute().data:
+            raise HTTPException(404, detail="Agent not found")
 
-	try:
-		organization_id = await get_user_organization_id(current_user)
-		supabase = get_supabase_client()
+        # Get Metadata
+        doc = supabase.table("knowledge_documents").select("*").eq("id", doc_id).execute()
+        if not doc.data: raise HTTPException(404, detail="Document not found")
+        
+        meta = doc.data[0].get("metadata", {})
+        file_id = meta.get("file_id")
+        version = meta.get("processor_version", "v1")
 
-		# Verify agent belongs to organization
-		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
-		                                                                          organization_id).execute()
+        # Delete Embeddings
+        if file_id:
+            try:
+                if version == "v2":
+                    service = ChromaDBServiceV2()
+                    name = f"agent_{agent_id}_v2"
+                else:
+                    service = ChromaDBService()
+                    name = f"agent_{agent_id}"
+                
+                col = service.client.get_collection(name=name, embedding_function=service.embedding_function)
+                col.delete(where={"file_id": {"$eq": file_id}})
+            except Exception as e:
+                logger.warning(f"Chroma delete failed: {e}")
 
-		if not agent_check.data:
-			raise HTTPException(
-				status_code=status.HTTP_404_NOT_FOUND,
-				detail=f"Agent with ID {agent_id} not found"
-			)
+        # Delete Storage & DB Record
+        if file_id:
+            supabase.storage.from_(f"agent_{agent_id}").remove([file_id])
+        
+        supabase.table("knowledge_documents").delete().eq("id", doc_id).execute()
+        return None
 
-		# Get document metadata to retrieve file_id and bucket info
-		doc_response = supabase.table("knowledge_documents").select("*").eq("id", doc_id).eq("agent_id",
-		                                                                                     agent_id).execute()
-
-		if not doc_response.data:
-			raise HTTPException(
-				status_code=status.HTTP_404_NOT_FOUND,
-				detail=f"Knowledge document with ID {doc_id} not found for agent {agent_id}"
-			)
-
-		document = doc_response.data[0]
-		metadata = document.get("metadata", {})
-		file_id = metadata.get("file_id")
-		agent_bucket_name = f"agent_{agent_id}"
-		agent_collection_name = f"agent_{agent_id}"
-
-		logger.info(f"🗑️  Deleting knowledge document {doc_id} for agent {agent_id}")
-
-		# Step 1: Delete embeddings from ChromaDB
-		if file_id:
-			try:
-				chromadb_service = ChromaDBService()
-				collection = chromadb_service.client.get_collection(
-					name=agent_collection_name,
-					embedding_function=chromadb_service.embedding_function
-				)
-
-				# Delete all chunks with matching file_id
-				collection.delete(where={"file_id": {"$eq": file_id}})
-				logger.info(f"✅ Deleted embeddings from ChromaDB collection: {agent_collection_name}")
-			except Exception as e:
-				# Log but don't fail if ChromaDB deletion fails
-				logger.warning(f"Failed to delete from ChromaDB: {e}")
-
-		# Step 2: Delete file from Supabase Storage
-		if file_id:
-			try:
-				supabase.storage.from_(agent_bucket_name).remove([file_id])
-				logger.info(f"✅ Deleted file from storage: {agent_bucket_name}/{file_id}")
-			except Exception as e:
-				# Log but don't fail if storage deletion fails
-				logger.warning(f"Failed to delete from storage: {e}")
-
-		# Step 3: Delete metadata from database
-		supabase.table("knowledge_documents").delete().eq("id", doc_id).execute()
-		logger.info(f"✅ Deleted document metadata from database")
-
-		logger.info(
-			f"✅ Knowledge document {doc_id} completely deleted from agent {agent_id} by user {current_user.user_id}")
-
-		return None
-
-	except HTTPException:
-		raise
-	except Exception as e:
-		logger.error(f"Error deleting knowledge document {doc_id}: {e}")
-		raise HTTPException(
-			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail="Failed to delete knowledge document"
-		)
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(500, detail=str(e)) 
 
 
 # ============================================
@@ -1340,7 +1424,8 @@ async def create_knowledge_document(
         # Step 3: Generate embeddings and store in ChromaDB
         logger.info(f"🔄 Generating embeddings for: {filename}")
         chromadb_service = ChromaDBServiceV2()
-        agent_collection_name = f"agent_{agent_id}"
+        # [FIX] Use V2 collection to avoid dimension mismatch (384 vs 1024)
+        agent_collection_name = f"agent_{agent_id}_v2"
 
         try:
             # Split text into chunks

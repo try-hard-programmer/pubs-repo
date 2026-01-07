@@ -619,6 +619,7 @@ async def process_webhook_message(
                 attachment=attachment_data
             )
         except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
+        except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
 
     if res.get("is_merged_event"): return res
 

@@ -62,21 +62,17 @@ class CRMChromaServiceV2:
         except Exception as e:
             logger.warning(f"⚠️ CRM Chroma V2 Connection Failed: {e}")
 
-    def query_context(self, query: str, organization_id: str, top_k: int = 5) -> str:
+    def query_context(self, query: str, agent_id: str, top_k: int = 5) -> str:
         """
-        Retrieves context from agent_{id} collection.
+        Retrieves context from agent_{id}_v2 collection.
         Returns empty string if anything fails (Fail-Safe).
         """
-        if not self.client or not organization_id:
+        if not self.client or not agent_id:
             return ""
 
         try:
-            # In V2, we search the specific AGENT collection or ORG collection
-            # Assuming 'agent_{id}' based on upload logic, but here we ask for organization_id?
-            # Let's stick to org_{id} if that's your retrieval pattern, 
-            # OR agent_{id} if you pass agent_id. 
-            # Based on previous code, it used org_{id}. 
-            collection_name = f"org_{organization_id}" 
+            # [FIX] Point to the V2 Agent Collection where we stored the 1024-dim vectors
+            collection_name = f"agent_{agent_id}_v2"
             
             # Try to get collection
             try:
@@ -87,26 +83,22 @@ class CRMChromaServiceV2:
             except Exception:
                 return "" # No memories yet
 
-            # Query
+            # Query (Removed organization_id filter as collection is already unique to agent)
             results = collection.query(
                 query_texts=[query],
                 n_results=top_k,
-                where={
-                    "$and": [
-                        {"organization_id": {"$eq": organization_id}},
-                        {"is_trashed": {"$eq": False}}
-                    ]
-                }
+                where={"is_trashed": {"$eq": False}} 
             )
 
             documents = results.get("documents", [])
             if documents and len(documents) > 0:
-                return "\n\n".join(documents[0])
+                # Flatten list of lists
+                flat_docs = [doc for sublist in documents for doc in sublist]
+                return "\n\n".join(flat_docs)
             
             return ""
 
         except Exception as e:
-            # [FIX] Gracefully handle the unavailability
             if "Embedding Service Unavailable" in str(e) or "503" in str(e):
                 logger.warning(f"⚠️ RAG Skipped: Embedding Service Offline.")
             else:

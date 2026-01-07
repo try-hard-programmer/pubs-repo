@@ -158,6 +158,14 @@ class AIResponseService:
 
             customer_message = customer_msg_response.data[0].get("content", "")
 
+            if not customer_message or len(str(customer_message).strip()) < 2:
+                logger.info(f"🛡️ Sage Guard: Skipping AI for low text/image/empty content.")
+                return {
+                    "success": True, 
+                    "reason": "sage_guard_skipped", 
+                    "ai_message_id": None
+                }
+            
             logger.info(
                 f"💬 Customer message: "
                 f"{customer_message[:100]}{'...' if len(customer_message) > 100 else ''}"
@@ -219,7 +227,7 @@ class AIResponseService:
                 conn = get_connection_manager()
                 
                 await conn.broadcast_new_message(
-                    organization_id=chat.get("organization_id"),
+                   organization_id=chat.get("organization_id"),
                     chat_id=chat_id,
                     message_id=ai_message_id,
                     customer_id=chat.get("customer_id"),
@@ -230,7 +238,8 @@ class AIResponseService:
                     sender_type="ai",
                     sender_id=chat.get("ai_agent_id") or "ai_agent",
                     is_new_chat=False,
-                    was_reopened=False
+                    was_reopened=False,
+                    metadata=message_data["metadata"]
                 )
             except Exception as ws_error:
                 logger.warning(f"⚠️ WebSocket broadcast failed: {ws_error}")

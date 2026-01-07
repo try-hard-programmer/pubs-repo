@@ -28,11 +28,6 @@ class DynamicAIServiceV2:
         1. Contextualize (DB + RAG)
         2. Generate (LLM Proxy V2)
         3. Deliver (DB + WebSocket + Webhook)
-        
-        Args:
-            chat_id: The UUID of the chat.
-            customer_message_id: The UUID of the user's last message.
-            priority: The urgency/category detected by ML Guard (e.g., 'high', 'medium', 'urgent').
         """
         try:
             logger.info(f"🤖 Manager V2: Processing Chat {chat_id} [Priority: {priority}]")
@@ -43,10 +38,8 @@ class DynamicAIServiceV2:
                 return {"success": False, "reason": "chat_not_found"}
             chat = chat_res.data[0]
             
-            # 2. Fetch Agent Settings (CORRECTED for DB Schema)
+            # 2. Fetch Agent Settings
             agent_id = chat.get("sender_agent_id") 
-            
-            # Fallback: find agent in org if not set on chat
             if not agent_id:
                 agent_res = self.supabase.table("agents").select("id").eq("organization_id", chat["organization_id"]).limit(1).execute()
                 if agent_res.data:
@@ -54,33 +47,34 @@ class DynamicAIServiceV2:
             
             agent_settings = {}
             if agent_id:
-                # [FIX] Fetch from 'agent_settings' TABLE
                 settings_res = self.supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute()
                 if settings_res.data:
                     agent_settings = settings_res.data[0]
-                    # Clean up DB fields so they don't confuse the LLM
                     for k in ["id", "created_at", "updated_at", "agent_id"]:
                         agent_settings.pop(k, None)
 
-            # 3. Get History
-            msgs_res = self.supabase.table("messages").select("*").eq("chat_id", chat_id).order("created_at", desc=True).limit(5).execute()
-            history = msgs_res.data[::-1] 
-
-            # 4. Get User Message
-            # [FIX] Use correct column 'content' (not message_content)
+            # 3. Get User Message
             prompt_res = self.supabase.table("messages").select("content").eq("id", customer_message_id).execute()
             user_prompt = prompt_res.data[0]["content"] if prompt_res.data else ""
 
+            # 4. Get History (DYNAMIC LIMIT)
+            history_limit = 5
+            if isinstance(agent_settings.get("advanced_config"), dict):
+                history_limit = int(agent_settings["advanced_config"].get("historyLimit", 5))
+            
+            msgs_res = self.supabase.table("messages").select("*").eq("chat_id", chat_id).order("created_at", desc=True).limit(history_limit).execute()
+            history = msgs_res.data[::-1] 
+
             # 5. CALL READER V2 (RAG)
+            # [FIX] Pass agent_id to target the correct V2 collection
             context = self.reader.query_context(
                 query=user_prompt, 
-                organization_id=chat["organization_id"]
+                agent_id=agent_id
             )
             if context:
                 logger.info(f"📖 Reader V2 found context ({len(context)} chars)")
 
             # 6. CALL SPEAKER V2 (Generation)
-            # [CHANGE] Passing priority as category
             reply = await self.speaker.process_message(
                 chat_id=chat_id,
                 customer_message=user_prompt,
@@ -92,14 +86,13 @@ class DynamicAIServiceV2:
             )
 
             # 7. Save Response
-            # [FIX] Match 'public.messages' schema (content, metadata)
             ai_msg = {
                 "chat_id": chat_id,
                 "sender_type": "ai",
                 "sender_id": agent_id or "ai_agent_v2", 
-                "content": reply,  # Correct column name
+                "content": reply,
                 "metadata": {
-                    "is_internal": False, # Move extra flags to metadata
+                    "is_internal": False,
                     "model": "v2_proxy_local",
                     "rag_enabled": bool(context),
                     "guard_priority": priority
@@ -109,7 +102,7 @@ class DynamicAIServiceV2:
             res = self.supabase.table("messages").insert(ai_msg).execute()
             ai_message_id = res.data[0]["id"]
 
-            # 8. Broadcast (WS + Webhook)
+            # 8. Broadcast
             await self._broadcast_response(chat, ai_message_id, reply)
 
             return {"success": True, "ai_message_id": ai_message_id}
@@ -119,8 +112,6 @@ class DynamicAIServiceV2:
             return {"success": False, "error": str(e)}
 
     async def _broadcast_response(self, chat, msg_id, content):
-        """Helper to broadcast message to Frontend WebSocket and External Webhooks"""
-        # WebSocket (Frontend)
         try:
             conn = get_connection_manager()
             await conn.broadcast_new_message(
@@ -130,13 +121,15 @@ class DynamicAIServiceV2:
                 customer_id=chat.get("customer_id"),
                 message_content=content,
                 sender_type="ai",
-                # Pass handled_by to ensure UI reflects AI status
-                handled_by="ai" 
+                handled_by="ai",
+                # [FIX] Add missing arguments required by WebSocket service
+                customer_name=chat.get("customer_name", "Unknown"),
+                channel=chat.get("channel", "web"),
+                sender_id=chat.get("ai_agent_id") or "ai_v2"
             )
         except Exception as e:
             logger.warning(f"Broadcast WS error: {e}")
 
-        # Webhook (Userbot/WhatsApp)
         try:
             await self.webhook_service.send_callback(
                 chat=chat,
@@ -147,8 +140,5 @@ class DynamicAIServiceV2:
             logger.warning(f"Broadcast Webhook error: {e}")
 
 async def process_dynamic_ai_response_v2(chat_id: str, msg_id: str, supabase, priority: str = "medium"):
-    """
-    Background Task Wrapper for V2.
-    """
     service = DynamicAIServiceV2(supabase)
     await service.process_and_respond(chat_id, msg_id, priority)

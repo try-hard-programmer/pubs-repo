@@ -198,6 +198,16 @@ class TicketService:
         payload = update_data.model_dump(exclude_unset=True)
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         
+        if "priority" in payload:
+            new_p = str(payload["priority"]).upper()
+            old_p = str(old_ticket.get("priority", "LOW")).upper()
+            
+            # If we are trying to set LOW, but it wasn't LOW before...
+            if new_p == "LOW" and old_p != "LOW":
+                logger.warning(f"🛑 Priority Downgrade Blocked: {old_p} -> {new_p}")
+                del payload["priority"] # Remove priority from update, keeping other changes
+                # Alternatively: raise Exception("Cannot downgrade priority to LOW")
+                
         # --- ROBUST STATUS EXTRACTION ---
         new_status_raw = payload.get("status")
         if new_status_raw is None and getattr(update_data, 'status', None) is not None:
