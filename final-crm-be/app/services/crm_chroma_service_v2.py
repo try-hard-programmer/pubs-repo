@@ -57,19 +57,24 @@ class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
 class CRMChromaServiceV2:
     def __init__(self):
         self.client = chromadb.HttpClient(
-            host=settings.CHROMA_DB_HOST, 
-            port=settings.CHROMA_DB_PORT,
+            host=settings.CHROMADB_HOST, 
+            port=settings.CHROMADB_PORT,
             settings=Settings(allow_reset=True, anonymized_telemetry=False)
         )
-        proxy_url = settings.CRM_EMBEDDING_API_URL or "http://localhost:6657/v2/embeddings"
-        api_key = settings.CRM_EMBEDDING_API_KEY or "dummy-key"
+        
+        default_proxy_url = f"{settings.PROXY_BASE_URL}/embeddings" if hasattr(settings, "PROXY_BASE_URL") else "http://localhost:6657/v2/embeddings"
+        proxy_url = getattr(settings, "CRM_EMBEDDING_API_URL", None) or default_proxy_url
+        
+        # Fallback to OPENAI_API_KEY if CRM_EMBEDDING_API_KEY is missing
+        api_key = getattr(settings, "CRM_EMBEDDING_API_KEY", None) or settings.OPENAI_API_KEY or "dummy-key"
         
         self.embedding_fn = LocalProxyEmbeddingFunction(base_url=proxy_url, api_key=api_key)
         self.credit_service = get_credit_service()
 
     def get_or_create_collection(self, agent_id: str):
+        # [FIX] Append '_v2' (or '_1536') to the name to isolate it from the old 1024-dim collection
         return self.client.get_or_create_collection(
-            name=f"agent_{agent_id}",
+            name=f"agent_{agent_id}_v2", 
             embedding_function=self.embedding_fn
         )
 

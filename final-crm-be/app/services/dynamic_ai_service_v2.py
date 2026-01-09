@@ -42,9 +42,10 @@ class DynamicAIServiceV2:
             # 2. Webhook (WhatsApp/Telegram)
             # We fire and forget this wrapper
             asyncio.create_task(
-                self.webhook_service.send_whatsapp_text(
-                    chat_id=chat["id"],
-                    text=content
+                self.webhook_service.send_callback(
+                    chat=chat,
+                    message_content=content,
+                    supabase=self.supabase
                 )
             )
         except Exception as e:
@@ -117,9 +118,7 @@ class DynamicAIServiceV2:
             if should_rag:
                 try:
                     # We wrap this in try-except so a 401 error doesn't kill the whole process
-                    context = await asyncio.to_thread(
-                        lambda: self.reader.query_context(query=user_prompt, agent_id=agent_id)
-                    )
+                    context = await self.reader.query_context(query=user_prompt, agent_id=agent_id)
                     if context:
                         logger.info(f"📖 Reader V2 found context ({len(context)} chars)")
                 except Exception as rag_err:
@@ -175,14 +174,14 @@ class DynamicAIServiceV2:
                     # Pricing: $0.000002 per token
                     cost = total_tokens * 0.000002
                     
-                    if cost > 0:
-                        await self.credit_service.add_transaction(CreditTransactionCreate(
-                            organization_id=chat["organization_id"],
-                            amount=-cost, 
-                            description=f"AI Response (Tokens: {total_tokens})",
-                            transaction_type=TransactionType.USAGE,
-                            metadata={"chat_id": chat_id, "message_id": ai_message_id}
-                        ))
+                    await self.credit_service.add_transaction(CreditTransactionCreate(
+                        organization_id=chat["organization_id"],
+                        amount=-cost, 
+                        description=f"AI Response (Tokens: {total_tokens})",
+                        transaction_type=TransactionType.USAGE,
+                        metadata={"chat_id": chat_id, "message_id": ai_message_id}
+                    ))
+                    
                 except Exception as e:
                     logger.error(f"⚠️ Credit tracking failed: {e}")
 

@@ -979,14 +979,11 @@ async def create_knowledge_document(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    [V2 IMPLEMENTATION]
-    Upload, Process, Embed, and Bill.
-    """
+    """[V2 IMPLEMENTATION] Upload, Process, Embed, and Bill."""
     from uuid import uuid4
+    import asyncio
     from app.services.storage_service import StorageService
     from app.services.document_processor_v2 import DocumentProcessorV2
-    # [CHANGE] Use the service that supports billing
     from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
     from app.utils.chunking import split_into_chunks
 
@@ -1029,75 +1026,117 @@ async def create_knowledge_document(
                 file_options={"content-type": file.content_type, "upsert": "false"}
             )
             storage_uploaded = True
+            logger.info(f"✅ File uploaded to storage: {file_id}")
         except Exception as e:
+            logger.error(f"❌ Storage upload failed: {e}", exc_info=True)
             raise HTTPException(500, detail=f"File upload failed: {str(e)}")
 
-        # Step 2: Process document (Extract Text)
+        # Step 2: Process document (Extract Text) - RUN IN EXECUTOR
         doc_processor = DocumentProcessorV2(storage_service)
         try:
-            clean_text, _ = doc_processor.process_document(
-                content=file_content,
-                filename=filename,
-                folder_path=None,
-                organization_id=organization_id,
-                file_id=file_id
+            logger.info(f"📄 Processing document: {filename}")
+            
+            # ✅ Run sync process_document in thread pool
+            loop = asyncio.get_event_loop()
+            clean_text, _ = await loop.run_in_executor(
+                None,
+                doc_processor.process_document,
+                file_content,
+                filename,
+                agent_bucket_name,  # ✅ Pass bucket name instead of None
+                organization_id,
+                file_id
             )
-            if not clean_text: raise ValueError("No text extracted")
+            
+            if not clean_text:
+                raise ValueError("No text extracted from document")
+                
+            logger.info(f"✅ Text extracted: {len(clean_text)} characters")
+            
         except Exception as e:
-            if storage_uploaded: supabase.storage.from_(agent_bucket_name).remove([file_id])
+            logger.error(f"❌ Document processing failed: {e}", exc_info=True)
+            if storage_uploaded:
+                supabase.storage.from_(agent_bucket_name).remove([file_id])
             raise HTTPException(500, detail=f"Document processing failed: {str(e)}")
 
         # Step 3: Embed & Store (WITH BILLING)
-        # [CHANGE] We use the service wrapper instead of raw client
         chroma_service = get_crm_chroma_service_v2()
 
         try:
-            # Chunking logic (Keep your logic or use RecursiveCharacterTextSplitter)
+            logger.info(f"✂️ Chunking text...")
             chunks = split_into_chunks(text=clean_text, size=512, overlap=50)
+            logger.info(f"✅ Created {len(chunks)} chunks")
             
             # Prepare metadata for Chroma
             chunk_metas = [{
                 "file_id": file_id,
                 "filename": filename,
                 "chunk_index": i,
-                "doc_id": file_id, # Required by add_documents logic
+                "doc_id": file_id,
                 "processor": "v2"
             } for i in range(len(chunks))]
 
-            # [CRITICAL] Call add_documents to handle Embedding + Billing + Saving
+            logger.info(f"🧠 Embedding and storing chunks...")
             success = await chroma_service.add_documents(
                 agent_id=agent_id,
                 texts=chunks,
                 metadatas=chunk_metas,
-                organization_id=organization_id # <--- Pass this for $$$ deduction!
+                organization_id=organization_id
             )
 
             if not success:
                 raise Exception("ChromaDB service failed to save documents")
+                
+            logger.info(f"✅ Chunks embedded and stored successfully")
 
         except Exception as e:
-            if storage_uploaded: supabase.storage.from_(agent_bucket_name).remove([file_id])
+            logger.error(f"❌ Embedding failed: {e}", exc_info=True)
+            if storage_uploaded:
+                supabase.storage.from_(agent_bucket_name).remove([file_id])
             raise HTTPException(500, detail=f"Embedding failed: {str(e)}")
 
         # Step 4: Save Metadata to Postgres
-        doc_data = {
-            "agent_id": agent_id,
-            "name": filename,
-            "file_url": f"storage://{agent_bucket_name}/{file_id}",
-            "file_type": file_type,
-            "file_size_kb": file_size_kb,
-            "metadata": {"file_id": file_id, "bucket": agent_bucket_name, "processor_version": "v2", "chunks": len(chunks)}
-        }
-        response = supabase.table("knowledge_documents").insert(doc_data).execute()
-        
-        return KnowledgeDocument(**response.data[0])
+        try:
+            logger.info(f"💾 Saving document metadata to database...")
+            doc_data = {
+                "agent_id": agent_id,
+                "name": filename,
+                "file_url": f"storage://{agent_bucket_name}/{file_id}",
+                "file_type": file_type,
+                "file_size_kb": file_size_kb,
+                "metadata": {
+                    "file_id": file_id,
+                    "bucket": agent_bucket_name,
+                    "processor_version": "v2",
+                    "chunks": len(chunks)
+                }
+            }
+            response = supabase.table("knowledge_documents").insert(doc_data).execute()
+            
+            if not response.data:
+                raise Exception("Database insert returned no data")
+                
+            logger.info(f"✅ Document metadata saved successfully")
+            return KnowledgeDocument(**response.data[0])
+            
+        except Exception as e:
+            logger.error(f"❌ Database save failed: {e}", exc_info=True)
+            # Clean up
+            if storage_uploaded:
+                supabase.storage.from_(agent_bucket_name).remove([file_id])
+            raise HTTPException(500, detail=f"Database save failed: {str(e)}")
 
-    except HTTPException: raise
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
         if storage_uploaded and file_id:
-             supabase.storage.from_(f"agent_{agent_id}").remove([file_id])
+            try:
+                supabase.storage.from_(f"agent_{agent_id}").remove([file_id])
+            except:
+                pass
         raise HTTPException(500, detail=str(e))
-
+    
 @router.delete(
     "/{agent_id}/knowledge-documents/{doc_id}",
     status_code=status.HTTP_204_NO_CONTENT
@@ -1151,7 +1190,6 @@ async def delete_knowledge_document(
     except HTTPException: raise
     except Exception as e:
         raise HTTPException(500, detail=str(e)) 
-
 
 # ============================================
 # AGENT INTEGRATIONS ENDPOINTS
