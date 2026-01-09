@@ -1,106 +1,98 @@
 """
-LLM Queue Service
-Handles batching of AI requests to control rate limits and concurrency.
+LLM Queue Service (Debounce/Stacking Edition)
+Prevents "Double Posting" by waiting for the user to stop typing.
 """
 import asyncio
 import time
 import logging
-from typing import List, Dict, Any
+from typing import Dict, Any
 
-# Only import what is strictly used
 from app.services.dynamic_ai_service_v2 import process_dynamic_ai_response_v2
 
 logger = logging.getLogger(__name__)
 
 class LLMQueueService:
     def __init__(self):
-        self.queue = asyncio.Queue()
+        # The "Stack": Stores the LATEST pending task for each chat
+        # Key: chat_id
+        # Value: { "msg_id": str, "supabase": obj, "priority": str, "last_activity": float }
+        self.pending_chats: Dict[str, Any] = {}
         self.is_running = False
-        self.batch_interval = 2.0  # Seconds
-        self.processing_timeout = 30.0 # Seconds
+        
+        # CONFIG: How long to wait for "silence" before replying
+        # If user types again within 10 seconds, we reset the timer (Stacking)
+        self.debounce_window = 10.0 
 
     async def enqueue(self, chat_id: str, message_id: str, supabase_client: Any, priority: str = "medium"):
         """
-        Add a request to the processing queue.
+        Add a request to the stack.
+        If a user types again, this OVERWRITES the previous trigger and RESETS the timer.
         """
-        request_item = {
-            "chat_id": chat_id,
-            "message_id": message_id,
+        now = time.time()
+        
+        if chat_id in self.pending_chats:
+            logger.info(f"🔄 Stacking: Resetting timer for Chat {chat_id} (New Msg: {message_id})")
+        else:
+            logger.info(f"📥 New Stack: Chat {chat_id} | Waiting {self.debounce_window}s for silence...")
+
+        # Store ONLY the latest state (The AI will read the full history anyway)
+        self.pending_chats[chat_id] = {
+            "msg_id": message_id, # We only need the latest ID to wake up the AI
             "supabase": supabase_client,
             "priority": priority,
-            "timestamp": time.time(),
+            "last_activity": now
         }
-        await self.queue.put(request_item)
-        logger.info(f"📥 Queued: Chat {chat_id} | Msg {message_id} | QSize: {self.queue.qsize()}")
 
     async def start_worker(self):
         """
-        Background worker that processes the queue in batches.
+        Background worker that watches the stack.
         """
         self.is_running = True
-        logger.info("🚀 LLM Batch Worker Started")
+        logger.info("🚀 LLM Stacking/Debounce Worker Started")
         
         while self.is_running:
             try:
-                # 1. Wait for window time (Buffer mechanism)
-                await asyncio.sleep(self.batch_interval)
-
-                # 2. Drain the queue
-                batch_items = []
-                while not self.queue.empty():
-                    try:
-                        item = self.queue.get_nowait()
-                        batch_items.append(item)
-                    except asyncio.QueueEmpty:
-                        break
+                await asyncio.sleep(1.0) # Check stack every second
                 
-                if not batch_items:
-                    continue
-
-                logger.info(f"⚡ Processing Batch: {len(batch_items)} items")
-
-                # 3. Process Batch concurrently
-                asyncio.create_task(self._process_batch(batch_items))
+                now = time.time()
+                # Find chats that are "Ready" (Silent > debounce_window)
+                ready_chat_ids = []
                 
+                # Snapshot keys to avoid runtime modification errors
+                active_chats = list(self.pending_chats.keys())
+
+                for chat_id in active_chats:
+                    data = self.pending_chats[chat_id]
+                    elapsed = now - data["last_activity"]
+
+                    if elapsed >= self.debounce_window:
+                        ready_chat_ids.append(chat_id)
+
+                # Process Ready Chats
+                for chat_id in ready_chat_ids:
+                    # Pop the data from stack
+                    item = self.pending_chats.pop(chat_id, None)
+                    if item:
+                        logger.info(f"⚡ Stack Released ({self.debounce_window}s silence). Triggering AI for Chat {chat_id}")
+                        asyncio.create_task(
+                            self._process_safe(chat_id, item)
+                        )
+
             except Exception as e:
                 logger.error(f"🔥 Worker Crash: {e}")
                 await asyncio.sleep(1)
 
-    async def _process_batch(self, items: List[Dict]):
-        """
-        Execute AI logic in parallel using asyncio.gather.
-        """
-        tasks = []
-        now = time.time()
-        valid_items = []
-
-        for item in items:
-            # 4. Timeout Handling
-            if now - item["timestamp"] > self.processing_timeout:
-                logger.error(f"⏰ Timeout Dropped: Chat {item['chat_id']} (Age: {now - item['timestamp']:.2f}s)")
-                continue
-
-            valid_items.append(item)
-            tasks.append(
-                process_dynamic_ai_response_v2(
-                    chat_id=item["chat_id"],
-                    message_id=item["message_id"],
-                    supabase=item["supabase"],
-                    priority=item["priority"]
-                )
+    async def _process_safe(self, chat_id, item):
+        """Wrapper to catch errors without killing the worker"""
+        try:
+            await process_dynamic_ai_response_v2(
+                chat_id=chat_id,
+                msg_id=item["msg_id"], # Matches dynamic_ai_service_v2 definition
+                supabase=item["supabase"],
+                priority=item["priority"]
             )
-
-        if tasks:
-            # Execute all tasks concurrently (Promise.all equivalence)
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 5. Log results
-            for i, res in enumerate(results):
-                chat_id = valid_items[i]['chat_id']
-                if isinstance(res, Exception):
-                    logger.error(f"❌ Batch Item Failed [Chat {chat_id}]: {res}")
-                else:
-                    logger.info(f"✅ Batch Item Done [Chat {chat_id}]")
+        except Exception as e:
+            logger.error(f"❌ AI Task Failed [Chat {chat_id}]: {e}")
 
 # Singleton Instance
 llm_queue_service = LLMQueueService()

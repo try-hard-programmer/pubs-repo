@@ -148,6 +148,13 @@ class ConnectionManager:
             f"sent={success_count}, failed={len(failed_connections)}"
         )
 
+    async def broadcast_to_org(self, organization_id: str, message: Dict[str, Any]):
+        """
+        Wrapper to match the signature expected by DynamicAIServiceV2.
+        - Fixes method name mismatch.
+        - Fixes argument order (org_id first, then message).
+        """
+        await self.broadcast_to_organization(message, organization_id)
     # [FIX] Added 'attachment' parameter
     async def broadcast_new_message(
         self,

@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class MultiServicePreprocessor:
     def __init__(self):
         self.noise_words = [
-            'tolong','mohon','bantu','gan','sis','min','kak','minta','harap',
+            'gan','sis','min','kak','minta','harap','hi','ping'
             'halo','permisi','mas','mbak','pak','bu','om','boss','bro'
         ]
 

@@ -551,8 +551,13 @@ async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[s
         
         media_url = await _upload_media_to_supabase(base64_data, mime, ext)
         
-        # Content is ONLY caption
+        # [FIX] Extract Caption: Check media_obj first (Tele), then fallback to message body (WA)
         content = media_obj.get("caption", "")
+        if not content:
+            # WhatsApp structure: data.message.body contains the caption
+            msg_structure = message_data.get("message", {})
+            content = msg_structure.get("body", "") or msg_structure.get("_data", {}).get("body", "")
+
     else:
         # Handle Text
         body = message_data.get("body") or message_data.get("_data", {}).get("body", "")
@@ -563,7 +568,10 @@ async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[s
                 media_url = await _upload_media_to_supabase(body, "image/jpeg", "jpg")
                 content = "" 
                 msg_type = "image"
-            except: content = body
+            except Exception as e:
+                logger.error(f"❌ Failed to process Base64 text: {e}")
+                content = "[⚠️ Error: Image could not be processed]" 
+                msg_type = "text"
         else:
             content = body
             
@@ -1342,11 +1350,14 @@ async def _handle_message_content_for_telegram(message_data: dict, data_type: st
     media_url = None
     
     if data_type == "media":
-        base64_data = message_data.get("data") or message_data.get("body")
+        # [FIX] Unwrap messageMedia if present (Tele-service nests it)
+        media_obj = message_data.get("messageMedia", {}) or message_data
+        
+        base64_data = media_obj.get("data") or media_obj.get("body")
         if not base64_data: raise ValueError("Media data missing")
 
-        mime = message_data.get("mimetype", "application/octet-stream")
-        content = message_data.get("caption", "")
+        mime = media_obj.get("mimetype", "application/octet-stream")
+        content = media_obj.get("caption", "")
 
         if "image" in mime: msg_type = "image"
         elif "video" in mime: msg_type = "video"
@@ -1366,7 +1377,6 @@ async def _handle_message_content_for_telegram(message_data: dict, data_type: st
         msg_type = "text"
 
     return content, msg_type, media_url
-
 # app/api/webhook.py
 # Reworking
 # @router.post("/telegram-userbot", response_model=WebhookRouteResponse)

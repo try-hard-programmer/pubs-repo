@@ -14,9 +14,12 @@ logger = logging.getLogger(__name__)
 
 class DynamicCRMAgentV2:
     def __init__(self):
-        self.proxy_url = f"{settings.PROXY_BASE_URL.rstrip('/')}/chat"
+        # Ensure URL ends with /chat
+        base = settings.PROXY_BASE_URL.rstrip('/')
+        self.proxy_url = f"{base}/chat"
 
     def _parse_json(self, data: Any) -> Dict:
+        """Helper to safely parse JSON strings or dicts from Supabase"""
         if isinstance(data, dict): return data
         if isinstance(data, str):
             try: return json.loads(data)
@@ -29,27 +32,35 @@ class DynamicCRMAgentV2:
         customer_message: str,
         chat_history: List[Dict[str, Any]],
         agent_settings: Dict[str, Any],
-        organization_id: str, # [NEW] Required for Proxy Credit Tracking
+        organization_id: str,     # <--- MATCHING ARGUMENT for V2
         rag_context: str = "",
         category: str = "general",
         name_user: str = "Customer"
-    ) -> Dict[str, Any]: # [CHANGED] Returns Dict with metadata
+    ) -> Dict[str, Any]:
+        """
+        Generates the AI response. 
+        Returns Dict: { "content": str, "usage": dict, "metadata": dict }
+        """
         try:
+            # 1. PARSE SETTINGS
             persona = self._parse_json(agent_settings.get("persona_config", {}))
             advanced = self._parse_json(agent_settings.get("advanced_config", {}))
+            
+            # Extract Handoff Config (Escalation is AI's job)
+            handoff = advanced.get("handoffTriggers", {})
 
-            # A. Persona Settings
+            # 2. EXTRACT VARIABLES
             name = persona.get("name", "Support Agent")
             tone = persona.get("tone", "friendly")
             language = persona.get("language", "indonesia")
             custom_instructions = persona.get("customInstructions", "")
-
-            # B. Advanced Settings
+            
+            # Temperature Mapping
             temp_setting = advanced.get("temperature", "balanced")
             temp_map = {"precise": 0.1, "balanced": 0.5, "creative": 0.8}
             temperature = temp_map.get(temp_setting, 0.5)
 
-            # --- BUILD SYSTEM PROMPT ---
+            # 3. BUILD SYSTEM PROMPT
             system_prompt = (
                 f"IDENTITY:\n"
                 f"You are {name}.\n"
@@ -57,29 +68,38 @@ class DynamicCRMAgentV2:
                 f"Language: {language}.\n\n"
             )
 
+            # INJECT HANDOFF RULES
+            if handoff.get("enabled"):
+                system_prompt += (
+                    f"ESCALATION RULES:\n"
+                    f"- If the user is angry or asks for a human, apologize and say you are connecting them to an agent.\n"
+                    f"- Trigger Keyword: 'HUMAN_HANDOFF'.\n\n"
+                )
+
+            # Custom Instructions
             if custom_instructions:
                 system_prompt += (
                     f"OPERATIONAL INSTRUCTIONS:\n"
                     f"{custom_instructions}\n\n"
                 )
 
-            # Strict Safety Layer
+            # RAG / Knowledge Boundaries
             system_prompt += (
                 f"STRICT KNOWLEDGE BOUNDARIES:\n"
                 f"1. You are a CLOSED-DOMAIN agent. NO outside knowledge allowed.\n"
                 f"2. You MUST answer using ONLY the 'CONTEXT' below.\n"
-                f"3. If the answer is NOT in the CONTEXT, politely refuse. Do NOT hallucinate.\n\n"
+                f"3. If the answer is NOT in the CONTEXT, politely refuse.\n\n"
                 f"CONTEXT (SOURCE OF TRUTH):\n"
                 f"###\n{rag_context}\n###\n\n"
                 f"FINAL GUIDELINES:\n"
                 f"- Address customer as '{name_user}'.\n"
-                f"- Do NOT mention 'RAG' or 'training data'.\n"
             )
 
-            # --- BUILD MESSAGE CHAIN ---
+            # 4. BUILD MESSAGE CHAIN
             messages = [{"role": "system", "content": system_prompt}]
             
             for msg in chat_history:
+                # Map DB roles to LLM roles
                 role = "assistant" if msg.get("sender_type") == "ai" else "user"
                 content = msg.get("content") or msg.get("message_content", "")
                 if content:
@@ -87,13 +107,13 @@ class DynamicCRMAgentV2:
             
             messages.append({"role": "user", "content": customer_message})
 
-            # --- SEND TO PROXY ---
+            # 5. SEND TO PROXY
             payload = {
                 "messages": messages,
                 "category": category,
                 "nameUser": name_user,
                 "temperature": temperature,
-                "organization_id": organization_id # [NEW] Pass ID for billing
+                "organization_id": organization_id # <--- Sending this to Proxy for Logging
             }
 
             async with aiohttp.ClientSession() as session:
@@ -107,20 +127,22 @@ class DynamicCRMAgentV2:
                     if response.status != 200:
                         error_text = await response.text()
                         logger.error(f"❌ Speaker V2 Error {response.status}: {error_text}")
+                        # Return clean error dict, don't crash
                         return {
                             "content": "Maaf, saya sedang istirahat sebentar.",
-                            "metadata": {},
+                            "metadata": {"error": f"Proxy {response.status}"},
                             "usage": {}
                         }
                     
                     result = await response.json()
                     
+                    # Handle diverse proxy responses (OpenAI vs Simple)
+                    content = ""
                     try:
                         content = result["choices"][0]["message"]["content"]
                     except (KeyError, IndexError):
                         content = result.get("reply") or result.get("content") or "Error parsing response."
 
-                    # [CHANGED] Return full object to expose metadata
                     return {
                         "content": content,
                         "metadata": result.get("metadata", {}),
@@ -129,9 +151,10 @@ class DynamicCRMAgentV2:
 
         except Exception as e:
             logger.error(f"❌ Speaker V2 Exception: {e}")
+            # Fallback return
             return {
                 "content": "Maaf, sistem sedang sibuk. Mohon coba lagi nanti.",
-                "metadata": {},
+                "metadata": {"error": str(e)},
                 "usage": {}
             }
 
