@@ -29,17 +29,11 @@ from app.services.message_router_service import get_message_router_service
 from app.services.agent_finder_service import get_agent_finder_service
 from app.services.websocket_service import get_connection_manager
 
-# [CHANGE] Import the V2 AI Trigger
-from app.services.dynamic_ai_service_v2 import process_dynamic_ai_response_v2 
-# Keep V1 for backward compatibility if needed
-from app.services.ai_response_service import process_ai_response_async
-
 from app.config import settings as app_settings
 from app.models.webhook import WhatsAppUnofficialWebhookMessage, WebhookRouteResponse, WhatsAppEventPayload
 from app.models.ticket import TicketCreate, ActorType, TicketPriority, TicketDecision
 from app.services.ticket_service import get_ticket_service
 from app.api.crm_chats import send_message_via_channel
-from app.utils.ml_guard import ml_guard
 from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
 from app.services.llm_queue_service import get_llm_queue
 
@@ -587,512 +581,6 @@ def get_supabase_client():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Supabase is not configured")
     return create_client(app_settings.SUPABASE_URL, app_settings.SUPABASE_SERVICE_KEY)
 
-async def process_webhook_message(
-    agent: Dict, channel: str, contact: str, message_content: str,
-    customer_name: Optional[str], message_metadata: Dict, customer_metadata: Dict, supabase
-) -> Dict:
-    
-    agent_id = agent["id"]
-    org_id = agent["organization_id"]
-
-    if agent.get("status") == "inactive":
-        return {"success": False, "status": "dropped_inactive"}
-
-    # 1. ROUTING
-    router = get_message_router_service(supabase)
-    res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
-    chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
-
-    # 2. UPDATE PHONE
-    if customer_metadata.get("phone") and cust_id:
-        try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
-        except: pass
-
-    # 3. BROADCAST TO FRONTEND
-    if app_settings.WEBSOCKET_ENABLED:
-        try:
-            attachment_data = None
-            if message_metadata.get("media_url"):
-                attachment_data = {
-                    "url": message_metadata["media_url"],
-                    "type": message_metadata.get("message_type", "image"),
-                    "name": "Media Attachment"
-                }
-
-            await get_connection_manager().broadcast_new_message(
-                organization_id=org_id, chat_id=chat_id, message_id=msg_id,
-                customer_id=cust_id, customer_name=customer_name or "Unknown",
-                message_content=message_content, channel=channel, handled_by=res["handled_by"],
-                sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
-                was_reopened=res.get("was_reopened", False), metadata=message_metadata,
-                attachment=attachment_data
-            )
-        except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
-        except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
-
-    if res.get("is_merged_event"): return res
-
-    # ==========================================================================
-    # [FIX] STOP IF HANDLED BY HUMAN
-    # Ini mencegah bot membalas jika chat sudah di-assign ke agen manusia
-    # ==========================================================================
-    if res.get("handled_by") == "human":
-        logger.info(f"🛑 Chat {chat_id} is handled by Human. AI/Guard stopped.")
-        return res
-
-    # 5. BUSY CHECK
-    if agent.get("status") == "busy":
-        msg = "Maaf, saat ini kami sedang sibuk."
-        contact_info = {"phone": contact, "telegram_id": contact}
-        await send_auto_reply(supabase, channel, agent_id, contact_info, msg)
-        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel, agent_name=agent["name"])
-        return {**res, "handled_by": "system_busy"}
-
-    # ACTIVE TICKET CHECK (Backup check, biasanya sudah tercover oleh handled_by)
-    active_ticket = None
-    ticket_query = supabase.table("tickets").select("id, assigned_agent_id").eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
-    if ticket_query.data:
-        active_ticket = ticket_query.data[0]
-        if active_ticket.get("assigned_agent_id"):
-            return {**res, "handled_by": "human_ticket"}
-
-    # SCHEDULE CHECK
-    schedule = await get_agent_schedule_config(agent_id, supabase)
-    is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
-    if not is_within:
-        msg = "Maaf kami sedang tutup saat ini."
-        supabase.table("messages").update({"metadata": {**message_metadata, "out_of_schedule": True}}).eq("id", msg_id).execute()
-        chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
-        cust_data = {"phone": contact, "metadata": {"telegram_id": contact}}
-        await send_message_via_channel(chat_data, cust_data, msg, supabase)
-        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel)
-        return {**res, "handled_by": "ooo_system"}
-
-    # INTELLIGENCE (AI GUARD)
-    # Kode di bawah ini hanya akan jalan jika handled_by == "ai" atau "unassigned"
-    ticket_config = agent.get("ticketing_config") or {}
-    if isinstance(ticket_config, str):
-        try: ticket_config = json.loads(ticket_config)
-        except: ticket_config = {}
-
-    should_trigger_ai = True
-
-    if ticket_config.get("enabled"):
-        should_ticket, pred_cat, prio_str, conf, reason, ticket_title = ml_guard.predict(message_content)
-        
-        if prio_str == "low":
-            logger.info(f"🛡️ Low Priority ({reason}). Sending Greeting & Stopping AI.")
-            resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
-            
-            # Clean Name Display
-            display_name = customer_name or 'Kak'
-            if "@lid" in str(display_name) or "User" in str(display_name):
-                display_name = str(resolved_contact).split("@")[0]
-
-            greeting_msg = (
-                f"Halo {display_name}! 👋\n\n"
-                "Pesan Anda telah kami terima melalui platform Syntra.\n"
-                "Silakan jelaskan permasalahan yang Anda alami secara lebih rinci agar kami dapat membantu Anda dengan lebih baik."
-            )
-            chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
-            cust_data = {"phone": resolved_contact, "metadata": {"telegram_id": resolved_contact}}
-            
-            await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
-            await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel, agent_name=agent["name"])
-            
-            # Auto create low priority ticket if configured
-            if not active_ticket and ticket_config.get("autoCreateTicket"):
-                try: final_prio = TicketPriority.LOW
-                except: final_prio = "low"
-                ticket_svc = get_ticket_service()
-                ticket_data = TicketCreate(
-                    chat_id=chat_id, customer_id=cust_id,
-                    title=f"[LOW] {pred_cat.upper()} - {message_content[:40]}",
-                    description=f"Message: {message_content}",
-                    priority=final_prio, category=pred_cat
-                )
-                await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
-
-            should_trigger_ai = False
-            return {**res, "handled_by": "system_greeting"}
-
-        elif should_ticket:
-            # ... (Logic pembuatan tiket tetap sama) ...
-            final_cat = pred_cat
-            if ticket_config.get("categories") and pred_cat not in ticket_config["categories"]:
-                final_cat = ticket_config["categories"][0]
-            try: final_prio = TicketPriority(prio_str)
-            except: final_prio = TicketPriority.MEDIUM
-
-            if active_ticket:
-                # Update existing ticket logic...
-                pass     
-            elif ticket_config.get("autoCreateTicket"):
-                # Create new ticket logic...
-                ticket_svc = get_ticket_service()
-                ticket_data = TicketCreate(
-                    chat_id=chat_id, customer_id=cust_id,
-                    title=ticket_title, description=f"Message: {message_content}",
-                    priority=final_prio, category=final_cat
-                )
-                await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
-
-    if should_trigger_ai:
-        asyncio.create_task(process_ai_response_async(chat_id, msg_id, supabase))
-        return {**res, "handled_by": "ai"}
-    
-    return res
-
-# ============================================
-# WHATSAPP WEBHOOK
-# ============================================
-
-@router.post(
-    "/whatsapp",
-    response_model=WebhookRouteResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Receive WhatsApp message",
-    description="Webhook endpoint to receive incoming messages from WhatsApp service"
-)
-async def whatsapp_webhook(
-    payload: WhatsAppEventPayload,
-    secret: str = Depends(get_webhook_secret)
-):
-    try:
-        # 1. FILTER: Handle System Events (QR, Loading, Status) -> Ignore them
-        if payload.qr:
-            return JSONResponse(content={"status": "ignored", "reason": "qr_code"})
-            
-        if isinstance(payload.message, str):
-            # If 'message' is a string (e.g. "WhatsApp"), it's a loading status
-            return JSONResponse(content={"status": "ignored", "reason": "status_update"})
-
-        if not isinstance(payload.message, dict):
-            return JSONResponse(content={"status": "ignored", "reason": "no_message_data"})
-
-        # Extract the core message object
-        # The container usually sends: { "message": { "_data": { ... } } }
-        msg_obj = payload.message
-        msg_data = msg_obj.get("_data", msg_obj) # Fallback to msg_obj if _data missing
-
-        # 2. FILTER: Ignore Status Broadcasts
-        if msg_data.get("isStatus") is True or msg_data.get("type") == "e2e_notification":
-             return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
-
-        # 3. FILTER: Ignore Self-Replies (Infinite Loop Prevention)
-        # Check id.fromMe (official structure) or key.fromMe (some libraries)
-        is_from_me = False
-        if isinstance(msg_data.get("id"), dict):
-            is_from_me = msg_data["id"].get("fromMe", False)
-        elif isinstance(msg_data.get("key"), dict):
-             is_from_me = msg_data["key"].get("fromMe", False)
-        
-        # Also check boolean flag directly if present
-        if msg_data.get("fromMe") is True:
-            is_from_me = True
-
-        if is_from_me:
-            logger.info("♻️ Ignoring message from self (fromMe=True)")
-            return JSONResponse(content={"status": "ignored", "reason": "from_me"})
-
-        logger.info(f"📱 WhatsApp webhook received")
-
-        # 4. DATA EXTRACTION
-        # 'from': "6281317966173@c.us" (Sender)
-        # 'to': "6287874134867@c.us" (Agent/Receiver)
-        raw_from = msg_data.get("from", "")
-        raw_to = msg_data.get("to", "")
-        
-        # Clean numbers (remove @c.us / @g.us)
-        phone_number = raw_from.split("@")[0] if "@" in raw_from else raw_from
-        to_number = raw_to.split("@")[0] if "@" in raw_to else raw_to
-        
-        message_content = msg_data.get("body", "")
-        
-        # Sender Name Logic
-        sender_name = msg_data.get("notifyName")
-        if not sender_name:
-            sender_name = f"User {phone_number}"
-
-        message_id = msg_data.get("id", {}).get("id") if isinstance(msg_data.get("id"), dict) else None
-        timestamp = msg_data.get("t")
-
-        # 5. AGENT LOOKUP
-        supabase = get_supabase_client()
-        agent_finder = get_agent_finder_service(supabase)
-        
-        # Find agent by the 'to' number (the agent's number)
-        agent = await agent_finder.find_agent_by_whatsapp_number(phone_number=to_number)
-
-        if not agent:
-            # Fallback: try finding by raw ID or partial match
-            logger.warning(f"⚠️ Agent not found for {to_number}, retrying...")
-            agent = await agent_finder.find_agent_by_whatsapp_number(phone_number=raw_to)
-            
-        if not agent:
-            logger.error(f"❌ No agent integration found for WhatsApp number: {to_number}")
-            # Return 404 so we know it failed, or 200 to stop retries if configured
-            raise HTTPException(status_code=404, detail="Agent not found for this number")
-
-        organization_id = agent["organization_id"]
-
-        # 6. METADATA PREPARATION
-        message_metadata = {
-            "whatsapp_message_id": message_id,
-            "original_from": raw_from,
-            "timestamp": timestamp,
-            "source_raw": "chrishubert_api"
-        }
-        
-        customer_metadata = {
-            "whatsapp_name": sender_name
-        }
-
-        # 7. PROCESS & ROUTE
-        result = await process_webhook_message(
-            agent=agent,
-            channel="whatsapp",
-            contact=phone_number,
-            message_content=message_content,
-            customer_name=sender_name,
-            message_metadata=message_metadata,
-            customer_metadata=customer_metadata,
-            supabase=supabase
-        )
-
-        return WebhookRouteResponse(
-            success=True,
-            chat_id=result["chat_id"],
-            message_id=result["message_id"],
-            customer_id=result["customer_id"],
-            is_new_chat=result["is_new_chat"],
-            was_reopened=result["was_reopened"],
-            handled_by=result["handled_by"],
-            status=result["status"],
-            channel=result["channel"],
-            message=_generate_status_message(result)
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error processing WhatsApp webhook: {e}")
-        # Return 200 OK with error details to stop WhatsApp from retrying indefinitely on bad logic
-        return JSONResponse(
-            status_code=200, 
-            content={"success": False, "error": str(e)}
-        )
-
-# ============================================
-# WHATSAPP UNOFFICIAL WEBHOOK
-# ============================================
-
-# Reworking
-# @router.post(
-#     "/wa-unofficial",
-#     response_model=WebhookRouteResponse,
-#     status_code=status.HTTP_200_OK,
-#     summary="Receive WhatsApp message (Unofficial API)"
-# )
-# async def whatsapp_unofficial_webhook(
-#     message: WhatsAppUnofficialWebhookMessage,
-#     secret: str = Depends(get_webhook_secret)
-# ):
-#     try:
-#         supabase = get_supabase_client()
-#         agent_id = message.sessionId
-
-#         # ==================================================================
-#         # 1. VISIBILITY LAYER (Make the Invisible Visible)
-#         # ==================================================================
-#         # We log the raw payload structure so you can see exactly what the "Zombie" sends.
-#         import json
-#         try:
-#             # Truncate huge base64 strings for cleaner logs
-#             debug_payload = message.data.copy() if isinstance(message.data, dict) else {}
-#             if "body" in debug_payload and len(str(debug_payload["body"])) > 200:
-#                 debug_payload["body"] = "[BASE64_DATA_TRUNCATED]"
-            
-#             logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType} | Payload Keys: {list(debug_payload.keys())}")
-#         except: 
-#             logger.info(f"📦 [RAW INCOMING] Session: {agent_id} | Type: {message.dataType}")
-
-#         # ==================================================================
-#         # 2. SYSTEM EVENT FILTER (Dynamic)
-#         # ==================================================================
-#         # Hard system events that we know are not user messages
-#         system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
-        
-#         if message.dataType in system_events:
-#             logger.info(f"📡 System Event ({message.dataType}) - Ignored")
-#             # Broadcast status updates to frontend if needed
-#             agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
-#             if agent_res.data and app_settings.WEBSOCKET_ENABLED:
-#                 org_id = agent_res.data[0]["organization_id"]
-#                 await get_connection_manager().broadcast_to_organization(
-#                     message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType}},
-#                     organization_id=org_id
-#                 )
-#             return JSONResponse(content={"success": True, "status": "processed_system_event"})
-
-#         # ==================================================================
-#         # 3. STRUCTURAL VALIDATION (The "Dynamic" Guard)
-#         # ==================================================================
-#         # Extract the inner data structure dynamically
-#         data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
-#         data_content = data_wrapper.get("_data", {}) or data_wrapper 
-        
-#         # A valid message MUST have an ID. If not, it's garbage/ghost data.
-#         whatsapp_id = data_content.get("id", {}).get("id")
-#         if not whatsapp_id:
-#              # Sometimes the ID is at the root level in certain events
-#              whatsapp_id = message.data.get("id", {}).get("id")
-
-#         if not whatsapp_id and message.dataType not in ["ready", "authenticated"]:
-#              logger.warning("🗑️ Dropping Event: Malformed Structure (No Message ID found)")
-#              return JSONResponse(content={"status": "ignored", "reason": "malformed_structure"})
-
-#         # Check Flags (Status Updates, Broadcasts, Self-Messages)
-#         if data_content.get("isStatus") is True or data_content.get("isNotification") is True:
-#              return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
-        
-#         if data_content.get("id", {}).get("fromMe", False) or data_content.get("fromMe", False):
-#              return JSONResponse(content={"status": "ignored", "reason": "from_me"})
-
-#         # ==================================================================
-#         # 4. CONTENT INTEGRITY CHECK (Stop Empty Spam)
-#         # ==================================================================
-#         msg_body = data_content.get("body", "")
-#         has_media = message.dataType == "media" or data_content.get("mimetype") or message.data.get("mimetype")
-
-#         # If it has NO text content AND NO media, it is a Ghost Event (e.g. typing status, battery sync)
-#         if not str(msg_body).strip() and not has_media:
-#             logger.warning(f"👻 Ghost Message Detected (Empty Body + No Media). Rejection triggered.")
-#             return JSONResponse(content={"status": "ignored", "reason": "zero_information_payload"})
-
-#         # ==================================================================
-#         # 5. DEDUPLICATION
-#         # ==================================================================
-#         dedup_key = f"{whatsapp_id}_{message.dataType}"
-#         if dedup_cache.is_duplicate(dedup_key):
-#             logger.info(f"⚡ Fast Dedup: Skipping duplicate {dedup_key}")
-#             return JSONResponse(content={"status": "ignored", "reason": "duplicate_fast_cache"})
-
-#         if message.dataType != "media":
-#             existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
-#             if existing.data:
-#                 return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
-
-#         # ==================================================================
-#         # 6. AGENT VERIFICATION
-#         # ==================================================================
-#         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-#         if not agent_res.data: 
-#             return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
-#         agent = agent_res.data[0]
-
-#         integration_res = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
-#         if not integration_res.data or integration_res.data[0].get("enabled") is False:
-#             return JSONResponse(content={"status": "ignored", "reason": "integration_disabled"})
-
-#         # ==================================================================
-#         # 7. STANDARDIZATION & ZOMBIE TIME CHECK
-#         # ==================================================================
-#         settings_data = await fetch_agent_settings(supabase, agent_id)
-#         if settings_data: agent.update(settings_data)
-
-#         standard_message = await _convert_unofficial_to_standard(message)
-        
-#         # [ZOMBIE PROTECTION]: Ignore messages older than 2 minutes
-#         if standard_message.timestamp:
-#             try:
-#                 msg_time = datetime.fromisoformat(standard_message.timestamp)
-#                 if msg_time.tzinfo is None: msg_time = msg_time.replace(tzinfo=timezone.utc)
-                
-#                 age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
-#                 if age_seconds > 120:
-#                     logger.warning(f"⏳ Ignoring Old Message (Age: {int(age_seconds)}s). Zombie History Sync Protection.")
-#                     return JSONResponse(content={"status": "ignored", "reason": "too_old"})
-#             except Exception: pass
-
-#         # ==================================================================
-#         # 8. LID RESOLUTION & ROUTING
-#         # ==================================================================
-#         # Resolve LID to Real Number
-#         contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
-        
-#         # Fix Name Display
-#         sender_name = standard_message.sender_name
-#         if sender_name and ("@lid" in sender_name or not sender_name.strip()):
-#              sender_name = contact_id # Fallback to number if name is ugly/empty
-        
-#         # Clean ID
-#         if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
-
-#         result = await process_webhook_message(
-#             agent=agent,
-#             channel="whatsapp",
-#             contact=contact_id,
-#             message_content=standard_message.message,
-#             customer_name=sender_name or contact_id,
-#             message_metadata={
-#                 "whatsapp_message_id": standard_message.message_id,
-#                 "message_type": standard_message.message_type,
-#                 "timestamp": standard_message.timestamp,
-#                 "is_lid": "@lid" in standard_message.phone_number,
-#                 "media_url": standard_message.media_url,
-#                 **standard_message.metadata
-#             },
-#             customer_metadata={"whatsapp_name": sender_name},
-#             supabase=supabase
-#         )
-
-#         return WebhookRouteResponse(
-#             success=True, chat_id=result["chat_id"], message_id=result["message_id"],
-#             customer_id=result["customer_id"], is_new_chat=result["is_new_chat"],
-#             was_reopened=result["was_reopened"], handled_by=result["handled_by"],
-#             status=result["status"], channel="whatsapp", message=_generate_status_message(result)
-#         )
-
-#     except Exception as e:
-#         logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
-#         return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
-            
-# ============================================
-# TELEGRAM WEBHOOK
-# ============================================
-
-@router.post("/telegram", response_model=WebhookRouteResponse)
-async def telegram_webhook(message: TelegramWebhookMessage, secret: str = Depends(get_webhook_secret)):
-    try:
-        supabase = get_supabase_client()
-        if await check_telegram_idempotency(supabase, str(message.message_id)):
-            return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
-
-        agent_finder = get_agent_finder_service(supabase)
-        agent = await agent_finder.find_agent_by_telegram_bot(message.bot_token, message.bot_username)
-        if not agent: raise HTTPException(404, "Agent not found")
-        
-        settings_data = await fetch_agent_settings(supabase, agent["id"])
-        if settings_data: agent.update(settings_data)
-
-        customer_name = f"@{message.username}" if message.username else message.first_name
-        msg_meta = {"telegram_message_id": message.message_id, "telegram_chat_id": message.chat_id, "timestamp": message.timestamp, **message.metadata}
-        cust_meta = {"telegram_username": message.username, "telegram_first_name": message.first_name, "phone": str(message.telegram_id)}
-
-        result = await process_webhook_message(agent, "telegram", str(message.telegram_id), message.message, customer_name, msg_meta, cust_meta, supabase)
-        
-        return WebhookRouteResponse(
-            success=True, chat_id=result.get("chat_id"), message_id=result.get("message_id"), 
-            customer_id=result.get("customer_id"), is_new_chat=result.get("is_new_chat", False),
-            was_reopened=result.get("was_reopened", False),
-            handled_by=result.get("handled_by", "unknown"), status=result.get("status", "processed"), 
-            channel="telegram", message=_generate_status_message(result)
-        )
-    except Exception as e:
-        logger.error(f"Telegram Error: {e}")
-        raise HTTPException(500, str(e))
-
 # ============================================
 # EMAIL WEBHOOK
 # ============================================
@@ -1184,7 +672,7 @@ async def email_webhook(
         }
 
         # STEP 2: Process webhook message (unified logic)
-        result = await process_webhook_message(
+        result = await process_webhook_message_v2(
             agent=agent,
             channel="email",
             contact=message.email,
@@ -1292,14 +780,11 @@ async def _upload_media_to_supabase(
         raise Exception(f"Media upload failed: {str(e)}")
 
 def _extract_phone_number(whatsapp_id: str) -> str:
-    logger.info(f"🧪 [1. EXTRACTOR] Input: '{whatsapp_id}'") # LOG THIS
     
     if not whatsapp_id:
         return ""
     
     if "@lid" in whatsapp_id:
-        # This is where the @lid bypasses the cleaning logic
-        logger.info(f"🧪 [1. EXTRACTOR] LID Detected. Bypassing clean. Result: '{whatsapp_id}'") 
         return whatsapp_id
 
     clean_id = whatsapp_id.split("@")[0].split(":")[0]
@@ -1377,97 +862,18 @@ async def _handle_message_content_for_telegram(message_data: dict, data_type: st
         msg_type = "text"
 
     return content, msg_type, media_url
-# app/api/webhook.py
-# Reworking
-# @router.post("/telegram-userbot", response_model=WebhookRouteResponse)
-# async def telegram_userbot_webhook(
-#     payload: WhatsAppUnofficialWebhookMessage, 
-#     secret: str = Depends(get_webhook_secret)
-# ):
-#     try:
-#         agent_id = payload.sessionId
-#         raw_data = payload.data
-        
-#         if payload.dataType == "media":
-#             logger.info(f"📸 Telegram Userbot: Received Media (Agent: {agent_id})")
-#             content_source = raw_data
-#             data_wrapper = raw_data.get("message", {}) or {}
-#             data_content = data_wrapper.get("_data", {}) or data_wrapper
-#         else:
-#             logger.info(f"💬 Telegram Userbot: Received Text (Agent: {agent_id})")
-#             data_wrapper = raw_data.get("message", {}) or {}
-#             data_content = data_wrapper.get("_data", {}) or data_wrapper
-#             content_source = raw_data
-
-#         if not data_content and payload.dataType != "media": 
-#             raise HTTPException(status_code=400, detail="Invalid JSON structure")
-        
-#         # Idempotency
-#         msg_id = data_content.get("id", {}).get("id")
-#         supabase = get_supabase_client()
-#         if msg_id and await check_telegram_idempotency(supabase, str(msg_id)):
-#              return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
-
-#         # Identity
-#         sender_id = str(data_content.get("from", ""))
-#         sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
-#         timestamp_unix = data_content.get("t")
-#         raw_phone = data_content.get("phone")
-#         final_phone = sender_id
-#         if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
-#             final_phone = str(raw_phone)
-
-#         # Agent & Settings
-#         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-#         if not agent_res.data: raise HTTPException(404, "Agent not found")
-#         agent = agent_res.data[0]
-#         settings_data = await fetch_agent_settings(supabase, agent_id)
-#         if settings_data: agent.update(settings_data)
-
-#         # Content Extraction
-#         try:
-#             message_text, msg_type, media_url = await _handle_message_content_for_telegram(content_source, payload.dataType)
-#         except Exception as e:
-#             logger.error(f"❌ Telegram Content Error: {e}")
-#             message_text = ""
-#             msg_type = "text"
-#             media_url = None
-
-#         msg_meta = {
-#             "source_format": "wa_unofficial_json", 
-#             "telegram_message_id": msg_id, 
-#             "telegram_sender_id": sender_id, 
-#             "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None,
-#             "media_url": media_url,
-#             "message_type": msg_type 
-#         }
-        
-#         cust_meta = { "telegram_id": sender_id, "phone": final_phone, "source": "telegram_userbot" }
-
-#         result = await process_webhook_message(agent, "telegram", sender_id, message_text, sender_display_name, msg_meta, cust_meta, supabase)
-        
-#         return WebhookRouteResponse(
-#             success=True, chat_id=result.get("chat_id"), message_id=result.get("message_id"), 
-#             customer_id=result.get("customer_id"), is_new_chat=result.get("is_new_chat", False),
-#             was_reopened=result.get("was_reopened", False), handled_by=result.get("handled_by", "ai"), 
-#             status=result.get("status", "open"), channel="telegram", message=_generate_status_message(result)
-#         )
-        
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error(f"❌ Telegram Userbot Critical: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
 
 async def process_webhook_message_v2(
     agent: Dict, channel: str, contact: str, message_content: str,
     customer_name: Optional[str], message_metadata: Dict, customer_metadata: Dict, supabase
 ) -> Dict:
     """
-    V2 Processor: Uses Local Proxy V2 for AI Responses.
-    - [FIX] FORCE WA HIGH-RES: Polls DB to capture final image URL before broadcasting.
+    V2 Processor: Implements "Low Priority Default" Logic without ML Guard.
+    Flow:
+      1. Route Message
+      2. Check Active Ticket
+      3. IF Ticket Exists -> Queue AI (Batching)
+      4. IF NO Ticket -> Greeting -> Create Ticket (Low) -> Queue AI (Batching)
     """
     agent_id = agent["id"]
     org_id = agent["organization_id"]
@@ -1485,35 +891,25 @@ async def process_webhook_message_v2(
         try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
         except: pass
 
-    # =========================================================================
-    # 3. BROADCAST TO FRONTEND (THE HIGH-RES FIX)
-    # =========================================================================
+    # 3. BROADCAST TO FRONTEND (High-Res Media Fix)
     if app_settings.WEBSOCKET_ENABLED:
         try:
             fresh_metadata = message_metadata
-            
             # [LOGIC] If WhatsApp Media -> Wait for High-Res (Max 3s)
             if channel == "whatsapp" and message_metadata.get("message_type") in ["image", "video", "document"]:
                 initial_url = message_metadata.get("media_url")
-                logger.info(f"⏳ [WA-FIX] Waiting for High-Res Media for msg {msg_id}...")
-                
-                for attempt in range(6): # 6 attempts x 0.5s = 3 Seconds Max
+                # Quick poll to see if the URL updates to the high-res version
+                for attempt in range(6): 
                     await asyncio.sleep(0.5) 
                     try:
-                        # Fetch latest DB state
                         msg_res = supabase.table("messages").select("metadata").eq("id", msg_id).single().execute()
                         if msg_res.data and msg_res.data.get("metadata"):
                             db_meta = msg_res.data["metadata"]
-                            
-                            # Check if URL changed (Thumbnail -> HighRes) OR if we just found a URL where there was none
                             if db_meta.get("media_url") and db_meta.get("media_url") != initial_url:
                                 fresh_metadata = db_meta
-                                logger.info(f"✅ [WA-FIX] High-Res URL Captured! (Attempt {attempt+1})")
                                 break
-                    except Exception as poll_error:
-                        logger.debug(f"⚠️ [WA-FIX] Poll error: {poll_error}")
+                    except: pass
 
-            # Construct Attachment with Final URL
             attachment_data = None
             if fresh_metadata.get("media_url"):
                 attachment_data = {
@@ -1528,7 +924,7 @@ async def process_webhook_message_v2(
                 message_content=message_content, channel=channel, handled_by=res["handled_by"],
                 sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
                 was_reopened=res.get("was_reopened", False), 
-                metadata=fresh_metadata, # Sends the High-Res version
+                metadata=fresh_metadata,
                 attachment=attachment_data
             )
         except Exception as e: logger.error(f"❌ WS Broadcast Failed: {e}")
@@ -1548,18 +944,7 @@ async def process_webhook_message_v2(
         await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel, agent_name=agent["name"])
         return {**res, "handled_by": "system_busy"}
 
-    # ACTIVE TICKET CHECK
-    active_ticket = None
-    try:
-        ticket_query = supabase.table("tickets").select("id, ticket_number, assigned_agent_id, priority").eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
-        if ticket_query.data:
-            active_ticket = ticket_query.data[0]
-            if active_ticket.get("assigned_agent_id"):
-                return {**res, "handled_by": "human_ticket"}
-    except Exception as e:
-        logger.warning(f"⚠️ Ticket check failed: {e}")
-
-    # SCHEDULE CHECK
+    # 6. SCHEDULE CHECK
     schedule = await get_agent_schedule_config(agent_id, supabase)
     is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
     if not is_within:
@@ -1573,133 +958,100 @@ async def process_webhook_message_v2(
         return {**res, "handled_by": "ooo_system"}
 
     # =========================================================================
-    # 5. INTELLIGENCE V2
+    # 7. LOGIC: TICKET CHECK & AI TRIGGER (NO ML GUARD)
     # =========================================================================
-    ticket_config = agent.get("ticketing_config") or {}
-    if isinstance(ticket_config, str):
-        try: ticket_config = json.loads(ticket_config)
-        except: ticket_config = {}
+    
+    # Check for ACTIVE ticket
+    active_ticket = None
+    try:
+        ticket_query = supabase.table("tickets").select("id, ticket_number, assigned_agent_id, priority")\
+            .eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
+        if ticket_query.data:
+            active_ticket = ticket_query.data[0]
+            # Double check if ticket is assigned to human (redundant but safe)
+            if active_ticket.get("assigned_agent_id"):
+                return {**res, "handled_by": "human_ticket"}
+    except Exception as e:
+        logger.warning(f"⚠️ Ticket check failed: {e}")
 
-    should_trigger_ai = True
-    prio_str = "medium"
+    queue_svc = get_llm_queue()
+    ticket_svc = get_ticket_service()
+    
+    # Default priority logic
+    ai_priority = "medium" 
 
-    # --- LOGIC BRANCH A: TICKET EXISTS ---
     if active_ticket:
-        ticket_prio = str(active_ticket.get("priority", "medium")).lower()
-        logger.info(f"🎫 Active Ticket Found: {active_ticket['ticket_number']} (Current Prio: {ticket_prio})")
+        # --- PATH A: TICKET EXISTS ---
+        # The user is already in a conversation. Just batch the message.
+        logger.info(f"🎫 Active Ticket Found: {active_ticket['ticket_number']}. Batching message...")
+        ai_priority = str(active_ticket.get("priority", "medium")).lower()
 
-        if ticket_prio == "low":
-            logger.info("🔍 Re-evaluating LOW priority ticket with new message...")
-            should_ticket, pred_cat, new_prio_str, conf, reason, _ = ml_guard.predict(message_content)
-            
-            if new_prio_str in ["high", "urgent", "medium"]:
-                logger.info(f"🚀 UPGRADING Ticket {active_ticket['ticket_number']} to {new_prio_str.upper()}")
-                try:
-                    from app.models.ticket import TicketUpdate, TicketPriority
-                    try: new_prio_enum = TicketPriority(new_prio_str)
-                    except: new_prio_enum = TicketPriority.MEDIUM
+    else:
+        # --- PATH B: NO TICKET ---
+        # New conversation started. Send greeting + Create Ticket.
+        logger.info(f"🆕 No Active Ticket. Initiating New Interaction Flow...")
+        
+        # 1. Send Auto Reply (Greeting)
+        resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
+        display_name = customer_name or 'Kak'
+        
+        # Clean up display name if it looks like an ID
+        if "@lid" in str(display_name) or "User" in str(display_name):
+            display_name = str(resolved_contact).split("@")[0]
 
-                    ticket_svc = get_ticket_service()
-                    await ticket_svc.update_ticket(
-                        ticket_id=active_ticket["id"],
-                        update_data=TicketUpdate(priority=new_prio_enum),
-                        actor_id="system_guard_v2",
-                        actor_type=ActorType.SYSTEM
-                    )
-                    prio_str = new_prio_str
-                    should_trigger_ai = True 
-                except Exception as e:
-                    logger.error(f"❌ Failed to upgrade ticket priority: {e}")
-                    should_trigger_ai = False
-            else:
-                logger.info("📉 New message is still Low Priority. Keeping silent.")
-                should_trigger_ai = False
-                return {**res, "handled_by": "skipped_low_priority_ticket"}
-        else:
-            prio_str = ticket_prio
-            should_trigger_ai = True
-
-    # --- LOGIC BRANCH B: NO TICKET ---
-    elif ticket_config.get("enabled"):
-        should_ticket, pred_cat, prio_str, conf, reason, ticket_title = ml_guard.predict(message_content)
-
-        # Force Category 'General' if unknown
-        if not pred_cat or str(pred_cat).lower() == "unknown":
-            pred_cat = "General"
-
-        # [CASE 1] LOW PRIORITY
-        if prio_str == "low":
-            logger.info(f"🛡️ Guard V2: Low Priority ({reason}). Sending Greeting & Stopping AI.")
-            resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
-            
-            display_name = customer_name or 'Kak'
-            if "@lid" in str(display_name) or "User" in str(display_name):
-                display_name = str(resolved_contact).split("@")[0]
-
-            greeting_msg = (
-                f"Halo {display_name}! 👋\n\n"
-                "Pesan Anda telah kami terima melalui platform Syntra.\n"
-                "Silakan jelaskan permasalahan yang Anda alami secara lebih rinci agar kami dapat membantu Anda dengan lebih baik."
-            )
-            chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
-            cust_data = {"phone": resolved_contact, "metadata": {"telegram_id": resolved_contact}}
-            
-            await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
-            await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel, agent_name=agent["name"])
-            
-            if ticket_config.get("autoCreateTicket"):
-                try: 
-                    try: final_prio = TicketPriority.LOW
-                    except: final_prio = "low"
-                    ticket_svc = get_ticket_service()
-                    ticket_data = TicketCreate(
-                        chat_id=chat_id, customer_id=cust_id,
-                        title=f"[LOW] {pred_cat.upper()} - {message_content[:40]}",
-                        description=f"Message: {message_content}\n\n[Auto-created by Guard V2 - Low Priority]",
-                        priority=final_prio, category=pred_cat
-                    )
-                    await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
-                except Exception as e: logger.error(f"❌ Failed to create low-prio ticket: {e}")
-
-            should_trigger_ai = False
-            return {**res, "handled_by": "system_greeting"}
-
-        # [CASE 2] MED/HIGH PRIORITY
-        elif should_ticket:
-            logger.info(f"🎫 Guard V2: Ticket Intent Detected ({pred_cat}) - Prio: {prio_str}")
-            if ticket_config.get("autoCreateTicket"):
-                try:
-                    try: final_prio = TicketPriority(prio_str)
-                    except: final_prio = TicketPriority.MEDIUM
-                    
-                    final_cat = pred_cat
-                    if ticket_config.get("categories") and pred_cat not in ticket_config["categories"]:
-                         final_cat = ticket_config["categories"][0] if ticket_config["categories"] else "General"
-
-                    ticket_svc = get_ticket_service()
-                    ticket_data = TicketCreate(
-                        chat_id=chat_id, customer_id=cust_id,
-                        title=ticket_title or f"[{prio_str.upper()}] {final_cat} - {message_content[:40]}",
-                        description=f"Message: {message_content}\n\n[Auto-created by Guard V2]",
-                        priority=final_prio, category=final_cat
-                    )
-                    await ticket_svc.create_ticket(ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
-                except Exception as e: logger.error(f"❌ Failed to create auto-ticket in V2: {e}")
-
-    # 6. TRIGGER AI V2
-    if should_trigger_ai:
-        logger.info(f"⚡ Enqueueing AI V2 for Chat {chat_id} [Prio: {prio_str}]")
-        queue_svc = get_llm_queue()
-        await queue_svc.enqueue(
-            chat_id=chat_id, 
-            message_id=msg_id, 
-            supabase_client=supabase, 
-            priority=prio_str
+        greeting_msg = (
+            f"Halo {display_name}! 👋\n\n"
+            "Terima kasih telah menghubungi kami. Pesan Anda telah kami terima.\n"
+            "Kami membuatkan tiket untuk Anda dan Agen AI kami akan segera merespons."
         )
         
-        return {**res, "handled_by": "ai_v2_queued"}
+        # Send greeting via channel
+        chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
+        cust_data = {"phone": resolved_contact, "metadata": {"telegram_id": resolved_contact}}
+        
+        await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel, agent_name=agent["name"])
+
+        # 2. Create Ticket (LOW Priority)
+        try:
+            # Check config if ticketing is enabled (default to true if not present)
+            ticket_config = agent.get("ticketing_config") or {}
+            if isinstance(ticket_config, str): ticket_config = json.loads(ticket_config)
+            
+            # Create the Ticket
+            new_ticket_data = TicketCreate(
+                chat_id=chat_id,
+                customer_id=cust_id,
+                title=f"[LOW] New Interaction - {message_content[:40]}",
+                description=f"First Message: {message_content}\n\n[Auto-created: Low Priority Default]",
+                priority=TicketPriority.LOW,
+                category="General"
+            )
+            
+            await ticket_svc.create_ticket(
+                data=new_ticket_data,
+                organization_id=org_id,
+                ticket_config=ticket_config,
+                actor_id=None,
+                actor_type=ActorType.SYSTEM
+            )
+            logger.info("✅ Default Low Priority Ticket Created.")
+            ai_priority = "low"
+
+        except Exception as e:
+            logger.error(f"❌ Failed to create default ticket: {e}")
+
+    # 8. QUEUE AI (Universal)
+    # Both paths end here: "Batch Message -> Send to AI"
+    logger.info(f"⚡ Enqueueing AI for Chat {chat_id} [Prio: {ai_priority}]")
+    await queue_svc.enqueue(
+        chat_id=chat_id, 
+        message_id=msg_id, 
+        supabase_client=supabase, 
+        priority=ai_priority
+    )
     
-    return res
+    return {**res, "handled_by": "ai_v2_queued"}
 
 # ============================================
 # 2. WHATSAPP UNOFFICIAL WEBHOOK (Updated)
@@ -1829,7 +1181,6 @@ async def whatsapp_unofficial_webhook(
         logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
         return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
 
-
 # ============================================
 # 3. TELEGRAM USERBOT WEBHOOK (Updated)
 # ============================================
@@ -1843,52 +1194,59 @@ async def telegram_userbot_webhook(
         agent_id = payload.sessionId
         raw_data = payload.data
         
+        # 1. Adapt Content Source (Text vs Media)
+        # Telegram Userbot payload structure varies slightly between text and media
         if payload.dataType == "media":
-            logger.info(f"📸 Telegram Userbot: Received Media (Agent: {agent_id})")
             content_source = raw_data
             data_wrapper = raw_data.get("message", {}) or {}
             data_content = data_wrapper.get("_data", {}) or data_wrapper
         else:
-            logger.info(f"💬 Telegram Userbot: Received Text (Agent: {agent_id})")
             data_wrapper = raw_data.get("message", {}) or {}
             data_content = data_wrapper.get("_data", {}) or data_wrapper
             content_source = raw_data
 
+        # 2. Basic Validation
         if not data_content and payload.dataType != "media": 
             raise HTTPException(status_code=400, detail="Invalid JSON structure")
         
-        # Idempotency
+        # 3. Idempotency Check (Prevent processing same message twice)
         msg_id = data_content.get("id", {}).get("id")
         supabase = get_supabase_client()
         if msg_id and await check_telegram_idempotency(supabase, str(msg_id)):
              return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
 
-        # Identity
+        # 4. Identity Extraction
         sender_id = str(data_content.get("from", ""))
         sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
         timestamp_unix = data_content.get("t")
+        
+        # Phone logic: Try to use 'phone' field, fallback to sender_id if missing/null
         raw_phone = data_content.get("phone")
         final_phone = sender_id
         if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
             final_phone = str(raw_phone)
 
-        # Agent & Settings
+        # 5. Agent Verification
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data: raise HTTPException(404, "Agent not found")
+        if not agent_res.data: 
+            raise HTTPException(404, "Agent not found")
         agent = agent_res.data[0]
         
+        # 6. Apply Agent Settings
         settings_data = await fetch_agent_settings(supabase, agent_id)
-        if settings_data: agent.update(settings_data)
+        if settings_data: 
+            agent.update(settings_data)
 
-        # Content Extraction
+        # 7. Content Extraction (Uses the helper to handle Base64/MimeTypes safely)
         try:
             message_text, msg_type, media_url = await _handle_message_content_for_telegram(content_source, payload.dataType)
         except Exception as e:
-            logger.error(f"❌ Telegram Content Error: {e}")
+            logger.error(f"❌ Telegram Content Parse Error: {e}")
             message_text = ""
             msg_type = "text"
             media_url = None
 
+        # 8. Prepare Metadata
         msg_meta = {
             "source_format": "wa_unofficial_json", 
             "telegram_message_id": msg_id, 
@@ -1898,9 +1256,13 @@ async def telegram_userbot_webhook(
             "message_type": msg_type 
         }
         
-        cust_meta = { "telegram_id": sender_id, "phone": final_phone, "source": "telegram_userbot" }
+        cust_meta = { 
+            "telegram_id": sender_id, 
+            "phone": final_phone, 
+            "source": "telegram_userbot" 
+        }
 
-        # [CHANGE] Use V2 Processor
+        # 9. Process via V2 (Implements: Check Ticket -> Auto Reply -> Create Ticket Low Prio)
         result = await process_webhook_message_v2(
             agent=agent, 
             channel="telegram", 
@@ -1912,11 +1274,18 @@ async def telegram_userbot_webhook(
             supabase=supabase
         )
         
+        # 10. Return Response
         return WebhookRouteResponse(
-            success=True, chat_id=result.get("chat_id"), message_id=result.get("message_id"), 
-            customer_id=result.get("customer_id"), is_new_chat=result.get("is_new_chat", False),
-            was_reopened=result.get("was_reopened", False), handled_by=result.get("handled_by", "ai_v2"), 
-            status=result.get("status", "open"), channel="telegram", message=_generate_status_message(result)
+            success=True, 
+            chat_id=result.get("chat_id"), 
+            message_id=result.get("message_id"), 
+            customer_id=result.get("customer_id"), 
+            is_new_chat=result.get("is_new_chat", False),
+            was_reopened=result.get("was_reopened", False), 
+            handled_by=result.get("handled_by", "ai_v2"), 
+            status=result.get("status", "open"), 
+            channel="telegram", 
+            message=_generate_status_message(result)
         )
         
     except HTTPException:
@@ -1924,7 +1293,6 @@ async def telegram_userbot_webhook(
     except Exception as e:
         logger.error(f"❌ Telegram Userbot Critical: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 
