@@ -32,13 +32,14 @@ class DynamicCRMAgentV2:
         customer_message: str,
         chat_history: List[Dict[str, Any]],
         agent_settings: Dict[str, Any],
-        organization_id: str,     # <--- MATCHING ARGUMENT for V2
+        organization_id: str,
         rag_context: str = "",
         category: str = "general",
-        name_user: str = "Customer"
+        name_user: str = "Customer",
+        image_url: str = None
     ) -> Dict[str, Any]:
         """
-        Generates the AI response. 
+        Generates the AI response with Vision support for both History and Current Message.
         Returns Dict: { "content": str, "usage": dict, "metadata": dict }
         """
         try:
@@ -46,7 +47,7 @@ class DynamicCRMAgentV2:
             persona = self._parse_json(agent_settings.get("persona_config", {}))
             advanced = self._parse_json(agent_settings.get("advanced_config", {}))
             
-            # Extract Handoff Config (Escalation is AI's job)
+            # Extract Handoff Config
             handoff = advanced.get("handoffTriggers", {})
 
             # 2. EXTRACT VARIABLES
@@ -68,7 +69,6 @@ class DynamicCRMAgentV2:
                 f"Language: {language}.\n\n"
             )
 
-            # INJECT HANDOFF RULES
             if handoff.get("enabled"):
                 system_prompt += (
                     f"ESCALATION RULES:\n"
@@ -76,14 +76,9 @@ class DynamicCRMAgentV2:
                     f"- Trigger Keyword: 'HUMAN_HANDOFF'.\n\n"
                 )
 
-            # Custom Instructions
             if custom_instructions:
-                system_prompt += (
-                    f"OPERATIONAL INSTRUCTIONS:\n"
-                    f"{custom_instructions}\n\n"
-                )
+                system_prompt += f"OPERATIONAL INSTRUCTIONS:\n{custom_instructions}\n\n"
 
-            # RAG / Knowledge Boundaries
             system_prompt += (
                 f"STRICT KNOWLEDGE BOUNDARIES:\n"
                 f"1. You are a CLOSED-DOMAIN agent. NO outside knowledge allowed.\n"
@@ -95,25 +90,56 @@ class DynamicCRMAgentV2:
                 f"- Address customer as '{name_user}'.\n"
             )
 
-            # 4. BUILD MESSAGE CHAIN
+            # 4. BUILD MESSAGE CHAIN (WITH ROBUST VISION HISTORY)
             messages = [{"role": "system", "content": system_prompt}]
             
             for msg in chat_history:
-                # Map DB roles to LLM roles
                 role = "assistant" if msg.get("sender_type") == "ai" else "user"
-                content = msg.get("content") or msg.get("message_content", "")
-                if content:
-                    messages.append({"role": role, "content": content})
-            
-            messages.append({"role": "user", "content": customer_message})
+                content_text = msg.get("content") or msg.get("message_content", "") or ""
+                
+                # [FIX] Robust Image Check in History
+                msg_meta = msg.get("metadata") or {}
+                hist_media_url = msg_meta.get("media_url")
+                media_type = str(msg_meta.get("media_type", "")).lower()
+                
+                is_image = False
+                if hist_media_url:
+                    # Check explicit type OR file extension
+                    if "image" in media_type:
+                        is_image = True
+                    elif any(ext in hist_media_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', 'googleusercontent']):
+                        is_image = True
 
-            # 5. SEND TO PROXY
+                if hist_media_url and is_image:
+                    # Format as Multi-modal (Text + Image)
+                    content_block = []
+                    if content_text:
+                        content_block.append({"type": "text", "text": content_text})
+                    content_block.append({"type": "image_url", "image_url": {"url": hist_media_url}})
+                    
+                    messages.append({"role": role, "content": content_block})
+                elif content_text:
+                    # Text Only
+                    messages.append({"role": role, "content": content_text})
+            
+            # 5. HANDLE CURRENT MESSAGE
+            if image_url:
+                final_content = [
+                    {"type": "text", "text": customer_message},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]
+            else:
+                final_content = customer_message
+
+            messages.append({"role": "user", "content": final_content})
+
+            # 6. SEND TO PROXY
             payload = {
                 "messages": messages,
                 "category": category,
                 "nameUser": name_user,
                 "temperature": temperature,
-                "organization_id": organization_id # <--- Sending this to Proxy for Logging
+                "organization_id": organization_id
             }
 
             async with aiohttp.ClientSession() as session:
@@ -127,16 +153,14 @@ class DynamicCRMAgentV2:
                     if response.status != 200:
                         error_text = await response.text()
                         logger.error(f"❌ Speaker V2 Error {response.status}: {error_text}")
-                        # Return clean error dict, don't crash
                         return {
                             "content": "Maaf, saya sedang istirahat sebentar.",
-                            "metadata": {"error": f"Proxy {response.status}"},
+                            "metadata": {"error": f"Proxy {response.status}", "is_error": True},
                             "usage": {}
                         }
                     
                     result = await response.json()
                     
-                    # Handle diverse proxy responses (OpenAI vs Simple)
                     content = ""
                     try:
                         content = result["choices"][0]["message"]["content"]
@@ -149,15 +173,25 @@ class DynamicCRMAgentV2:
                         "usage": result.get("usage", {})
                     }
 
-        except Exception as e:
-            logger.error(f"❌ Speaker V2 Exception: {e}")
-            # Fallback return
+        except aiohttp.ClientConnectorError:
+            logger.error(f"❌ Speaker V2 Offline: Cannot connect to {self.proxy_url}")
             return {
-                "content": "Maaf, sistem sedang sibuk. Mohon coba lagi nanti.",
-                "metadata": {"error": str(e)},
-                "usage": {}
+                "content": "Maaf, sistem sedang under maintenance. Mohon coba lagi nanti",
+                "metadata": {"error": "Service Unavailable"},
+                "usage": {},
+                "is_error": True
             }
 
+        except Exception as e:
+            logger.error(f"❌ Speaker V2 Exception: {e}")
+            return {
+                "content": "Maaf, sistem sedang sibuk. Mohon coba lagi nanti.",
+                "metadata": {"error": str(e), "is_error": True},
+                "usage": {}
+            }
+        
+
+        
 # Singleton
 _dynamic_crm_agent_v2 = None
 def get_dynamic_crm_agent_v2():

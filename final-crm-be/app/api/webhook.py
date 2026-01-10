@@ -502,7 +502,7 @@ async def resolve_lid_to_real_number(
 async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
     """
     DRY Helper: Analyzes message body/media, uploads content if needed.
-    [FIX] Now detects message_type based on MIME type, not just the generic 'type' label.
+    [FIX] Aggressively sanitizes Base64 from captions and auto-detects image types.
     """
     content = ""
     msg_type = "text"
@@ -523,9 +523,12 @@ async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[s
         mime = media_obj.get("mimetype", "application/octet-stream")
         raw_type = media_obj.get("type", "file")
         
-        # [FIX] Detect Type from MIME (More accurate than raw_type)
+        # [FIX] Smart Type Detection (Check headers if MIME is generic)
         if "image" in mime:
             msg_type = "image"
+        elif base64_data.startswith("/9j/") or base64_data.startswith("iVBORw0KGgo"):
+            msg_type = "image" # Force image for JPEG/PNG signatures
+            if "octet" in mime: mime = "image/jpeg" # Correct MIME
         elif "video" in mime:
             msg_type = "video"
         elif "audio" in mime:
@@ -535,32 +538,49 @@ async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[s
         else:
             msg_type = "file"
             
-        # [FIX] Improved Extension Logic (Simple fallback)
+        # [FIX] Improved Extension Logic
         ext = "bin"
-        if "/" in mime:
+        if "/" in mime and "octet" not in mime:
             ext = mime.split("/")[-1].replace("jpeg", "jpg")
         else:
-            ext_map = {"image": "jpg", "ptt": "ogg", "document": "pdf", "audio": "mp3", "video": "mp4"}
-            ext = ext_map.get(raw_type, "bin")
+            # Fallback extension based on type
+            if msg_type == "image": ext = "jpg"
+            elif msg_type == "audio": ext = "mp3"
+            elif msg_type == "video": ext = "mp4"
         
         media_url = await _upload_media_to_supabase(base64_data, mime, ext)
         
-        # [FIX] Extract Caption: Check media_obj first (Tele), then fallback to message body (WA)
+        # [FIX] Extract Caption & Sanitize Base64 bleeding
+        # 1. Try explicit caption
         content = media_obj.get("caption", "")
+        
+        # 2. Fallback to body (common in WA), BUT check if it's Base64 first
         if not content:
-            # WhatsApp structure: data.message.body contains the caption
             msg_structure = message_data.get("message", {})
-            content = msg_structure.get("body", "") or msg_structure.get("_data", {}).get("body", "")
+            potential_content = msg_structure.get("body", "") or msg_structure.get("_data", {}).get("body", "")
+            
+            # Only use if it does NOT look like Base64
+            if potential_content and len(str(potential_content)) < 500:
+                content = potential_content
+            elif potential_content and " " in str(potential_content)[:50]:
+                content = potential_content
+
+        # 3. Final Sanity Check: If content is actually the Base64 string, kill it.
+        if content and (str(content).startswith("/9j/") or len(str(content)) > 1000):
+            logger.warning("🧹 Sanitized Base64 string from caption field.")
+            content = ""
 
     else:
         # Handle Text
         body = message_data.get("body") or message_data.get("_data", {}).get("body", "")
         
-        # Check for Base64 sneaking in as text
+        # Check for Base64 sneaking in as text (No-Caption Image)
         if body and isinstance(body, str) and (body.startswith("/9j/") or (len(body) > 500 and " " not in body[:50])):
             try:
+                # Treat as Image upload
+                logger.info("🕵️ Detected Base64 image sent as text. Converting...")
                 media_url = await _upload_media_to_supabase(body, "image/jpeg", "jpg")
-                content = "" 
+                content = "" # Clear text content
                 msg_type = "image"
             except Exception as e:
                 logger.error(f"❌ Failed to process Base64 text: {e}")

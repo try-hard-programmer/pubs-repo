@@ -172,7 +172,8 @@ class ConnectionManager:
         is_new_chat: bool = False,
         was_reopened: bool = False,
         metadata: Dict[str, Any] = None,  # <--- Added missing parameter
-        attachment: Dict[str, Any] = None
+        attachment: Dict[str, Any] = None,
+        created_at: str = None
     ):
         """
         Broadcast new incoming message notification to all organization members.
@@ -194,7 +195,8 @@ class ConnectionManager:
                 "is_new_chat": is_new_chat,
                 "was_reopened": was_reopened,
                 "metadata": metadata,  # <--- Include metadata in payload
-                "attachment": attachment
+                "attachment": attachment,
+                "created_at": created_at
             }
         }
 

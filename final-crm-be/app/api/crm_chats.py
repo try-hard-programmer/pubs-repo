@@ -1541,7 +1541,8 @@ async def get_chat_messages(
 )
 async def create_message(
     chat_id: str,
-    content: str = Form(...),
+    # [FIX 1] Make content Optional. Allows FE to send empty form-data for files.
+    content: Optional[str] = Form(None), 
     sender_type: str = Form(...),
     sender_id: str = Form(...),
     ticket_id: Optional[str] = Form(None),
@@ -1554,6 +1555,11 @@ async def create_message(
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
         
+        # [FIX 2] Aggressive Sanitization
+        # Prevents "null", "undefined" or Raw URL strings from becoming the message text.
+        if content is None or content.lower() in ["null", "undefined"]:
+            content = ""
+
         # Verify chat
         chat_check = supabase.table("chats").select("id, customer_id, channel, handled_by").eq("id", chat_id).eq("organization_id", organization_id).execute()
         if not chat_check.data: raise HTTPException(404, f"Chat {chat_id} not found")
@@ -1620,6 +1626,8 @@ async def create_message(
         response = supabase.table("messages").insert(message_data).execute()
         if not response.data: raise HTTPException(500, "Failed to create message")
         
+        created_message = response.data[0] # [CRITICAL] Capture the DB record immediately
+        
         supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
         
         logger.info(f"Message created in chat {chat_id}")
@@ -1657,7 +1665,6 @@ async def create_message(
         # ============================================
         # 4. BROADCAST (Fixed)
         # ============================================
-        created_message = response.data[0]
         sender_name = None
         
         # Resolve Sender Name (Simplified)
@@ -1693,12 +1700,18 @@ async def create_message(
                     message_id=created_message["id"],
                     customer_id=ws_cust_id,
                     customer_name=broadcast_name, 
-                    message_content=content,
+                    
+                    # [FIX 3] Use DB Content & Metadata
+                    # This ensures the frontend gets exactly what was saved (captions, URLs, etc)
+                    message_content=created_message.get("content", ""), 
+                    
                     channel=chat_data_minimal.get("channel"),
                     handled_by=chat_data_minimal.get("handled_by"),
                     sender_type=sender_type,
                     sender_id=sender_id,
-                    attachment=attach_dict  # <--- NOW IT WILL WORK
+                    attachment=attach_dict,
+                    metadata=created_message.get("metadata"),
+                    created_at=created_message.get("created_at")
                 )
             except Exception as e:
                 logger.warning(f"WS Broadcast failed: {e}")
@@ -1708,12 +1721,11 @@ async def create_message(
     except HTTPException: raise
     except Exception as e:
         logger.error(f"Create message error: {e}")
-        raise HTTPException(500, "Failed to create message")
-    
+        raise HTTPException(500, "Failed to create message")  
+
 # ============================================
 # TICKET ENDPOINTS
 # ============================================
-
 
 @router.get(
     "/tickets",
