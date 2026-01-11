@@ -370,23 +370,55 @@ const initializeEvents = (client, sessionId) => {
         return;
       }
 
-      triggerWebhook(sessionWebhook, sessionId, "message", { message });
-      if (message.hasMedia && message._data?.size < maxAttachmentSize) {
-        // custom service event
-        checkIfEventisEnabled("media").then((_) => {
-          message
-            .downloadMedia()
-            .then((messageMedia) => {
-              triggerWebhook(sessionWebhook, sessionId, "media", {
-                messageMedia,
-                message,
-              });
-            })
-            .catch((e) => {
-              console.log("Download media error:", e.message);
-            });
-        });
+      // Check if it's a media message that fits our size limit
+      const isMedia =
+        message.hasMedia && message._data?.size < maxAttachmentSize;
+
+      if (isMedia) {
+        // CASE 1: It is Media. WAIT for the download.
+        checkIfEventisEnabled("media")
+          .then(async (_) => {
+            try {
+              // console.log(`⏳ Downloading media for ${message.id.id}...`);
+
+              // Create a race: Download vs 15s Timeout
+              const downloadPromise = message.downloadMedia();
+              const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Download timeout")), 15000)
+              );
+
+              const messageMedia = await Promise.race([
+                downloadPromise,
+                timeoutPromise,
+              ]);
+
+              if (messageMedia && messageMedia.data) {
+                // ✅ Success: Send ONE webhook with type 'media' (includes Base64)
+                triggerWebhook(sessionWebhook, sessionId, "media", {
+                  messageMedia,
+                  message,
+                });
+              } else {
+                throw new Error("Empty media object returned");
+              }
+            } catch (e) {
+              console.error(
+                `⚠️ Media download failed/timeout (${e.message}). Sending as text fallback.`
+              );
+
+              // ⚠️ Fallback: Send as 'message' (Text/Metadata only) so we don't lose the event
+              triggerWebhook(sessionWebhook, sessionId, "message", { message });
+            }
+          })
+          .catch(() => {
+            // If 'media' event is disabled in config, just send as text
+            triggerWebhook(sessionWebhook, sessionId, "message", { message });
+          });
+      } else {
+        // CASE 2: Text Message (or too large). Send immediately.
+        triggerWebhook(sessionWebhook, sessionId, "message", { message });
       }
+
       if (setMessagesAsSeen) {
         const chat = await message.getChat();
         chat.sendSeen();

@@ -39,7 +39,7 @@ class DynamicCRMAgentV2:
         image_url: str = None
     ) -> Dict[str, Any]:
         """
-        Generates the AI response with Vision support for both History and Current Message.
+        Generates the AI response with Vision support.
         Returns Dict: { "content": str, "usage": dict, "metadata": dict }
         """
         try:
@@ -90,57 +90,40 @@ class DynamicCRMAgentV2:
                 f"- Address customer as '{name_user}'.\n"
             )
 
-            # 4. BUILD MESSAGE CHAIN (WITH ROBUST VISION HISTORY)
+            # 4. BUILD MESSAGE CHAIN (TEXT ONLY - Images go in files array)
             messages = [{"role": "system", "content": system_prompt}]
             
             for msg in chat_history:
                 role = "assistant" if msg.get("sender_type") == "ai" else "user"
                 content_text = msg.get("content") or msg.get("message_content", "") or ""
                 
-                # [FIX] Robust Image Check in History
-                msg_meta = msg.get("metadata") or {}
-                hist_media_url = msg_meta.get("media_url")
-                media_type = str(msg_meta.get("media_type", "")).lower()
-                
-                is_image = False
-                if hist_media_url:
-                    # Check explicit type OR file extension
-                    if "image" in media_type:
-                        is_image = True
-                    elif any(ext in hist_media_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', 'googleusercontent']):
-                        is_image = True
-
-                if hist_media_url and is_image:
-                    # Format as Multi-modal (Text + Image)
-                    content_block = []
-                    if content_text:
-                        content_block.append({"type": "text", "text": content_text})
-                    content_block.append({"type": "image_url", "image_url": {"url": hist_media_url}})
-                    
-                    messages.append({"role": role, "content": content_block})
-                elif content_text:
-                    # Text Only
+                # Add text content only (images handled separately)
+                if content_text:
                     messages.append({"role": role, "content": content_text})
             
-            # 5. HANDLE CURRENT MESSAGE
+            # 5. ADD CURRENT MESSAGE (TEXT ONLY)
+            messages.append({"role": "user", "content": customer_message})
+
+            # ✅ 6. BUILD FILES ARRAY FOR IMAGES
+            files = []
             if image_url:
-                final_content = [
-                    {"type": "text", "text": customer_message},
-                    {"type": "image_url", "image_url": {"url": image_url}}
-                ]
-            else:
-                final_content = customer_message
+                files.append({
+                    "type": "image",
+                    "url": image_url
+                })
+                logger.info(f"📸 Adding image to request: {image_url[:50]}...")
 
-            messages.append({"role": "user", "content": final_content})
-
-            # 6. SEND TO PROXY
+            # 7. SEND TO PROXY
             payload = {
                 "messages": messages,
+                "files": files,  # ✅ THIS IS THE FIX!
                 "category": category,
                 "nameUser": name_user,
                 "temperature": temperature,
                 "organization_id": organization_id
             }
+
+            logger.info(f"🌐 Calling proxy with {len(messages)} messages, {len(files)} files")
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -183,7 +166,7 @@ class DynamicCRMAgentV2:
             }
 
         except Exception as e:
-            logger.error(f"❌ Speaker V2 Exception: {e}")
+            logger.error(f"❌ Speaker V2 Exception: {e}", exc_info=True)
             return {
                 "content": "Maaf, sistem sedang sibuk. Mohon coba lagi nanti.",
                 "metadata": {"error": str(e), "is_error": True},

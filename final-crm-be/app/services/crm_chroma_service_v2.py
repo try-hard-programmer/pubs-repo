@@ -90,22 +90,39 @@ class CRMChromaServiceV2:
 
             if not embeddings: raise Exception("Embedding failed")
 
-            # Billing Logic
+            # =========================================================
+            # 💰 BILLING LOGIC (With "Paranoia Logging")
+            # =========================================================
             if organization_id:
-                cost = 0.0
-                if "cost_usd" in usage: cost = float(usage["cost_usd"])
-                elif "total_tokens" in usage: cost = usage["total_tokens"] * 0.0000002
-                
-                if cost > 0:
-                    await self.credit_service.add_transaction(CreditTransactionCreate(
-                        organization_id=organization_id,
-                        amount=-cost, 
-                        description=f"Knowledge Embedding ({len(texts)} chunks)",
-                        transaction_type=TransactionType.USAGE,
-                        metadata={"agent_id": agent_id, "provider": "openai"}
-                    ))
-                    logger.info(f"💰 Deducted ${cost:.6f} for embedding.")
+                try:
+                    cost = 0.0
+                    if "cost_usd" in usage: cost = float(usage["cost_usd"])
+                    elif "total_tokens" in usage: cost = usage["total_tokens"] * 0.0000002
+                    
+                    if cost > 0:
+                        logger.info(f"💸 Calculated Cost: ${cost:.6f}. Attempting deduction for Org {organization_id}...")
+                        
+                        # [CRITICAL FIX] REMOVED 'await'. This function is synchronous.
+                        tx_result = await self.credit_service.add_transaction(CreditTransactionCreate(
+                            organization_id=organization_id,
+                            amount=-cost, 
+                            description=f"Knowledge Embedding ({len(texts)} chunks)",
+                            transaction_type=TransactionType.USAGE,
+                            metadata={"agent_id": agent_id, "provider": "openai"}
+                        ))
+                        
+                        logger.info(f"💰 Deduction successful. Transaction Object: {tx_result}")
+                    else:
+                        logger.info("🆓 Cost was $0.00. No deduction made.")
+                        
+                except Exception as billing_err:
+                    # [SAFETY] If billing crashes, LOG IT but DO NOT stop the document save.
+                    logger.error(f"🚨 BILLING CRASHED (Money saved, but logic failed): {billing_err}")
+                    # We continue execution so the user still gets their file saved.
 
+            # =========================================================
+            # 💾 STORAGE LOGIC
+            # =========================================================
             collection = self.get_or_create_collection(agent_id)
             ids = [f"{m.get('doc_id')}_{i}" for i, m in enumerate(metadatas)]
             

@@ -118,7 +118,6 @@ class DynamicAIServiceV2:
             chat = chat_res.data[0]
 
             # [FIX] RESOLVE REAL CUSTOMER NAME
-            # The 'chats' table usually only has 'customer_id'. We need the real name from 'customers'.
             real_customer_name = "Customer"
             if chat.get("customer_id"):
                 try:
@@ -156,8 +155,7 @@ class DynamicAIServiceV2:
             # Extract Name for UI Broadcast
             agent_name = self._extract_agent_name(agent_settings)
 
-            # 3. Get User Message AND Metadata [FIXED]
-            # We must select 'metadata' to access the image URL
+            # 3. Get User Message AND Metadata
             prompt_res = await asyncio.to_thread(
                 lambda: self.supabase.table("messages")
                 .select("content, metadata") 
@@ -171,19 +169,46 @@ class DynamicAIServiceV2:
                 user_prompt = prompt_res.data[0].get("content", "") or ""
                 msg_metadata = prompt_res.data[0].get("metadata", {}) or {}
 
-            # 4. Get History
+            # 4. Get History (✅ OPTIMIZED - Exclude current, deduplicate)
             history_limit = 5
             if isinstance(agent_settings.get("advanced_config"), dict):
                 history_limit = int(agent_settings["advanced_config"].get("historyLimit", 5))
             
+            # Get extra messages for deduplication
             msgs_res = await asyncio.to_thread(
-                lambda: self.supabase.table("messages").select("*").eq("chat_id", chat_id).order("created_at", desc=True).limit(history_limit).execute()
+                lambda: self.supabase.table("messages")
+                .select("*")
+                .eq("chat_id", chat_id)
+                .neq("id", msg_id)  # ✅ EXCLUDE current message
+                .order("created_at", desc=True)
+                .limit(history_limit * 2)  # Get extra to filter duplicates
+                .execute()
             )
-            history = msgs_res.data[::-1] 
+            
+            # ✅ DEDUPLICATE consecutive identical messages
+            raw_history = msgs_res.data[::-1]  # Reverse to chronological order
+            history = []
+            last_content = None
+            
+            for msg in raw_history:
+                content = msg.get("content", "").strip()
+                
+                # Skip empty messages or consecutive duplicates
+                if not content or content == last_content:
+                    continue
+                
+                history.append(msg)
+                last_content = content
+                
+                # Stop when we have enough unique messages
+                if len(history) >= history_limit:
+                    break
+            
+            logger.info(f"📜 History: {len(history)} unique messages (limit: {history_limit})")
 
             # 5. CALL READER V2 (RAG)
             context = ""
-            should_rag = (priority != "low" and len(user_prompt.split()) > 2)
+            should_rag = len(user_prompt.split()) > 2
 
             if should_rag:
                 if self.reader: 
@@ -197,15 +222,22 @@ class DynamicAIServiceV2:
                 else:
                     logger.warning("⚠️ RAG Skipped: Reader service unavailable (Chroma Down).")
             else:
-                logger.info("⏩ Smart RAG: Skipped (Trivial Message)")
+                logger.info("⏩ Smart RAG: Skipped (Message too short, <3 words)")
 
-            # 👁️ VISION BRIDGE: Extract Image URL
+            # 6. Extract image URL from message metadata
             media_url = msg_metadata.get("media_url")
-            # Only pass URL if it's an image
-            valid_image_url = media_url if (media_url and "image" in msg_metadata.get("media_type", "")) else None
+            media_type = msg_metadata.get("media_type") or ""
 
-            # 6. CALL SPEAKER V2 (Generation)
-            # Passes text + optional image URL to the LLM Proxy
+            # ✅ Better validation
+            valid_image_url = None
+            if media_url:
+                # Check if media_type contains "image" OR if URL looks like an image
+                if "image" in str(media_type).lower() or any(ext in media_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                    valid_image_url = media_url
+
+            logger.info(f"📸 Image detection: media_url={bool(media_url)}, media_type={media_type}, valid={valid_image_url is not None}")
+
+            # 7. CALL SPEAKER V2 (Generation)
             response_data = await self.speaker.process_message(
                 chat_id=chat_id,
                 customer_message=user_prompt,
@@ -214,8 +246,8 @@ class DynamicAIServiceV2:
                 organization_id=chat.get("organization_id", ""), 
                 rag_context=context,
                 category=priority, 
-                name_user=real_customer_name, # <--- [FIXED] Using the real name
-                image_url=valid_image_url     # <--- [FIXED] Passing the image
+                name_user=real_customer_name,
+                image_url=valid_image_url
             )
             
             reply_text = response_data.get("content", "Maaf, saya tidak dapat menjawab saat ini.")
@@ -233,7 +265,7 @@ class DynamicAIServiceV2:
                 logger.warning(f"🛑 Suppression: Detected exact duplicate response: '{reply_text[:20]}...'")
                 return {"success": True, "duplicate": True}
 
-            # 7. Save Response
+            # 8. Save Response
             ai_msg = {
                 "chat_id": chat_id,
                 "sender_type": "ai",
@@ -256,10 +288,10 @@ class DynamicAIServiceV2:
             full_db_record = res.data[0]
             ai_message_id = full_db_record["id"]
 
-            # 8. Broadcast (Using Standard Method)
+            # 9. Broadcast (Using Standard Method)
             await self._broadcast_response(chat, full_db_record, agent_name)
 
-            # 9. TRACK CREDITS
+            # 10. TRACK CREDITS
             is_system_error = metadata.get("is_error", False)
             if usage and chat.get("organization_id") and not is_system_error:
                 try:
@@ -311,10 +343,10 @@ class DynamicAIServiceV2:
                     await self._broadcast_response(chat, res.data[0], agent_name or "System AI")
                     
                 except Exception as final_err:
-                     logger.error(f"💀 Final Fallback Failed: {final_err}")
+                    logger.error(f"💀 Final Fallback Failed: {final_err}")
 
-            return {"success": False, "error": str(e)}
-        
+            return {"success": False, "error": str(e)}    
+             
              
 def process_dynamic_ai_response_v2(chat_id: str, msg_id: str, supabase: Any, priority: str = "medium"):
     service = DynamicAIServiceV2(supabase)
