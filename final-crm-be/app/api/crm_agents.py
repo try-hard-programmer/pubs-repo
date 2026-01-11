@@ -972,14 +972,14 @@ async def get_agent_knowledge_documents(
     response_model=KnowledgeDocument,
     status_code=status.HTTP_201_CREATED,
     summary="Upload knowledge document (V2)",
-    description="Upload knowledge using V2 Processor (Proxy Vision/Audio + Local Text)"
+    description="Upload knowledge using V2 Processor. metadata.agent_name saved to Chroma ONLY."
 )
 async def create_knowledge_document(
     agent_id: str,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
-    """[V2 IMPLEMENTATION] Upload, Process, Embed, and Bill."""
+    """[V2 IMPLEMENTATION] Upload, Process, Embed (with Agent Name), and Bill."""
     from uuid import uuid4
     import asyncio
     from app.services.storage_service import StorageService
@@ -994,10 +994,13 @@ async def create_knowledge_document(
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # Verify agent
-        agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        # [FIX 1] Select 'name' so we can inject it into Vector Metadata
+        agent_check = supabase.table("agents").select("id, name").eq("id", agent_id).eq("organization_id", organization_id).execute()
         if not agent_check.data:
             raise HTTPException(404, detail=f"Agent with ID {agent_id} not found")
+        
+        # Capture Name
+        agent_name = agent_check.data[0]["name"]
 
         # Read file
         file_content = await file.read()
@@ -1006,7 +1009,7 @@ async def create_knowledge_document(
         file_type = filename.rsplit(".", 1)[-1].upper() if "." in filename else "UNKNOWN"
         file_id = str(uuid4())
 
-        logger.info(f"📤 [V2] Uploading knowledge document for agent {agent_id}: {filename} ({file_size_kb} KB)")
+        logger.info(f"📤 [V2] Uploading knowledge document for agent {agent_name} ({agent_id}): {filename}")
 
         # Step 1: Upload to Supabase (Raw File)
         agent_bucket_name = f"agent_{agent_id}"
@@ -1031,19 +1034,18 @@ async def create_knowledge_document(
             logger.error(f"❌ Storage upload failed: {e}", exc_info=True)
             raise HTTPException(500, detail=f"File upload failed: {str(e)}")
 
-        # Step 2: Process document (Extract Text) - RUN IN EXECUTOR
+        # Step 2: Process document (Extract Text)
         doc_processor = DocumentProcessorV2(storage_service)
         try:
             logger.info(f"📄 Processing document: {filename}")
             
-            # ✅ Run sync process_document in thread pool
             loop = asyncio.get_event_loop()
             clean_text, _ = await loop.run_in_executor(
                 None,
                 doc_processor.process_document,
                 file_content,
                 filename,
-                agent_bucket_name,  # ✅ Pass bucket name instead of None
+                agent_bucket_name,
                 organization_id,
                 file_id
             )
@@ -1059,7 +1061,7 @@ async def create_knowledge_document(
                 supabase.storage.from_(agent_bucket_name).remove([file_id])
             raise HTTPException(500, detail=f"Document processing failed: {str(e)}")
 
-        # Step 3: Embed & Store (WITH BILLING)
+        # Step 3: Embed & Store (WITH BILLING & METADATA FIX)
         chroma_service = get_crm_chroma_service_v2()
 
         try:
@@ -1067,12 +1069,15 @@ async def create_knowledge_document(
             chunks = split_into_chunks(text=clean_text, size=512, overlap=50)
             logger.info(f"✅ Created {len(chunks)} chunks")
             
-            # Prepare metadata for Chroma
+            # [FIX 2] Inject agent_name into Chroma Metadata ONLY
             chunk_metas = [{
                 "file_id": file_id,
                 "filename": filename,
                 "chunk_index": i,
                 "doc_id": file_id,
+                "agent_id": agent_id,
+                "agent_name": agent_name,   # <--- HERE IT IS (Chroma only)
+                "organization_id": organization_id,
                 "processor": "v2"
             } for i in range(len(chunks))]
 
@@ -1095,7 +1100,7 @@ async def create_knowledge_document(
                 supabase.storage.from_(agent_bucket_name).remove([file_id])
             raise HTTPException(500, detail=f"Embedding failed: {str(e)}")
 
-        # Step 4: Save Metadata to Postgres
+        # Step 4: Save Metadata to Postgres (CLEAN - No Agent Name)
         try:
             logger.info(f"💾 Saving document metadata to database...")
             doc_data = {
@@ -1109,6 +1114,7 @@ async def create_knowledge_document(
                     "bucket": agent_bucket_name,
                     "processor_version": "v2",
                     "chunks": len(chunks)
+                    # [NOTE] agent_name is purposely omitted here
                 }
             }
             response = supabase.table("knowledge_documents").insert(doc_data).execute()
@@ -1121,7 +1127,6 @@ async def create_knowledge_document(
             
         except Exception as e:
             logger.error(f"❌ Database save failed: {e}", exc_info=True)
-            # Clean up
             if storage_uploaded:
                 supabase.storage.from_(agent_bucket_name).remove([file_id])
             raise HTTPException(500, detail=f"Database save failed: {str(e)}")
@@ -1136,60 +1141,88 @@ async def create_knowledge_document(
             except:
                 pass
         raise HTTPException(500, detail=str(e))
-    
+
+
 @router.delete(
     "/{agent_id}/knowledge-documents/{doc_id}",
-    status_code=status.HTTP_204_NO_CONTENT
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete knowledge document",
+    description="STRICT ORDER: Chroma -> Storage -> DB. Aborts if Chroma fails."
 )
 async def delete_knowledge_document(
     agent_id: str,
     doc_id: str,
     current_user: User = Depends(get_current_user)
 ):
+    from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
     from app.services.chromadb_service import ChromaDBService
-    from app.services.chromadb_service_v2 import ChromaDBServiceV2
 
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # Check Agent
-        if not supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute().data:
+        # 1. Verify Agent Ownership & Get Document Metadata
+        # We need the metadata BEFORE we delete anything.
+        agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not agent_check.data:
             raise HTTPException(404, detail="Agent not found")
 
-        # Get Metadata
         doc = supabase.table("knowledge_documents").select("*").eq("id", doc_id).execute()
-        if not doc.data: raise HTTPException(404, detail="Document not found")
+        if not doc.data:
+            raise HTTPException(404, detail="Document not found")
         
         meta = doc.data[0].get("metadata", {})
         file_id = meta.get("file_id")
         version = meta.get("processor_version", "v1")
 
-        # Delete Embeddings
+        # =========================================================
+        # 🛑 CRITICAL STEP 1: DELETE FROM CHROMA (The Gatekeeper)
+        # =========================================================
         if file_id:
             try:
                 if version == "v2":
-                    service = ChromaDBServiceV2()
-                    name = f"agent_{agent_id}_v2"
+                    svc = get_crm_chroma_service_v2()
+                    # We pass agent_id (UUID) because that is the Collection Name
+                    success = svc.delete_document(agent_id, file_id)
+                    
+                    if not success:
+                        # IF CHROMA FAILS, WE STOP.
+                        raise Exception("ChromaDB delete operation returned False")
                 else:
+                    # Legacy V1 Fallback
                     service = ChromaDBService()
-                    name = f"agent_{agent_id}"
-                
-                col = service.client.get_collection(name=name, embedding_function=service.embedding_function)
-                col.delete(where={"file_id": {"$eq": file_id}})
+                    name = f"agent_{agent_id}" # V1 still uses old naming
+                    try:
+                        col = service.client.get_collection(name=name, embedding_function=service.embedding_function)
+                        col.delete(where={"file_id": {"$eq": file_id}})
+                    except ValueError:
+                        pass # Collection already gone, safe to proceed
             except Exception as e:
-                logger.warning(f"Chroma delete failed: {e}")
+                logger.error(f"❌ Aborting Delete: Failed to clear Vector DB: {e}")
+                raise HTTPException(500, detail=f"Integrity Error: Failed to delete vectors. Database not touched. ({str(e)})")
 
-        # Delete Storage & DB Record
+        # =========================================================
+        # STEP 2: DELETE FROM STORAGE
+        # =========================================================
         if file_id:
-            supabase.storage.from_(f"agent_{agent_id}").remove([file_id])
-        
+            try:
+                # Try to remove, but don't crash if file is already missing from bucket
+                supabase.storage.from_(f"agent_{agent_id}").remove([file_id])
+            except Exception as e:
+                logger.warning(f"⚠️ Storage delete warning: {e}")
+
+        # =========================================================
+        # STEP 3: DELETE FROM DATABASE (Final Commit)
+        # =========================================================
         supabase.table("knowledge_documents").delete().eq("id", doc_id).execute()
+        
+        logger.info(f"🗑️ [Strict Delete] Successfully removed document {doc_id}")
         return None
 
     except HTTPException: raise
     except Exception as e:
-        raise HTTPException(500, detail=str(e)) 
+        logger.error(f"Delete failed: {e}")
+        raise HTTPException(500, detail=str(e))
 
 # ============================================
 # AGENT INTEGRATIONS ENDPOINTS

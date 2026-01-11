@@ -8,13 +8,18 @@ from app.services.credit_service import get_credit_service, CreditTransactionCre
 
 logger = logging.getLogger(__name__)
 
+# ==========================================
+# 1. EMBEDDING FUNCTION (Proxy Mode)
+# ==========================================
 class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
-    def __init__(self, base_url: str, api_key: str):
+    def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
+        # Proxy handles key, we just send a placeholder
+        self.api_key = "proxy-managed"
 
     def _call_api(self, input: List[str]) -> Tuple[List[List[float]], Dict[str, Any]]:
-        payload = { "model": "text-embedding-3-small", "input": input }
+        # [CHANGE] No model param, let Proxy default to text-embedding-3-small
+        payload = { "input": input }
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}" }
 
         try:
@@ -24,12 +29,9 @@ class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
                 return [], {}
 
             data = response.json()
-            
-            # Extract Usage & Cost from Proxy Response
             usage = data.get("usage", {})
             metadata = data.get("metadata", {})
             
-            # [NEW] Inject cost from proxy metadata into usage dict for easier access
             if "cost_usd" in metadata:
                 usage["cost_usd"] = metadata["cost_usd"]
 
@@ -54,6 +56,9 @@ class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
         return self._call_api(input)
 
 
+# ==========================================
+# 2. SERVICE CLASS (Strict UUID Naming)
+# ==========================================
 class CRMChromaServiceV2:
     def __init__(self):
         self.client = chromadb.HttpClient(
@@ -65,20 +70,17 @@ class CRMChromaServiceV2:
         default_proxy_url = f"{settings.PROXY_BASE_URL}/embeddings" if hasattr(settings, "PROXY_BASE_URL") else "http://localhost:6657/v2/embeddings"
         proxy_url = getattr(settings, "CRM_EMBEDDING_API_URL", None) or default_proxy_url
         
-        # Fallback to OPENAI_API_KEY if CRM_EMBEDDING_API_KEY is missing
-        api_key = getattr(settings, "CRM_EMBEDDING_API_KEY", None) or settings.OPENAI_API_KEY or "dummy-key"
-        
-        self.embedding_fn = LocalProxyEmbeddingFunction(base_url=proxy_url, api_key=api_key)
+        # [FIX] Clean init - no API Key logic needed
+        self.embedding_fn = LocalProxyEmbeddingFunction(base_url=proxy_url)
         self.credit_service = get_credit_service()
 
     def get_or_create_collection(self, agent_id: str):
-        # [FIX] Append '_v2' (or '_1536') to the name to isolate it from the old 1024-dim collection
+        # [FIX] Naming = Exact UUID. No "agent_" prefix, no "_v2" suffix.
         return self.client.get_or_create_collection(
-            name=f"agent_{agent_id}_v2", 
+            name=agent_id, 
             embedding_function=self.embedding_fn
         )
 
-    # [ASYNC] Handles Billing + Chroma Save
     async def add_documents(self, agent_id: str, texts: List[str], metadatas: List[Dict], organization_id: str = None):
         try:
             if not texts: return False
@@ -86,18 +88,13 @@ class CRMChromaServiceV2:
             logger.info(f"🧠 Embedding {len(texts)} chunks for Agent {agent_id}...")
             embeddings, usage = self.embedding_fn.embed_with_usage(texts)
 
-            if not embeddings:
-                raise Exception("Embedding failed (Empty response)")
+            if not embeddings: raise Exception("Embedding failed")
 
-            # --- BILLING LOGIC ---
+            # Billing Logic
             if organization_id:
                 cost = 0.0
-                # Priority 1: Use Cost from Proxy
-                if "cost_usd" in usage:
-                    cost = float(usage["cost_usd"])
-                # Priority 2: Calculate from Tokens (Fallback)
-                elif "total_tokens" in usage:
-                    cost = usage["total_tokens"] * 0.0000002
+                if "cost_usd" in usage: cost = float(usage["cost_usd"])
+                elif "total_tokens" in usage: cost = usage["total_tokens"] * 0.0000002
                 
                 if cost > 0:
                     await self.credit_service.add_transaction(CreditTransactionCreate(
@@ -109,17 +106,10 @@ class CRMChromaServiceV2:
                     ))
                     logger.info(f"💰 Deducted ${cost:.6f} for embedding.")
 
-            # --- SAVE LOGIC ---
             collection = self.get_or_create_collection(agent_id)
             ids = [f"{m.get('doc_id')}_{i}" for i, m in enumerate(metadatas)]
             
-            collection.add(
-                embeddings=embeddings, 
-                documents=texts,
-                metadatas=metadatas,
-                ids=ids
-            )
-            
+            collection.add(embeddings=embeddings, documents=texts, metadatas=metadatas, ids=ids)
             logger.info(f"✅ Successfully stored {len(texts)} chunks.")
             return True
 
@@ -137,11 +127,47 @@ class CRMChromaServiceV2:
             logger.error(f"⚠️ Query failed: {e}")
             return ""
 
+    def delete_document(self, agent_id: str, file_id: str):
+        """
+        [FIX] Smart Delete:
+        1. Deletes vectors for the specific file.
+        2. Checks if collection is empty.
+        3. If empty, DELETES THE COLLECTION (Clean Slate).
+        """
+        try:
+            # 1. Get Collection (Check existence)
+            try:
+                collection = self.client.get_collection(name=agent_id, embedding_function=self.embedding_fn)
+            except ValueError:
+                logger.warning(f"⚠️ Collection '{agent_id}' already gone. Skipping.")
+                return True
+
+            # 2. Delete the Vectors
+            collection.delete(where={"file_id": {"$eq": file_id}})
+            
+            # 3. [NEW] Auto-Cleanup: Check if any vectors remain
+            remaining_count = collection.count()
+            
+            if remaining_count == 0:
+                self.client.delete_collection(name=agent_id)
+                logger.info(f"🔥 [Auto-Cleanup] Collection '{agent_id}' is empty. Deleted successfully.")
+            else:
+                logger.info(f"🗑️ [V2] Deleted vectors for file {file_id}. Remaining docs: {remaining_count}")
+                
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ V2 Delete Operation Failed: {e}")
+            return False
+        
     def delete_collection(self, agent_id: str):
         try:
-            self.client.delete_collection(f"agent_{agent_id}")
+            # [FIX] Deletes by exact UUID name
+            self.client.delete_collection(name=agent_id)
+            logger.info(f"🔥 [V2] Deleted collection {agent_id}")
             return True
         except: return False
+
 
 _crm_chroma_service_v2 = None
 def get_crm_chroma_service_v2():
