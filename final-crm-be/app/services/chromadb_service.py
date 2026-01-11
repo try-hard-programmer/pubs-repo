@@ -46,7 +46,8 @@ class ChromaDBService:
         self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
             api_key=settings.OPENAI_API_KEY,
             model_name=settings.OPENAI_MODEL,
-            api_base=settings.OPENAI_BASE_URL
+            # api_base=settings.OPENAI_BASE_URL
+            api_base=settings.PROXY_BASE_URL
         )
 
     def _get_collection_name(self, organization_id: str) -> str:
