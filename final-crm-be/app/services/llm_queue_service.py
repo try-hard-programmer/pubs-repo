@@ -1,98 +1,142 @@
 """
-LLM Queue Service (Debounce/Stacking Edition)
-Prevents "Double Posting" by waiting for the user to stop typing.
+LLM Queue Service (Dynamic Per-Chat Workers)
+Architecture: One Async Task per Active Chat backed by Redis.
+Prevents race conditions and "Double Posting" by debouncing user input.
 """
 import asyncio
+import json
 import time
 import logging
-from typing import Dict, Any
+from typing import Any
 
+# Import the centralized Redis service
+from app.services.redis_service import get_redis
+
+# Import the AI Processor
 from app.services.dynamic_ai_service_v2 import process_dynamic_ai_response_v2
+
+# Import configuration for creating fresh Supabase clients
+from app.config.settings import settings
+from supabase import create_client
 
 logger = logging.getLogger(__name__)
 
 class LLMQueueService:
     def __init__(self):
-        # The "Stack": Stores the LATEST pending task for each chat
-        # Key: chat_id
-        # Value: { "msg_id": str, "supabase": obj, "priority": str, "last_activity": float }
-        self.pending_chats: Dict[str, Any] = {}
-        self.is_running = False
-        
-        # CONFIG: How long to wait for "silence" before replying
-        # If user types again within 10 seconds, we reset the timer (Stacking)
+        # CONFIG: How long to wait for "silence" before replying (Debounce)
         self.debounce_window = 10.0 
+        self.redis = get_redis()
 
     async def enqueue(self, chat_id: str, message_id: str, supabase_client: Any, priority: str = "medium"):
         """
-        Add a request to the stack.
-        If a user types again, this OVERWRITES the previous trigger and RESETS the timer.
-        """
-        now = time.time()
+        Add a request to the Redis queue.
+        1. Updates the 'Target Execution Time' for this chat in Redis.
+        2. Spawns a dedicated background worker if one isn't already running.
         
-        if chat_id in self.pending_chats:
-            logger.info(f"🔄 Stacking: Resetting timer for Chat {chat_id} (New Msg: {message_id})")
-        else:
-            logger.info(f"📥 New Stack: Chat {chat_id} | Waiting {self.debounce_window}s for silence...")
-
-        # Store ONLY the latest state (The AI will read the full history anyway)
-        self.pending_chats[chat_id] = {
-            "msg_id": message_id, # We only need the latest ID to wake up the AI
-            "supabase": supabase_client,
-            "priority": priority,
-            "last_activity": now
+        Args:
+            chat_id: The chat session UUID.
+            message_id: The latest message UUID (so AI replies to the newest context).
+            supabase_client: Ignored here (we create a fresh one in the worker).
+            priority: Task priority.
+        """
+        # Calculate when the AI should trigger (Now + 10s)
+        target_time = time.time() + self.debounce_window
+        
+        # 1. Store State in Redis (Persistent Atomic Storage)
+        # We use HSET so we can update the 'msg_id' and 'run_at' atomically.
+        # This effectively "resets the timer" for the worker.
+        data = {
+            "run_at": target_time,
+            "msg_id": message_id,
+            "priority": priority
         }
-
-    async def start_worker(self):
-        """
-        Background worker that watches the stack.
-        """
-        self.is_running = True
-        logger.info("🚀 LLM Stacking/Debounce Worker Started")
+        await self.redis.hset(f"queue:ctx:{chat_id}", mapping=data)
         
-        while self.is_running:
-            try:
-                await asyncio.sleep(1.0) # Check stack every second
-                
-                now = time.time()
-                # Find chats that are "Ready" (Silent > debounce_window)
-                ready_chat_ids = []
-                
-                # Snapshot keys to avoid runtime modification errors
-                active_chats = list(self.pending_chats.keys())
+        # 2. Check if a worker is ALREADY alive for this chat
+        # We check a simple flag key.
+        worker_key = f"worker:active:{chat_id}"
+        is_active = await self.redis.get(worker_key)
+        
+        if not is_active:
+            # 3. SPAWN THE WORKER (Fire and Forget)
+            # This creates a background task that runs independently of this request.
+            logger.info(f"🚀 Spawning New Worker for Chat {chat_id}")
+            asyncio.create_task(self._chat_worker_lifecycle(chat_id))
+        else:
+            # If active, the worker will automatically see the updated 'run_at' time 
+            # in the next loop cycle and sleep longer.
+            logger.info(f"🔄 Worker exists for {chat_id}. Extended timer to {self.debounce_window}s.")
 
-                for chat_id in active_chats:
-                    data = self.pending_chats[chat_id]
-                    elapsed = now - data["last_activity"]
+    async def _chat_worker_lifecycle(self, chat_id: str):
+        """
+        The Dedicated Worker Lifecycle.
+        Cycle: Check Redis Time -> Sleep Difference -> Execute -> Terminate.
+        """
+        worker_key = f"worker:active:{chat_id}"
+        context_key = f"queue:ctx:{chat_id}"
+        
+        # Mark worker as active (Expires in 60s as a safety net against zombies)
+        await self.redis.setex(worker_key, 60, "1")
 
-                    if elapsed >= self.debounce_window:
-                        ready_chat_ids.append(chat_id)
-
-                # Process Ready Chats
-                for chat_id in ready_chat_ids:
-                    # Pop the data from stack
-                    item = self.pending_chats.pop(chat_id, None)
-                    if item:
-                        logger.info(f"⚡ Stack Released ({self.debounce_window}s silence). Triggering AI for Chat {chat_id}")
-                        asyncio.create_task(
-                            self._process_safe(chat_id, item)
-                        )
-
-            except Exception as e:
-                logger.error(f"🔥 Worker Crash: {e}")
-                await asyncio.sleep(1)
-
-    async def _process_safe(self, chat_id, item):
-        """Wrapper to catch errors without killing the worker"""
         try:
+            while True:
+                # 1. Fetch the latest Context & Target Time
+                ctx = await self.redis.hgetall(context_key)
+                if not ctx:
+                    logger.warning(f"⚠️ Context lost for {chat_id}, aborting worker.")
+                    break
+                
+                run_at = float(ctx["run_at"])
+                now = time.time()
+                remaining = run_at - now
+
+                # 2. THE OPTIMIZATION: "Calculated Sleep"
+                # If we still have time to wait, we sleep exactly that amount (capped).
+                if remaining > 0.1:
+                    # Sleep, but cap at 5s to allow for heartbeat/shutdown checks
+                    sleep_duration = min(remaining, 5.0) 
+                    await asyncio.sleep(sleep_duration)
+                    
+                    # Heartbeat: Keep the worker key alive while we wait
+                    await self.redis.expire(worker_key, 60)
+                    continue
+                
+                # 3. TIME IS UP! EXECUTE AI.
+                logger.info(f"⚡ Timer Finished for Chat {chat_id}. Executing AI.")
+                
+                # Cleanup Redis State BEFORE execution.
+                # This ensures that if the user types *while* the AI is generating,
+                # enqueue() will see no active worker and spawn a NEW one for the next turn.
+                await self.redis.delete(context_key)
+                await self.redis.delete(worker_key)
+                
+                # Run the Heavy AI Logic
+                await self._execute_ai_logic(chat_id, ctx)
+                
+                # 4. TERMINATE
+                logger.info(f"💀 Worker for {chat_id} terminating gracefully.")
+                break
+
+        except Exception as e:
+            logger.error(f"🔥 Worker Crash [{chat_id}]: {e}")
+            # Ensure cleanup so a new worker can spawn later
+            await self.redis.delete(worker_key)
+
+    async def _execute_ai_logic(self, chat_id: str, ctx: dict):
+        """Wrapper to safely run the AI service with a fresh DB connection"""
+        try:
+            # Create FRESH Supabase client for the background task.
+            # We cannot reuse the webhook's client because that request context is closed.
+            supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+            
             await process_dynamic_ai_response_v2(
                 chat_id=chat_id,
-                msg_id=item["msg_id"], # Matches dynamic_ai_service_v2 definition
-                supabase=item["supabase"],
-                priority=item["priority"]
+                msg_id=ctx["msg_id"],
+                supabase=supabase,
+                priority=ctx["priority"]
             )
         except Exception as e:
-            logger.error(f"❌ AI Task Failed [Chat {chat_id}]: {e}")
+            logger.error(f"❌ AI Execution Failed [{chat_id}]: {e}")
 
 # Singleton Instance
 llm_queue_service = LLMQueueService()

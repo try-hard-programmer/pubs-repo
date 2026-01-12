@@ -13,6 +13,13 @@ load_dotenv()
 class Settings:
     """Application settings loaded from environment variables"""
 
+    # Redis
+    REDIS_HOST: str = "redis"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: Optional[str] = None
+    INVITATION_URL: str = os.getenv("INVITATION_URL", "https://stgconsole.syntra.id")
+
     # OpenAI Configuration
     OPENAI_API_KEY: str = os.getenv("PLATFORM_KEY", "")
     OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://proxy.aigent.id/v1")

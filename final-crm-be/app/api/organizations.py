@@ -569,7 +569,7 @@ async def invite_user(
         logger.info(f"[{request_id}] 📧 Calling Supabase Admin Invite...")
         
         try:
-            base_url = getattr(settings, "INVITATION_URL", "http://localhost:8080")
+            base_url = settings.INVITATION_URL,
             
             # [FIXED]: Redirect to 'accept-invitation' with the DB token
             redirect_url = f"{base_url}/accept-invitation?token={token}"

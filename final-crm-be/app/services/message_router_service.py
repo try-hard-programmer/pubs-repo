@@ -4,12 +4,13 @@ Handles message routing from external services (WhatsApp, Telegram, Email) to co
 Based on MESSAGE_ROUTING_CHAT_MATCHING.md documentation.
 """
 import logging
+import asyncio # <--- Added
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 from app.config import settings
+from app.services.redis_service import acquire_lock
 
 logger = logging.getLogger(__name__)
-
 
 class MessageRouterService:
     """Service for routing incoming messages to correct chats"""
@@ -298,8 +299,37 @@ class MessageRouterService:
         customer_metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Route incoming message to correct chat or create new chat.
-        [FIX] Uses .contains() for robust JSONB lookup and returns 'is_merged_event' flag.
+        [FIXED] Entry point with Redis Spin-Lock.
+        This wrapper ensures we get a lock before running the heavy logic.
+        """
+        organization_id = agent["organization_id"]
+        
+        # LOCK KEY: Unique to the Organization + Contact (e.g. Phone Number)
+        lock_key = f"router:{organization_id}:{contact}"
+        
+        # SPIN LOCK: Try up to 5 times (2.5 seconds max wait)
+        for attempt in range(5):
+            async with acquire_lock(lock_key, expire=5) as acquired:
+                if acquired:
+                    # ✅ LOCK ACQUIRED: Run the original logic (The Worker)
+                    return await self._execute_routing_logic(
+                        agent, channel, contact, message_content, 
+                        customer_name, message_metadata, customer_metadata
+                    )
+            
+            # ⏳ Lock busy? Wait 0.5s and try again (Spinning)
+            await asyncio.sleep(0.5)
+        
+        # ⚠️ TIMEOUT: If we failed 5 times, we just proceed UNSAFE
+        logger.warning(f"⚠️ Router Lock Timeout for {contact}. Proceeding unsafely.")
+        return await self._execute_routing_logic(
+            agent, channel, contact, message_content, 
+            customer_name, message_metadata, customer_metadata
+        )
+    async def _execute_routing_logic(self, agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata):
+        """
+        Internal method containing 100% of your original routing logic.
+        Protected by the Lock in route_incoming_message.
         """
         try:
             # Extract agent information
@@ -338,10 +368,9 @@ class MessageRouterService:
             was_reopened = False
             handled_by = "unassigned"
             chat_status = "open"
-            is_merged_event = False  # <--- [NEW FLAG]
+            is_merged_event = False 
 
-            # [FIX START] Robust Duplicate Check
-            # Use .contains() to find existing message by WhatsApp ID (Fixes Duplicate Rows)
+            # Robust Duplicate Check (Your original fix)
             wa_msg_id = (message_metadata or {}).get("whatsapp_message_id")
             existing_message = None
             
@@ -357,7 +386,6 @@ class MessageRouterService:
                         existing_message = check_res.data[0]
                 except Exception as e:
                     logger.warning(f"⚠️ Metadata lookup warning: {e}")
-            # [FIX END]
 
             if active_chat:
                 # Chat exists
@@ -366,32 +394,27 @@ class MessageRouterService:
                 handled_by = active_chat.get("handled_by", "unassigned")
 
                 if existing_message:
-                    # [FIX] UPDATE PATH (Merge split events)
+                    # MERGE SPLIT EVENTS (Your original logic)
                     logger.info(f"🔄 Merging split message events for ID: {wa_msg_id}")
                     message_id = existing_message["id"]
-                    is_merged_event = True  # <--- Set Flag to prevent Double Reply
+                    is_merged_event = True
                     
-                    # Merge Metadata
                     current_meta = existing_message.get("metadata") or {}
                     new_meta = message_metadata or {}
                     merged_meta = {**current_meta, **new_meta}
                     
                     update_data = {"metadata": merged_meta}
-                    
-                    # Merge Content: Only overwrite if we have new content and existing was empty
-                    # (e.g. Media came first with empty body, now Text comes with caption)
                     if message_content and not existing_message.get("content"):
                         update_data["content"] = message_content
                         
                     self.supabase.table("messages").update(update_data).eq("id", message_id).execute()
                     
                 else:
-                    # INSERT PATH (New Message)
+                    # INSERT NEW MESSAGE
                     logger.info(f"📥 Adding message to existing chat: {chat_id}")
 
-                    # Auto-reopen resolved chats
                     if chat_status == "resolved":
-                        logger.info(f"♻️  Reopening resolved chat: {chat_id}")
+                        logger.info(f"♻️ Reopening resolved chat: {chat_id}")
                         if handled_by == "ai": new_status = "open"
                         elif handled_by == "human": new_status = "assigned"
                         else: new_status = "open"
@@ -416,12 +439,10 @@ class MessageRouterService:
                     if message_response.data:
                         message_id = message_response.data[0]["id"]
                         logger.info(f"✅ Message added to chat: {message_id}")
-                        
-                        # Update timestamp
                         self.supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
 
             else:
-                # No active chat - create new chat
+                # CREATE NEW CHAT
                 logger.info(f"📝 Creating new chat for customer: {customer_id}")
 
                 chat_data = {
@@ -447,7 +468,6 @@ class MessageRouterService:
                     is_new_chat = True
                     logger.info(f"✅ New chat created: {chat_id}")
 
-                    # Create initial message
                     message_data = {
                         "chat_id": chat_id,
                         "sender_type": "customer",
@@ -469,7 +489,6 @@ class MessageRouterService:
                 new_metadata=customer_metadata
             )
 
-            # [FIX] Return is_merged_event flag
             result = {
                 "success": True,
                 "chat_id": chat_id,
@@ -483,7 +502,7 @@ class MessageRouterService:
                 "agent_id": agent_id,
                 "agent_name": agent_name,
                 "organization_id": organization_id,
-                "is_merged_event": is_merged_event # <--- Check this in webhook.py
+                "is_merged_event": is_merged_event
             }
 
             logger.info(f"✅ Message routed successfully: chat={chat_id}")
@@ -492,8 +511,7 @@ class MessageRouterService:
         except Exception as e:
             logger.error(f"❌ Error routing message: {e}")
             raise
-
-
+        
     def _extract_name_from_contact(self, contact: str, channel: str) -> str:
         """
         Extract a display name from contact information.
