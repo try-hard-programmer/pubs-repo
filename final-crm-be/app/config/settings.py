@@ -14,10 +14,12 @@ class Settings:
     """Application settings loaded from environment variables"""
 
     # Redis
-    REDIS_HOST: str = "redis"
-    REDIS_PORT: int = 6379
-    REDIS_DB: int = 0
-    REDIS_PASSWORD: Optional[str] = None
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "redis")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
+    REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")
+
+    # Invitation org link
     INVITATION_URL: str = os.getenv("INVITATION_URL", "https://stgconsole.syntra.id")
 
     # OpenAI Configuration

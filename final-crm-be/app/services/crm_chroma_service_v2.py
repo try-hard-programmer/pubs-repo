@@ -134,12 +134,48 @@ class CRMChromaServiceV2:
             logger.error(f"❌ Failed to add documents: {e}")
             return False
 
-    async def query_context(self, query: str, agent_id: str, n_results: int = 3) -> str:
+    async def query_context(self, query: str, agent_id: str, n_results: int = 5) -> str:
         try:
             collection = self.get_or_create_collection(agent_id)
-            results = collection.query(query_texts=[query], n_results=n_results)
-            if not results["documents"] or not results["documents"][0]: return ""
-            return "\n\n".join(results["documents"][0])
+            
+            # 1. Ask Chroma for Distances (Scores)
+            results = collection.query(
+                query_texts=[query], 
+                n_results=n_results,
+                include=['documents', 'distances'] # <--- REQUIRED to see scores
+            )
+
+            if not results["documents"] or not results["documents"][0]: 
+                return ""
+
+            valid_documents = []
+            
+            # 2. FILTERING LOGIC
+            # Distance 0 = Exact Match. 
+            # Distance > 1.2 usually means "Not relevant".
+            # Adjust this threshold based on your needs (1.0 to 1.5).
+            THRESHOLD = 1.2 
+
+            logger.info(f"🔎 RAG Query: '{query}'")
+            
+            if results['distances']:
+                for i, distance in enumerate(results['distances'][0]):
+                    doc_preview = results['documents'][0][i][:50].replace('\n', ' ')
+                    
+                    if distance < THRESHOLD:
+                        # ✅ Good Match
+                        valid_documents.append(results['documents'][0][i])
+                        logger.info(f"   ✅ KEEP (Score: {distance:.4f}): {doc_preview}...")
+                    else:
+                        # ❌ Bad Match - Discard it!
+                        logger.info(f"   🗑️ DROP (Score: {distance:.4f}): {doc_preview}...")
+
+            if not valid_documents:
+                logger.warning(f"⚠️ No relevant documents found (All scores > {THRESHOLD})")
+                return "" # Return empty string so AI knows it has no context
+
+            return "\n\n###\n\n".join(valid_documents)
+
         except Exception as e:
             logger.error(f"⚠️ Query failed: {e}")
             return ""

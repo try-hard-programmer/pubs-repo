@@ -30,6 +30,7 @@ from app.config import settings as app_settings
 from app.services.webhook_callback_service import get_webhook_callback_service
 from app.services.ticket_service import get_ticket_service
 from app.models.ticket import ActorType
+from app.services.redis_service import acquire_lock
 
 logger = logging.getLogger(__name__)
 
@@ -848,7 +849,7 @@ async def create_chat(
 
         # Normalize Channel Value safely
         channel_val = chat.channel.value if hasattr(chat.channel, "value") else chat.channel
-
+        
         # ==============================================================================
         # 1. RESOLVE AGENT & SENDER FIRST (READ ONLY - NO WRITES YET)
         # ==============================================================================
@@ -1001,44 +1002,63 @@ async def create_chat(
                 else: raise HTTPException(500, "Failed to create customer")
 
         # ==============================================================================
-        # 3. REUSE OR CREATE CHAT
+        # 3. REUSE OR CREATE CHAT (ATOMIC LOCK APPLIED HERE)
         # ==============================================================================
-        active_chat = supabase.table("chats").select("*").eq("customer_id", customer_id).eq("channel", channel_val).neq("status", "resolved").neq("status", "closed").execute()
-        
         chat_obj = None
-        if active_chat.data:
-            chat_obj = active_chat.data[0]
-            logger.info(f"♻️ Reusing Chat {chat_obj['id']}")
+        
+        # [FIX] Define Lock Key based on Customer + Channel to prevent duplicates
+        lock_key = f"chat_create:{organization_id}:{customer_id}:{channel_val}"
+        
+        async with acquire_lock(lock_key, expire=5) as acquired:
+            if not acquired:
+                # If locked, it means another request is creating this chat RIGHT NOW.
+                # Returning 429 allows the webhook/client to retry safely.
+                # On retry, it will find the existing chat below.
+                raise HTTPException(429, "Concurrent creation detected. Please retry.")
+
+            # --- CRITICAL SECTION START ---
+            active_chat = supabase.table("chats")\
+                .select("*")\
+                .eq("customer_id", customer_id)\
+                .eq("channel", channel_val)\
+                .neq("status", "resolved")\
+                .neq("status", "closed")\
+                .execute()
             
-            upd = {"sender_agent_id": sender_agent_id}
-            
-            if assigned_agent_id:
-                upd.update({
-                    "status": status_value,
-                    "handled_by": handled_by,
-                    "assigned_agent_id": assigned_agent_id
-                })
-                if human_agent_id: upd["human_agent_id"] = human_agent_id
-                if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
-            elif handled_by == "unassigned":
-                upd.update({
-                    "status": "open",
-                    "handled_by": "unassigned",
-                    "assigned_agent_id": None,
-                    "human_agent_id": None
-                })
-            
-            supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
-            chat_obj.update(upd)
-        else:
-            new_chat_data = {
-                "organization_id": organization_id, "customer_id": customer_id, "channel": channel_val,
-                "assigned_agent_id": assigned_agent_id, "ai_agent_id": ai_agent_id, "human_agent_id": human_agent_id,
-                "handled_by": handled_by, "status": status_value, "sender_agent_id": sender_agent_id,
-                "unread_count": 0, "last_message_at": datetime.utcnow().isoformat()
-            }
-            res = supabase.table("chats").insert(new_chat_data).execute()
-            chat_obj = res.data[0]
+            if active_chat.data:
+                chat_obj = active_chat.data[0]
+                logger.info(f"♻️ Reusing Chat {chat_obj['id']}")
+                
+                upd = {"sender_agent_id": sender_agent_id}
+                
+                if assigned_agent_id:
+                    upd.update({
+                        "status": status_value,
+                        "handled_by": handled_by,
+                        "assigned_agent_id": assigned_agent_id
+                    })
+                    if human_agent_id: upd["human_agent_id"] = human_agent_id
+                    if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
+                elif handled_by == "unassigned":
+                    upd.update({
+                        "status": "open",
+                        "handled_by": "unassigned",
+                        "assigned_agent_id": None,
+                        "human_agent_id": None
+                    })
+                
+                supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
+                chat_obj.update(upd)
+            else:
+                new_chat_data = {
+                    "organization_id": organization_id, "customer_id": customer_id, "channel": channel_val,
+                    "assigned_agent_id": assigned_agent_id, "ai_agent_id": ai_agent_id, "human_agent_id": human_agent_id,
+                    "handled_by": handled_by, "status": status_value, "sender_agent_id": sender_agent_id,
+                    "unread_count": 0, "last_message_at": datetime.utcnow().isoformat()
+                }
+                res = supabase.table("chats").insert(new_chat_data).execute()
+                chat_obj = res.data[0]
+            # --- CRITICAL SECTION END ---
 
         # ==============================================================================
         # 4. SEND MESSAGE & BROADCAST
@@ -1086,7 +1106,7 @@ async def create_chat(
     except Exception as e:
         logger.error(f"Create chat error: {e}", exc_info=True)
         raise HTTPException(500, "Failed to create chat")
-
+    
 @router.put(
     "/chats/{chat_id}/assign",
     response_model=Chat,

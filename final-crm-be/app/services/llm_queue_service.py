@@ -2,6 +2,7 @@
 LLM Queue Service (Dynamic Per-Chat Workers)
 Architecture: One Async Task per Active Chat backed by Redis.
 Prevents race conditions and "Double Posting" by debouncing user input.
+Includes Supervisor for crash recovery.
 """
 import asyncio
 import json
@@ -26,6 +27,46 @@ class LLMQueueService:
         # CONFIG: How long to wait for "silence" before replying (Debounce)
         self.debounce_window = 10.0 
         self.redis = get_redis()
+        self.is_running = True # Flag to control supervisor loop
+
+    async def start_worker(self):
+        """
+        [NEW] Supervisor Loop & Crash Recovery.
+        Called by main.py on startup.
+        1. Scans Redis for 'orphaned' chats (pending tasks from before restart).
+        2. Spawns workers for them.
+        3. Idles to keep the background task alive.
+        """
+        logger.info("🚀 LLM Queue Supervisor: Starting & Scanning for orphans...")
+        
+        try:
+            # RECOVERY: Find chats that have a pending context but no active worker
+            # (This happens if the server crashed while a user was waiting)
+            async for key in self.redis.scan_iter(match="queue:ctx:*"):
+                # key format: "queue:ctx:{chat_id}"
+                chat_id = key.split(":")[-1]
+                
+                # Check if a worker is already active (unlikely on fresh boot, but good check)
+                worker_key = f"worker:active:{chat_id}"
+                is_active = await self.redis.get(worker_key)
+                
+                if not is_active:
+                    logger.info(f"❤️‍🩹 Recovering orphaned chat session: {chat_id}")
+                    # Respawn the worker
+                    asyncio.create_task(self._chat_worker_lifecycle(chat_id))
+                    
+        except Exception as e:
+            logger.error(f"⚠️ Queue Recovery Warning: {e}")
+
+        logger.info("✅ LLM Queue Supervisor: Running")
+
+        # Keep the task alive (as expected by main.py)
+        while self.is_running:
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                logger.info("🛑 LLM Queue Supervisor Stopping...")
+                break
 
     async def enqueue(self, chat_id: str, message_id: str, supabase_client: Any, priority: str = "medium"):
         """
@@ -83,7 +124,7 @@ class LLMQueueService:
                 # 1. Fetch the latest Context & Target Time
                 ctx = await self.redis.hgetall(context_key)
                 if not ctx:
-                    logger.warning(f"⚠️ Context lost for {chat_id}, aborting worker.")
+                    logger.debug(f"Context empty/finished for {chat_id}, worker exiting.")
                     break
                 
                 run_at = float(ctx["run_at"])

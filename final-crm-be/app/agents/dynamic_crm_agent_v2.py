@@ -6,6 +6,7 @@ Dynamic CRM Agent V2 (The Speaker)
 """
 import logging
 import aiohttp
+import asyncio
 import json
 from typing import List, Dict, Any
 from app.config import settings
@@ -25,7 +26,7 @@ class DynamicCRMAgentV2:
             try: return json.loads(data)
             except: return {}
         return {}
-
+    
     async def process_message(
         self,
         chat_id: str,
@@ -116,7 +117,7 @@ class DynamicCRMAgentV2:
             # 7. SEND TO PROXY
             payload = {
                 "messages": messages,
-                "files": files,  # ✅ THIS IS THE FIX!
+                "files": files,
                 "category": category,
                 "nameUser": name_user,
                 "temperature": temperature,
@@ -125,12 +126,15 @@ class DynamicCRMAgentV2:
 
             logger.info(f"🌐 Calling proxy with {len(messages)} messages, {len(files)} files")
 
-            async with aiohttp.ClientSession() as session:
+            # [FIX] INCREASE TIMEOUT TO 5 MINUTES (300s)
+            # This ensures Python waits for the Node.js Queue even under heavy load.
+            timeout = aiohttp.ClientTimeout(total=300) 
+
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     self.proxy_url,
                     json=payload,
-                    headers={"Content-Type": "application/json"},
-                    ssl=False 
+                    headers={"Content-Type": "application/json"}
                 ) as response:
                     
                     if response.status != 200:
@@ -164,6 +168,15 @@ class DynamicCRMAgentV2:
                 "usage": {},
                 "is_error": True
             }
+        
+        except asyncio.TimeoutError:
+            logger.error(f"❌ Speaker V2 Timeout: Proxy took longer than 300s")
+            return {
+                "content": "Maaf, respon terlalu lama. Mohon coba lagi.",
+                "metadata": {"error": "Timeout"},
+                "usage": {},
+                "is_error": True
+            }
 
         except Exception as e:
             logger.error(f"❌ Speaker V2 Exception: {e}", exc_info=True)
@@ -172,7 +185,6 @@ class DynamicCRMAgentV2:
                 "metadata": {"error": str(e), "is_error": True},
                 "usage": {}
             }
-        
 
         
 # Singleton

@@ -1,6 +1,6 @@
 """
 Document Processor Service V2
-Handles document parsing and preprocessing.
+Handles document parsing, preprocessing, and ORCHESTRATES BILLING.
 Hardcoded for Local V2 Proxy (HTTP).
 """
 import io
@@ -29,6 +29,9 @@ from app.utils.text_processing import elements_to_clean_text
 from app.config import settings
 from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
 
+# [PRIORITY 2 FIX] Import Credit Service here (The Manager handles the money)
+from app.services.credit_service import get_credit_service, CreditTransactionCreate, TransactionType
+
 if TYPE_CHECKING:
     from app.services.storage_service import StorageService
 
@@ -41,7 +44,11 @@ class DocumentProcessorV2:
         self.storage_service = storage_service
         self.logger = logging.getLogger(__name__)
         self.logger.info("📦 Using Document Processor V2 (HTTP Localhost)")
+        
         self.chroma_service = get_crm_chroma_service_v2()
+        
+        # [PRIORITY 2 FIX] Initialize Credit Service
+        self.credit_service = get_credit_service()
         
         base = getattr(settings, "PROXY_BASE_URL", "http://localhost:6657")
         self.proxy_base_url = base.rstrip("/") if base else "http://localhost:6657"
@@ -96,17 +103,47 @@ class DocumentProcessorV2:
             metadatas = [{"source": filename, "doc_id": filename} for _ in chunks]
 
             # 4. Save to Chroma (Async Call)
-            success = await self.chroma_service.add_documents(
+            # The service now returns Usage Stats, NOT a boolean
+            result = await self.chroma_service.add_documents(
                 agent_id=agent_id, 
                 texts=chunks, 
-                metadatas=metadatas,
-                organization_id=organization_id 
+                metadatas=metadatas
+                # [NOTE] organization_id removed from here, we handle billing below
             )
 
-            if success:
+            # 5. [PRIORITY 2 FIX] Handle Billing Logic Here
+            if result.get("success"):
+                try:
+                    usage = result.get("usage", {})
+                    cost = 0.0
+                    
+                    # Calculate cost based on usage report
+                    if "cost_usd" in usage:
+                        cost = float(usage["cost_usd"])
+                    elif "total_tokens" in usage:
+                        # Fallback calculation if Proxy didn't send cost
+                        cost = usage["total_tokens"] * 0.0000002
+                    
+                    if cost > 0 and organization_id:
+                        self.logger.info(f"💸 Deducting ${cost:.6f} for embedding {len(chunks)} chunks...")
+                        await self.credit_service.add_transaction(CreditTransactionCreate(
+                            organization_id=organization_id,
+                            amount=-cost,
+                            description=f"Knowledge Embedding ({len(chunks)} chunks)",
+                            transaction_type=TransactionType.USAGE,
+                            metadata={"agent_id": agent_id, "file": filename}
+                        ))
+                    else:
+                        self.logger.info("🆓 Embedding cost was $0.00.")
+
+                except Exception as bill_err:
+                    # Don't fail the upload if billing fails, but log it LOUDLY
+                    self.logger.error(f"🚨 BILLING FAILURE for {organization_id}: {bill_err}")
+
                 return {"success": True, "chunks": len(chunks)}
+            
             else:
-                return {"success": False, "error": "Chroma storage failed"}
+                return {"success": False, "error": result.get("error", "Chroma storage failed")}
 
         except Exception as e:
             self.logger.error(f"❌ Processing Failed: {e}", exc_info=True)
