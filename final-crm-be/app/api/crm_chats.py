@@ -129,57 +129,33 @@ async def send_message_via_channel(
 ) -> Dict[str, Any]:
     """
     Sends message strictly via the defined agent. 
-    Returns raw data on success for ID capture.
-    Handles Text, Media (Image/Video/Audio), and Files (Documents).
     """
     try:
         chat_channel = chat_data.get("channel")
         sender_id = chat_data.get("sender_agent_id")
         
-        if not sender_id:
-             return {"success": False, "message": "No sender_agent_id provided."}
+        if not sender_id: return {"success": False, "message": "No sender_agent_id"}
 
         # 1. STRICT INTEGRATION CHECK
-        int_check = supabase.table("agent_integrations") \
-            .select("id") \
-            .eq("agent_id", sender_id) \
-            .eq("channel", chat_channel) \
-            .eq("enabled", True) \
-            .execute()
-        
-        if not int_check.data:
-            return {
-                "success": False, 
-                "message": f"Agent {sender_id} has no connected {chat_channel} account."
-            }
+        int_check = supabase.table("agent_integrations").select("id").eq("agent_id", sender_id).eq("channel", chat_channel).eq("enabled", True).execute()
+        if not int_check.data: return {"success": False, "message": "No integration"}
 
-        # 2. PREPARE CONTENT & MEDIA (Moved to TOP Scope)
+        # 2. PREPARE
         effective_chat_data = chat_data.copy()
         msg_meta = message_metadata or {}
-        
-        # [CRITICAL FIX] Define this BEFORE checking channels
         media_url = msg_meta.get("media_url") or msg_meta.get("file_url")
 
         # 3. ROUTE TO SERVICE
         if chat_channel == "whatsapp":
-            # [FIX] PRIORITY: Check metadata for stored WhatsApp ID (LID or @c.us)
+            # Priority: Metadata LID > Phone > Metadata ID
             metadata = customer_data.get("metadata", {}) or {}
-            target = metadata.get("whatsapp_lid")
+            target = metadata.get("whatsapp_lid") or customer_data.get("phone") or metadata.get("whatsapp_id")
             
-            # Fallback to phone or whatsapp_id
-            if not target:
-                target = customer_data.get("phone")
-            if not target or target == "None":
-                target = metadata.get("whatsapp_id")
+            if not target: return {"success": False, "message": "No target ID"}
             
-            if not target: return {"success": False, "message": "Customer has no phone or WhatsApp ID"}
-            
-            # [FIX] GENERIC ID PRESERVATION
             final_target = str(target).strip()
-            
-            if "@" in final_target:
-                pass 
-            else:
+            # Clean non-LID numbers
+            if "@" not in final_target:
                 cleaned = re.sub(r'[^\d]', '', final_target)
                 if len(cleaned) < 15 and not cleaned.startswith('62') and cleaned.startswith('0'): 
                     cleaned = '62' + cleaned[1:]
@@ -187,34 +163,27 @@ async def send_message_via_channel(
             
             svc = get_whatsapp_service()
             
+            # [FIX] Extract Mentions List
+            mentions_list = msg_meta.get("mentions")
+
             try:
                 if media_url:
-                    # Determine if it's a file/document or general media
-                    is_document = msg_meta.get("is_document", False)
-                    filename = msg_meta.get("filename")
-                    
-                    if is_document or filename:
-                        # Send as Document/File
-                        res = await svc.send_file_message(
-                            session_id=sender_id,
-                            phone_number=final_target,
-                            file_url=media_url,
-                            filename=filename,
-                            caption=message_content
-                        )
-                    else:
-                        # Send as Media (Image, Video, etc.)
-                        media_type = msg_meta.get("media_type", "image")
-                        res = await svc.send_media_message(
-                            session_id=sender_id,
-                            phone_number=final_target,
-                            media_url=media_url,
-                            caption=message_content,
-                            media_type=media_type
-                        )
+                    # Media Sending
+                    res = await svc.send_media_message(
+                        session_id=sender_id,
+                        phone_number=final_target,
+                        media_url=media_url,
+                        caption=message_content,
+                        media_type=msg_meta.get("media_type", "image")
+                    )
                 else:
-                    # Send Text
-                    res = await svc.send_text_message(sender_id, final_target, message_content)
+                    # [FIX] Text Sending with Mentions
+                    res = await svc.send_text_message(
+                        session_id=sender_id, 
+                        phone_number=final_target, 
+                        message=message_content,
+                        mentions=mentions_list # <--- Payload Passed Here
+                    )
                 
                 return {"success": True, "data": res}
             except Exception as e:
@@ -223,18 +192,9 @@ async def send_message_via_channel(
         elif chat_channel == "telegram":
             try:
                 svc = get_webhook_callback_service()
-                
-                # [FIX] media_url is now defined and safe to pass
-                res = await svc.send_callback(
-                    effective_chat_data, 
-                    message_content, 
-                    supabase,
-                    media_url=media_url 
-                )
-                if res.get("success"):
-                    return {"success": True, "data": res.get("data", res)} 
-                else:
-                    return {"success": False, "message": res.get("error") or "Telegram Send Failed"}
+                res = await svc.send_callback(effective_chat_data, message_content, supabase, media_url=media_url)
+                if res.get("success"): return {"success": True, "data": res.get("data", res)} 
+                else: return {"success": False, "message": res.get("error")}
             except Exception as e:
                 return {"success": False, "message": str(e)}
         
@@ -243,7 +203,7 @@ async def send_message_via_channel(
     except Exception as e:
         logger.error(f"Send Error: {e}")
         return {"success": False, "message": str(e)}
-        
+                    
 def _extract_attachment(metadata: Dict[str, Any]) -> Optional[MessageAttachment]:
     """Helper to extract attachment data from metadata"""
     if not metadata:
@@ -1561,7 +1521,6 @@ async def get_chat_messages(
 )
 async def create_message(
     chat_id: str,
-    # [FIX 1] Make content Optional. Allows FE to send empty form-data for files.
     content: Optional[str] = Form(None), 
     sender_type: str = Form(...),
     sender_id: str = Form(...),
@@ -1575,23 +1534,74 @@ async def create_message(
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
         
-        # [FIX 2] Aggressive Sanitization
-        # Prevents "null", "undefined" or Raw URL strings from becoming the message text.
+        # Aggressive Sanitization
         if content is None or content.lower() in ["null", "undefined"]:
             content = ""
 
-        # Verify chat
-        chat_check = supabase.table("chats").select("id, customer_id, channel, handled_by").eq("id", chat_id).eq("organization_id", organization_id).execute()
-        if not chat_check.data: raise HTTPException(404, f"Chat {chat_id} not found")
-        chat_data_minimal = chat_check.data[0]
+        # Verify chat & Get Channel info
+        chat_full_res = supabase.table("chats").select("*").eq("id", chat_id).eq("organization_id", organization_id).single().execute()
+        if not chat_full_res.data: raise HTTPException(404, f"Chat {chat_id} not found")
+        chat_data = chat_full_res.data
 
         # Parse Metadata
         msg_metadata = {}
         if metadata:
-            try:
-                msg_metadata = json.loads(metadata)
-            except Exception:
-                logger.warning("Invalid metadata JSON, ignoring")
+            try: msg_metadata = json.loads(metadata)
+            except: logger.warning("Invalid metadata JSON")
+
+        # ============================================
+        # [FIX] GROUP MENTION LOGIC (HUMAN REPLY)
+        # ============================================
+        if sender_type in ["agent", "human"] and chat_data.get("channel") == "whatsapp":
+            
+            cust_res = supabase.table("customers").select("phone").eq("id", chat_data["customer_id"]).single().execute()
+            customer_phone = cust_res.data.get("phone", "") if cust_res.data else ""
+
+            if "@g.us" in str(customer_phone):
+                try:
+                    logger.info(f"👥 Group Reply ({customer_phone}). Resolving mention target...")
+                    
+                    # Fetch Last Customer Message
+                    last_msg = supabase.table("messages") \
+                        .select("metadata") \
+                        .eq("chat_id", chat_id) \
+                        .eq("sender_type", "customer") \
+                        .order("created_at", desc=True) \
+                        .limit(1) \
+                        .execute()
+
+                    if last_msg.data:
+                        last_meta = last_msg.data[0].get("metadata", {})
+                        
+                        # Get ID for API (Hidden)
+                        target_id = last_meta.get("group_participant") or last_meta.get("original_sender_id")
+                        
+                        # Get Name for Display (Visible)
+                        # Prioritize real_sender_name > whatsapp_name > real_contact_number
+                        display_name = (
+                            last_meta.get("real_sender_name") or 
+                            last_meta.get("whatsapp_name") or 
+                            last_meta.get("pushName") or 
+                            last_meta.get("notifyName")
+                        )
+                        
+                        # Fallback to number if name is missing
+                        if not display_name:
+                            display_name = last_meta.get("real_contact_number")
+
+                        if target_id:
+                            # 1. Add ID to metadata (CRITICAL for WhatsApp API)
+                            msg_metadata["mentions"] = [target_id]
+                            
+                            # 2. Prepend @Name to text (CRITICAL for Visuals)
+                            safe_label = str(display_name).replace("@", "").strip()
+                            
+                            if f"@{safe_label}" not in content:
+                                content = f"@{safe_label} {content}"
+                                logger.info(f"✅ Auto-mentioned: @{safe_label}")
+                                
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to auto-mention in group: {e}")
 
         # ============================================
         # 1. HANDLE FILE UPLOAD
@@ -1646,72 +1656,48 @@ async def create_message(
         response = supabase.table("messages").insert(message_data).execute()
         if not response.data: raise HTTPException(500, "Failed to create message")
         
-        created_message = response.data[0] # [CRITICAL] Capture the DB record immediately
+        created_message = response.data[0]
         
         supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
         
         logger.info(f"Message created in chat {chat_id}")
 
         # ============================================
-        # 3. SEND EXTERNAL (The Critical Part)
+        # 3. SEND EXTERNAL
         # ============================================
-        if sender_type in ["agent", "ai"]:
+        if sender_type in ["agent", "ai", "human"]:
             try:
-                chat_full = supabase.table("chats").select("*").eq("id", chat_id).single().execute()
-                if chat_full.data:
-                    chat_data = chat_full.data
-                    cust_data = supabase.table("customers").select("*").eq("id", chat_data["customer_id"]).single().execute()
-                    
-                    if cust_data.data:
-                        # [DEBUG LOG]
-                        logger.info(f"📤 Attempting to send to {chat_data.get('channel')}...")
-                        
-                        result = await send_message_via_channel(
-                            chat_data=chat_data,
-                            customer_data=cust_data.data,
-                            message_content=content,
-                            supabase=supabase,
-                            message_metadata=msg_metadata 
-                        )
-                        
-                        # [DEBUG LOG] Check the result!
-                        if result.get("success"):
-                            logger.info(f"✅ External Send Success: {result}")
-                        else:
-                            logger.error(f"❌ External Send Failed: {result.get('message')}")
+                cust_data = supabase.table("customers").select("*").eq("id", chat_data["customer_id"]).single().execute()
+                if cust_data.data:
+                    result = await send_message_via_channel(
+                        chat_data=chat_data,
+                        customer_data=cust_data.data,
+                        message_content=content,
+                        supabase=supabase,
+                        message_metadata=msg_metadata 
+                    )
             except Exception as e:
-                logger.error(f"❌ Critical Error sending external message: {e}")
+                logger.error(f"❌ External Send Error: {e}")
 
         # ============================================
-        # 4. BROADCAST (Fixed)
+        # 4. BROADCAST
         # ============================================
-        sender_name = None
-        
-        # Resolve Sender Name (Simplified)
-        if sender_type == "agent":
-            sender_name = "Human Agent" # Simplify for speed, or fetch if needed
-        elif sender_type == "ai":
-            sender_name = "AI Assistant"
-        elif sender_type == "customer":
-            sender_name = "Customer"
-            
+        sender_name = "Human Agent" if sender_type == "agent" else ("AI Assistant" if sender_type == "ai" else "Customer")
         created_message["sender_name"] = sender_name
         
-        # Extract attachment for response model
         attachment_obj = _extract_attachment(created_message.get("metadata"))
         created_message["attachment"] = attachment_obj
 
         if app_settings.WEBSOCKET_ENABLED:
             try:
                 conn = get_connection_manager()
-                ws_cust_id = chat_data_minimal.get("customer_id")
+                ws_cust_id = chat_data.get("customer_id")
                 
                 broadcast_name = sender_name
                 if sender_type == "customer":
                     c_res = supabase.table("customers").select("name").eq("id", ws_cust_id).single().execute()
                     broadcast_name = c_res.data.get("name") if c_res.data else "Unknown Customer"
 
-                # [FIX] Convert Pydantic model to Dict
                 attach_dict = attachment_obj.model_dump() if attachment_obj else None
 
                 await conn.broadcast_new_message(
@@ -1720,13 +1706,9 @@ async def create_message(
                     message_id=created_message["id"],
                     customer_id=ws_cust_id,
                     customer_name=broadcast_name, 
-                    
-                    # [FIX 3] Use DB Content & Metadata
-                    # This ensures the frontend gets exactly what was saved (captions, URLs, etc)
                     message_content=created_message.get("content", ""), 
-                    
-                    channel=chat_data_minimal.get("channel"),
-                    handled_by=chat_data_minimal.get("handled_by"),
+                    channel=chat_data.get("channel"),
+                    handled_by=chat_data.get("handled_by"),
                     sender_type=sender_type,
                     sender_id=sender_id,
                     attachment=attach_dict,
@@ -1741,7 +1723,8 @@ async def create_message(
     except HTTPException: raise
     except Exception as e:
         logger.error(f"Create message error: {e}")
-        raise HTTPException(500, "Failed to create message")  
+        raise HTTPException(500, "Failed to create message")
+
 
 # ============================================
 # TICKET ENDPOINTS

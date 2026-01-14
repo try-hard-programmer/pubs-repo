@@ -51,309 +51,6 @@ def _generate_status_message(result: dict) -> str:
     if result.get("handled_by") == "system_busy": return "Auto-reply sent (Agent Busy)"
     return "Message processed"
 
-async def process_auto_ticket_async(
-    chat_id: str,
-    customer_id: str,
-    organization_id: str,
-    customer_name: str,
-    message_content: str,
-    decision: TicketDecision, 
-    supabase
-):
-    """
-    Background task to auto-create tickets based on the Guard's decision.
-    """
-    try:
-        # 1. Check for existing active ticket to avoid duplicates
-        active_tickets = supabase.table("tickets") \
-            .select("id, ticket_number") \
-            .eq("chat_id", chat_id) \
-            .in_("status", ["open", "in_progress"]) \
-            .execute()
-        
-        if active_tickets.data:
-            existing_ticket = active_tickets.data[0]
-            logger.info(f"ℹ️  Skipping auto-ticket: Active ticket {existing_ticket['ticket_number']} already exists for chat {chat_id}")
-            return # Ticket exists, do nothing
-
-        logger.info(f"🎫 Creating Auto-Ticket for {chat_id}. Priority: {decision.suggested_priority}")
-
-        # 2. Use the TicketService to create (handles DB + Logging)
-        ticket_service = get_ticket_service()
-        
-        new_ticket_data = TicketCreate(
-            chat_id=chat_id,
-            customer_id=customer_id,
-            title=f"Support Request: {customer_name}",
-            description=f"Message: {message_content}\n\n[Auto-created: {decision.reason}]",
-            priority=decision.suggested_priority or TicketPriority.MEDIUM, 
-            category=decision.suggested_category or "inquiry"
-        )
-
-        new_ticket = await ticket_service.create_ticket(
-            data=new_ticket_data,
-            organization_id=organization_id,
-            actor_id=None,
-            actor_type=ActorType.SYSTEM
-        )
-
-        logger.info(f"✅ Auto-Ticket created successfully: {new_ticket.ticket_number}")
-
-    except Exception as e:
-        logger.error(f"❌ Auto-Ticket creation failed: {e}")
-
-def is_agent_busy(agent: dict) -> bool:
-    """
-    Check if agent is busy
-
-    Args:
-        agent: Agent data from database
-
-    Returns:
-        True if agent status is 'busy', False otherwise
-    """
-    return agent.get("status") == "busy"
-
-async def send_busy_agent_auto_reply(
-    agent: dict,
-    channel: str,
-    contact: str,
-    supabase
-) -> bool:
-    """
-    Send automatic reply when agent is busy
-
-    Args:
-        agent: Agent data from database
-        channel: Channel type (whatsapp, telegram, email)
-        contact: Customer contact (phone number, telegram_id, or email)
-        supabase: Supabase client
-
-    Returns:
-        True if message sent successfully, False otherwise
-    """
-    try:
-        # Check if agent status is 'busy'
-        if not is_agent_busy(agent):
-            return False
-
-        agent_id = agent["id"]
-        logger.info(f"🔔 Agent {agent['name']} is BUSY - sending auto-reply to {contact}")
-
-        # Get agent integration for this channel
-        integration_response = supabase.table("agent_integrations").select("*").eq(
-            "agent_id", agent_id
-        ).eq("channel", channel).execute()
-
-        if not integration_response.data:
-            logger.warning(f"⚠️  No integration found for agent {agent_id} on channel {channel}")
-            return False
-
-        integration = integration_response.data[0]
-
-        # Check if integration is enabled and connected
-        if not integration.get("enabled") or integration.get("status") != "connected":
-            logger.warning(f"⚠️  Integration not enabled or not connected for agent {agent_id}")
-            return False
-
-        # Prepare auto-reply message
-        auto_reply_message = "Mohon maaf agent saat ini sedang sibuk dan akan menghubungi anda dalam beberapa saat kemudian"
-
-        # Send message based on channel
-        if channel == "whatsapp":
-            # Get WhatsApp service
-            from app.services.whatsapp_service import get_whatsapp_service
-            whatsapp_service = get_whatsapp_service()
-
-            # Send text message via WhatsApp
-            try:
-                result = await whatsapp_service.send_text_message(
-                    session_id=agent_id,  # session_id is same as agent_id
-                    phone_number=contact,
-                    message=auto_reply_message
-                )
-
-                if result.get("success"):
-                    logger.info(f"✅ Auto-reply sent to {contact} via WhatsApp")
-                    return True
-                else:
-                    logger.error(f"❌ Failed to send auto-reply via WhatsApp: {result}")
-                    return False
-
-            except Exception as e:
-                logger.error(f"❌ Error sending auto-reply via WhatsApp: {e}")
-                return False
-
-        elif channel == "telegram":
-            # TODO: Implement Telegram auto-reply when telegram service is available
-            logger.warning(f"⚠️  Telegram auto-reply not implemented yet")
-            return False
-
-        elif channel == "email":
-            # TODO: Implement Email auto-reply when email service is available
-            logger.warning(f"⚠️  Email auto-reply not implemented yet")
-            return False
-
-        else:
-            logger.warning(f"⚠️  Unknown channel: {channel}")
-            return False
-
-    except Exception as e:
-        logger.error(f"❌ Error in send_busy_agent_auto_reply: {e}")
-        return False
-
-async def send_out_of_schedule_message(
-    agent: dict,
-    channel: str,
-    contact: str,
-    supabase
-) -> bool:
-    """
-    Send automatic message when agent is outside working hours.
-
-    Only sends message for AI agents. Human agents are expected to handle manually.
-
-    Args:
-        agent: Agent data from database
-        channel: Channel type (whatsapp, telegram, email)
-        contact: Customer contact (phone number, telegram_id, or email)
-        supabase: Supabase client
-
-    Returns:
-        True if message sent successfully, False otherwise
-    """
-    try:
-        # Only send message for AI agents
-        if agent.get("user_id") is not None:
-            logger.debug(f"ℹ️  Agent {agent['name']} is human - skipping out-of-schedule message")
-            return False
-
-        agent_id = agent["id"]
-        logger.info(f"⏰ Agent {agent['name']} is OUT OF SCHEDULE - sending auto-message to {contact}")
-
-        # Get agent integration for this channel
-        integration_response = supabase.table("agent_integrations").select("*").eq(
-            "agent_id", agent_id
-        ).eq("channel", channel).execute()
-
-        if not integration_response.data:
-            logger.warning(f"⚠️  No integration found for agent {agent_id} on channel {channel}")
-            return False
-
-        integration = integration_response.data[0]
-
-        # Check if integration is enabled and connected
-        if not integration.get("enabled") or integration.get("status") != "connected":
-            logger.warning(f"⚠️  Integration not enabled or not connected for agent {agent_id}")
-            return False
-
-        # Prepare out-of-schedule message
-        out_of_schedule_message = "Mohon di tunggu sebentar akan di arahkan ke admin kami"
-
-        # Send message based on channel
-        if channel == "whatsapp":
-            # Get WhatsApp service
-            from app.services.whatsapp_service import get_whatsapp_service
-            whatsapp_service = get_whatsapp_service()
-
-            # Send text message via WhatsApp
-            try:
-                result = await whatsapp_service.send_text_message(
-                    session_id=agent_id,  # session_id is same as agent_id
-                    phone_number=contact,
-                    message=out_of_schedule_message
-                )
-
-                if result.get("success"):
-                    logger.info(f"✅ Out-of-schedule message sent to {contact} via WhatsApp")
-                    return True
-                else:
-                    logger.error(f"❌ Failed to send out-of-schedule message via WhatsApp: {result}")
-                    return False
-
-            except Exception as e:
-                logger.error(f"❌ Error sending out-of-schedule message via WhatsApp: {e}")
-                return False
-
-        elif channel == "telegram":
-            # TODO: Implement Telegram out-of-schedule message when telegram service is available
-            logger.warning(f"⚠️  Telegram out-of-schedule message not implemented yet")
-            return False
-
-        elif channel == "email":
-            # TODO: Implement Email out-of-schedule message when email service is available
-            logger.warning(f"⚠️  Email out-of-schedule message not implemented yet")
-            return False
-
-        else:
-            logger.warning(f"⚠️  Unknown channel: {channel}")
-            return False
-
-    except Exception as e:
-        logger.error(f"❌ Error in send_out_of_schedule_message: {e}")
-        return False
-
-async def flag_message_as_out_of_schedule(
-    message_id: str,
-    reason: str,
-    supabase
-) -> bool:
-    """
-    Flag message as out-of-schedule by updating message metadata.
-
-    This allows frontend/admin to identify messages that need human attention
-    because they arrived outside working hours.
-
-    Args:
-        message_id: UUID of the message to flag
-        reason: Reason why message is out of schedule (e.g., "Outside working hours: Sunday")
-        supabase: Supabase client
-
-    Returns:
-        True if flagging successful, False otherwise
-    """
-    try:
-        logger.info(f"🚩 Flagging message {message_id} as out-of-schedule: {reason}")
-
-        # Prepare metadata update
-        # Note: We're using JSONB merge, so existing metadata won't be lost
-        flag_metadata = {
-            "out_of_schedule": True,
-            "out_of_schedule_reason": reason,
-            "out_of_schedule_flagged_at": datetime.utcnow().isoformat()
-        }
-
-        # First, get existing metadata
-        existing_response = supabase.table("messages") \
-            .select("metadata") \
-            .eq("id", message_id) \
-            .execute()
-
-        if not existing_response.data:
-            logger.warning(f"⚠️  Message {message_id} not found")
-            return False
-
-        # Merge with existing metadata
-        existing_metadata = existing_response.data[0].get("metadata", {})
-        merged_metadata = {**existing_metadata, **flag_metadata}
-
-        # Update message metadata
-        update_response = supabase.table("messages") \
-            .update({"metadata": merged_metadata}) \
-            .eq("id", message_id) \
-            .execute()
-
-        if update_response.data:
-            logger.info(f"✅ Message {message_id} flagged as out-of-schedule successfully")
-            return True
-        else:
-            logger.error(f"❌ Failed to flag message {message_id}")
-            return False
-
-    except Exception as e:
-        logger.error(f"❌ Error flagging message as out-of-schedule: {e}")
-        return False
-
 def parse_agent_config(config_data: Any) -> Dict:
     if not config_data: return {}
     if isinstance(config_data, dict): return config_data
@@ -373,14 +70,6 @@ async def fetch_agent_settings(supabase, agent_id: str) -> Dict[str, Any]:
             return data
     except Exception: pass
     return {}
-
-async def check_telegram_idempotency(supabase, msg_id: str) -> bool:
-    if not msg_id: return False
-    res = supabase.table("messages").select("id").eq("metadata->>telegram_message_id", str(msg_id)).execute()
-    if res.data:
-        logger.warning(f"🛑 Duplicate Message ID {msg_id}")
-        return True
-    return False
 
 async def send_auto_reply(supabase, channel: str, agent_id: str, contact_info: Dict, message_text: str):
     """Sends reply via channel (WhatsApp/Telegram)."""
@@ -786,20 +475,17 @@ async def _upload_media_to_supabase(
         raise Exception(f"Media upload failed: {str(e)}")
 
 def _extract_phone_number(whatsapp_id: str) -> str:
+    if not whatsapp_id: return ""
+    if "@lid" in whatsapp_id: return whatsapp_id
+    if "@g.us" in whatsapp_id: return whatsapp_id # Keep Group IDs intact
     
-    if not whatsapp_id:
-        return ""
-    
-    if "@lid" in whatsapp_id:
-        return whatsapp_id
-
     clean_id = whatsapp_id.split("@")[0].split(":")[0]
-    logger.info(f"🧪 [1. EXTRACTOR] Standard Clean Result: '{clean_id}'")
     return clean_id
 
 async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookMessage) -> WhatsAppWebhookMessage:
     """
-    Unified converter that correctly routes data sources for Text vs Media.
+    Unified converter: Extracts Real Sender Number & Enforces 'Group - Name' format.
+    Fixes 'None' display by ensuring notifyName/pushName are populated.
     """
     raw_payload = unofficial.data
     
@@ -807,14 +493,54 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
     wrapper = raw_payload.get("message", {}) or raw_payload.get("messageMedia", {})
     identity_source = wrapper.get("_data", {}) or wrapper
     
-    phone = _extract_phone_number(identity_source.get("from", ""))
+    # Identify Context
+    chat_id = identity_source.get("id", {}).get("remote") or identity_source.get("from", "")
+    sender_id = identity_source.get("author") or identity_source.get("participant") or chat_id
+
+    # Clean IDs
+    phone = _extract_phone_number(chat_id)          # Group ID
+    sender_clean = _extract_phone_number(sender_id) # Participant ID (LID or Phone)
     to_num = _extract_phone_number(identity_source.get("to", ""))
-    sender = identity_source.get("notifyName") or phone
+
+    # [FIX] Get Real Phone Number (Strip Suffix)
+    real_number = sender_clean.split('@')[0]
+
+    # [FIX] Detect Sender Name (Prioritize Real Name)
+    real_sender_name = (
+        identity_source.get("notifyName") or 
+        identity_source.get("pushname") or 
+        identity_source.get("verifiedName")
+    )
+    
+    # Fallback: If Name is missing/empty, use the Number
+    if not real_sender_name or str(real_sender_name).strip() == "":
+        real_sender_name = real_number
+        
+    # [FIX] Logic for "Customer Name" -> "Group Name - Sender Name"
+    if "@g.us" in chat_id:
+        # 1. Get Group Name
+        group_subject = (
+            identity_source.get("chat", {}).get("name") or 
+            identity_source.get("groupInfo", {}).get("subject") or
+            wrapper.get("chat", {}).get("name")
+        )
+        
+        # [FIX] Clean "Group g.us" or Empty Subject
+        # If subject is missing OR it looks like an ID (contains @g.us), use a clean fallback
+        if not group_subject or "@g.us" in str(group_subject):
+            # Use last 4 digits of the numeric ID for a clean look "Group 9066"
+            short_id = phone[-4:] if len(phone) > 4 else phone
+            group_subject = f"Group {short_id}"
+            
+        # 2. Combine format: "Group Name - Sender Name"
+        final_customer_name = f"{group_subject} - {real_sender_name}"
+    else:
+        final_customer_name = real_sender_name
+    
     msg_id = identity_source.get("id", {}).get("id") if isinstance(identity_source.get("id"), dict) else None
     ts = datetime.fromtimestamp(identity_source.get("t")).isoformat() if identity_source.get("t") else None
     
     # 2. EXTRACT CONTENT
-    # [FIX] For Media, we need raw_payload. For Text, we prefer the inner identity_source.
     if unofficial.dataType == "media":
         content_source = raw_payload
     else:
@@ -829,9 +555,25 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         url = None
 
     return WhatsAppWebhookMessage(
-        phone_number=phone, to_number=to_num, sender_name=sender,
-        message=text, message_id=msg_id, message_type=type_str,
-        media_url=url, timestamp=ts, metadata={"session_id": unofficial.sessionId}
+        phone_number=phone,
+        to_number=to_num,
+        sender_name=final_customer_name,
+        message=text, 
+        message_id=msg_id, 
+        message_type=type_str,
+        media_url=url, 
+        timestamp=ts,
+        metadata={
+            "session_id": unofficial.sessionId,
+            "is_group": "@g.us" in chat_id,
+            "group_participant": sender_clean if "@g.us" in chat_id else None,
+            "real_contact_number": real_number,    # Used for logic
+            "real_sender_name": real_sender_name,  # Used for Display
+            "notifyName": real_sender_name,        # [FIX] Ensure UI finds a name
+            "pushName": real_sender_name,          # [FIX] Ensure UI finds a name
+            "original_sender_id": sender_id,
+            "whatsapp_name": real_sender_name
+        }
     )
 
 async def _handle_message_content_for_telegram(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
@@ -874,7 +616,12 @@ async def process_webhook_message_v2(
     customer_name: Optional[str], message_metadata: Dict, customer_metadata: Dict, supabase
 ) -> Dict:
     """
-    V2 Processor: Fixed Ticket Race Condition using Blocking Redis Lock.
+    V2 Processor: 
+    1. Route Message (One Chat = One Ticket/Session)
+    2. Broadcast to WebSocket (with Media Polling)
+    3. Busy & Schedule Checks (Blocking)
+    4. Ticket Logic (with Redis Locking for safety)
+    5. Enqueue AI
     """
     agent_id = agent["id"]
     org_id = agent["organization_id"]
@@ -882,28 +629,116 @@ async def process_webhook_message_v2(
     if agent.get("status") == "inactive":
         return {"success": False, "status": "dropped_inactive"}
 
+    # =========================================================================
     # 1. ROUTING & STORAGE
+    # =========================================================================
     router = get_message_router_service(supabase)
-    res = await router.route_incoming_message(agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata)
+    
+    # [GROUP SUPPORT] The router now receives 'participant' and 'is_group' via metadata
+    res = await router.route_incoming_message(
+        agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata
+    )
     chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
 
-    # 2. UPDATE PHONE & 3. BROADCAST (Standard logic)
-    if customer_metadata.get("phone") and cust_id:
-        try: supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
-        except: pass
-
-    if app_settings.WEBSOCKET_ENABLED:
-        try:
-             # Basic websocket notification logic (if needed)
-             pass 
-        except Exception: 
+    # 2. UPDATE CUSTOMER PHONE (Only for legitimate users, not Groups)
+    is_group = message_metadata.get("is_group", False)
+    if customer_metadata.get("phone") and cust_id and not is_group:
+        try: 
+            supabase.table("customers").update({"phone": customer_metadata["phone"]}).eq("id", cust_id).execute()
+        except: 
             pass
 
-    if res.get("is_merged_event"): return res
-    if res.get("handled_by") == "human": return res
+    # =========================================================================
+    # 3. WEBSOCKET BROADCAST (With High-Res Media Polling)
+    # =========================================================================
+    if app_settings.WEBSOCKET_ENABLED:
+        try:
+            fresh_metadata = message_metadata
+            
+            # [POLLING FIX] WhatsApp often sends a low-res thumbnail URL first, then updates DB.
+            # We wait up to 3s to catch the high-res URL for the frontend.
+            if channel == "whatsapp" and message_metadata.get("message_type") in ["image", "video", "document"]:
+                initial_url = message_metadata.get("media_url")
+                for _ in range(3): # 3 attempts * 1s = 3 seconds max
+                    await asyncio.sleep(1)
+                    try:
+                        msg_res = supabase.table("messages").select("metadata").eq("id", msg_id).single().execute()
+                        if msg_res.data and msg_res.data.get("metadata"):
+                            db_meta = msg_res.data["metadata"]
+                            # If URL changed (updated by backend storage service), use it
+                            if db_meta.get("media_url") and db_meta.get("media_url") != initial_url:
+                                fresh_metadata = db_meta
+                                break
+                    except: pass
+            
+            # Construct Attachment Data for Frontend
+            attachment_data = None
+            if fresh_metadata.get("media_url"):
+                attachment_data = {
+                    "url": fresh_metadata["media_url"], 
+                    "type": fresh_metadata.get("message_type", "image"),
+                    "name": "Media Attachment"
+                }
 
-    # 5. BUSY CHECK & 6. SCHEDULE CHECK (Standard logic)
-    # ... (Preserving existing logic flow for these checks if they exist in your full implementation) ...
+            # [GROUP SUPPORT] Broadcast who actually sent the message
+            sender_display = customer_name
+            if is_group:
+                participant = message_metadata.get("participant", "")
+                sender_display = f"{participant} (in {customer_name})"
+
+            await get_connection_manager().broadcast_new_message(
+                organization_id=org_id, chat_id=chat_id, message_id=msg_id,
+                customer_id=cust_id, customer_name=sender_display or "Unknown",
+                message_content=message_content, channel=channel, handled_by=res["handled_by"],
+                sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
+                was_reopened=res.get("was_reopened", False), 
+                metadata=fresh_metadata,
+                attachment=attachment_data
+            )
+        except Exception as e:
+            logger.error(f"❌ WS Broadcast Failed: {e}")
+
+    # Stop if it was a merged chunk (don't re-process logic)
+    if res.get("is_merged_event"): return res
+
+    # 4. STOP IF HANDLED BY HUMAN
+    if res.get("handled_by") == "human": 
+        # Optional: Log WHO it is assigned to for debugging
+        logger.info(f"🛑 Chat {chat_id} is assigned to Human. Skipping AI processing.")
+        return res
+
+    # =========================================================================
+    # 5. BUSY CHECK (Blocking)
+    # =========================================================================
+    if agent.get("status") == "busy":
+        logger.info(f"⛔ Agent Busy. Sending Auto-Reply and STOPPING AI.")
+        msg = "Maaf, saat ini kami sedang sibuk."
+        contact_info = {"phone": contact, "telegram_id": contact}
+        
+        await send_auto_reply(supabase, channel, agent_id, contact_info, msg)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel, agent_name=agent["name"])
+        return {**res, "handled_by": "system_busy"}
+
+    # =========================================================================
+    # 6. SCHEDULE CHECK (Blocking)
+    # =========================================================================
+    schedule = await get_agent_schedule_config(agent_id, supabase)
+    is_within, _ = is_within_schedule(schedule, datetime.now(ZoneInfo("UTC")))
+    
+    if not is_within:
+        logger.info(f"🌙 Agent Out of Schedule. Sending Auto-Reply and STOPPING AI.")
+        msg = "Maaf kami sedang tutup saat ini."
+        
+        # Flag user message as OOO
+        try: supabase.table("messages").update({"metadata": {**message_metadata, "out_of_schedule": True}}).eq("id", msg_id).execute()
+        except: pass
+        
+        chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
+        cust_data = {"phone": contact, "metadata": {"telegram_id": contact}}
+        
+        await send_message_via_channel(chat_data, cust_data, msg, supabase)
+        await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, msg, channel, agent_name=agent["name"])
+        return {**res, "handled_by": "ooo_system"}
 
     # =========================================================================
     # 7. LOGIC: TICKET CHECK & AI TRIGGER (LOCKED FOR SAFETY)
@@ -913,35 +748,28 @@ async def process_webhook_message_v2(
     ticket_svc = get_ticket_service()
     ai_priority = "medium"
 
-    # [CRITICAL FIX] Use Blocking Lock (wait up to 5s)
-    # This stops the "Double Ticket" race condition.
+    # [CRITICAL] Redis Lock to prevent Double Ticket Creation
     async with acquire_lock(f"webhook:ticket:{chat_id}", expire=30, wait_time=5) as acquired:
         if not acquired:
             logger.warning(f"🔒 Lock Timeout for Chat {chat_id}. Assuming race condition handled.")
             ai_priority = "medium"
         else:
-            # LOCK ACQUIRED: Safe to check DB
             try:
-                # Check for ACTIVE ticket
                 active_ticket = None
                 ticket_query = supabase.table("tickets").select("id, ticket_number, assigned_agent_id, priority")\
                     .eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
                 
                 if ticket_query.data:
-                    # [Found Ticket] - Do nothing, just mark handled
+                    # TICKET EXISTS
                     active_ticket = ticket_query.data[0]
                     if active_ticket.get("assigned_agent_id"):
                         return {**res, "handled_by": "human_ticket"}
-                    
-                    logger.info(f"🎫 Active Ticket Found: {active_ticket['ticket_number']}")
                     ai_priority = str(active_ticket.get("priority", "medium")).lower()
                 else:
-                    # [No Ticket] - Create One
-                    logger.info(f"🆕 No Active Ticket. Creating New...")
-                    
-                    # 1. Create Ticket Object FIRST (DB Transaction)
-                    # We create the ticket BEFORE sending the message to ensure DB integrity.
+                    # CREATE TICKET (NO GREETING)
+                    logger.info(f"🆕 No Active Ticket. Creating New Default...")
                     ticket_config = parse_agent_config(agent.get("ticketing_config"))
+                    
                     new_ticket_data = TicketCreate(
                         chat_id=chat_id,
                         customer_id=cust_id,
@@ -959,35 +787,13 @@ async def process_webhook_message_v2(
                         actor_type=ActorType.SYSTEM
                     )
                     
-                    # 2. Send Auto Reply (THE "FIRST HELLO")
-                    # This logic is PRESERVED, just moved here for safety.
-                    resolved_contact = await resolve_lid_to_real_number(contact, agent_id, channel, supabase)
-                    display_name = customer_name or 'Kak'
-                    if "@lid" in str(display_name) or "User" in str(display_name):
-                        display_name = str(resolved_contact).split("@")[0]
-
-                    greeting_msg = (
-                        f"Halo {display_name}! 👋\n\n"
-                        "Terima kasih telah menghubungi kami. Pesan Anda telah kami terima.\n"
-                        "Kami membuatkan tiket untuk Anda dan Agen AI kami akan segera merespons."
-                    )
-                    
-                    chat_data = {"id": chat_id, "channel": channel, "sender_agent_id": agent_id}
-                    cust_data = {"phone": resolved_contact, "metadata": {"telegram_id": resolved_contact}}
-                    
-                    await send_message_via_channel(chat_data, cust_data, greeting_msg, supabase)
-                    await save_and_broadcast_system_message(supabase, chat_id, agent_id, org_id, greeting_msg, channel, agent_name=agent["name"])
-
-                    logger.info("✅ Default Ticket Created & Reply Sent.")
+                    logger.info("✅ Default Low Priority Ticket Created (Silent).")
                     ai_priority = "low"
 
             except Exception as e:
-                logger.error(f"❌ Ticket Creation Error: {e}")
-                # Fallback: Just continue to queue so AI might pick it up
-
-
+                logger.error(f"❌ Ticket Creation Flow Error: {e}")
+                
     # 8. QUEUE AI (Universal)
-    logger.info(f"⚡ Enqueueing AI for Chat {chat_id} [Prio: {ai_priority}]")
     await queue_svc.enqueue(
         chat_id=chat_id, 
         message_id=msg_id, 
@@ -1000,6 +806,7 @@ async def process_webhook_message_v2(
 # ============================================
 # 2. WHATSAPP UNOFFICIAL WEBHOOK (Updated)
 # ============================================
+
 @router.post(
     "/wa-unofficial",
     response_model=WebhookRouteResponse,
@@ -1017,7 +824,7 @@ async def whatsapp_unofficial_webhook(
         # System Events
         system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
         if message.dataType in system_events:
-            logger.info(f"📡 System Event ({message.dataType}) - Ignored")
+            # logger.info(f"📡 System Event ({message.dataType}) - Ignored")
             agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
             if agent_res.data and app_settings.WEBSOCKET_ENABLED:
                 org_id = agent_res.data[0]["organization_id"]
@@ -1050,10 +857,10 @@ async def whatsapp_unofficial_webhook(
         if not str(msg_body).strip() and not has_media:
             return JSONResponse(content={"status": "ignored", "reason": "zero_information_payload"})
 
-        # [FIX] Dedup using Redis Atomic Check (Replaces dedup_cache)
+        # Redis Dedup
         dedup_key = f"{whatsapp_id}_{message.dataType}"
         if await is_duplicate_message(dedup_key):
-            logger.info(f"⚡ Redis Dedup: Skipping duplicate {dedup_key}")
+            # logger.info(f"⚡ Redis Dedup: Skipping duplicate {dedup_key}")
             return JSONResponse(content={"status": "ignored", "reason": "duplicate_redis_cache"})
 
         if message.dataType != "media":
@@ -1075,9 +882,86 @@ async def whatsapp_unofficial_webhook(
         settings_data = await fetch_agent_settings(supabase, agent_id)
         if settings_data: agent.update(settings_data)
 
+        # -------------------------------------------------------------
+        # 1. STANDARDIZE & GROUP CHECK
+        # -------------------------------------------------------------
         standard_message = await _convert_unofficial_to_standard(message)
-        
-        # Zombie Check
+        meta = standard_message.metadata
+        is_group = meta.get("is_group", False)
+
+        # -------------------------------------------------------------
+        # 2. GROUP MENTION FILTER
+        # -------------------------------------------------------------
+        if is_group:
+            # Gather all possible IDs for "Me"
+            potential_ids = set()
+            
+            # A. From Database
+            if agent.get("phone"):
+                potential_ids.add(str(agent.get("phone")).replace("+", "").strip())
+                
+            # B. From Session ID
+            potential_ids.add(_extract_phone_number(agent_id))
+            
+            # C. From Injected 'me' object (Node.js)
+            raw_me = message.data.get("me", {})
+            if raw_me.get("wid"): potential_ids.add(_extract_phone_number(raw_me["wid"]))
+            if raw_me.get("lid"): potential_ids.add(_extract_phone_number(raw_me["lid"]))
+            
+            # Extract Pushname
+            pushname = raw_me.get("pushname")
+
+            mentions = meta.get("mentioned_ids", [])
+            
+            is_mentioned = False
+            
+            # Check 1: Exact ID Match (Metadata)
+            for my_id in potential_ids:
+                if any(my_id in str(m) for m in mentions):
+                    is_mentioned = True
+                    logger.info(f"✅ Mention Metadata Match: {my_id}")
+                    break
+            
+            # Check 2: Body Text Fallback (Smart Scan)
+            final_content = standard_message.message or ""
+            
+            if not is_mentioned and final_content:
+                # A. Check Phone IDs in text
+                for my_id in potential_ids:
+                    if f"@{my_id}" in final_content:
+                        is_mentioned = True
+                        final_content = final_content.replace(f"@{my_id}", "").strip() # Strip ID
+                        logger.info(f"✅ Mention Body Match (ID): @{my_id}")
+                        break
+                
+                # B. Check Pushname
+                if not is_mentioned and pushname and f"@{pushname}" in final_content:
+                    is_mentioned = True
+                    final_content = final_content.replace(f"@{pushname}", "").strip() # Strip Name
+                    logger.info(f"✅ Mention Body Match (Name): @{pushname}")
+
+                # C. Heuristic LID Match (Backup)
+                if not is_mentioned:
+                    import re
+                    # Find LID (@2...) pattern
+                    lid_matches = re.findall(r"@\s?(2\d{10,17})", final_content)
+                    if lid_matches:
+                        detected_lid = lid_matches[0]
+                        is_mentioned = True
+                        # Cleanly strip the mention substring
+                        final_content = re.sub(r"@\s?" + detected_lid, "", final_content).strip()
+                        logger.info(f"🦸‍♂️ Heuristic Match: Found LID @{detected_lid}. Stripped & Processing.")
+
+            if not is_mentioned:
+                # logger.info(f"🔇 Dropping Group Msg: No matching mention found.")
+                return JSONResponse(content={"status": "ignored", "reason": "group_no_mention"})
+            
+            # Update the message content to the cleaned version (Mention Removed)
+            standard_message.message = final_content
+
+        # -------------------------------------------------------------
+        # 3. ZOMBIE CHECK (Ignore old messages)
+        # -------------------------------------------------------------
         if standard_message.timestamp:
             try:
                 msg_time = datetime.fromisoformat(standard_message.timestamp)
@@ -1088,19 +972,55 @@ async def whatsapp_unofficial_webhook(
                     return JSONResponse(content={"status": "ignored", "reason": "too_old"})
             except Exception: pass
 
-        # Resolve LID
-        contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
+        # -------------------------------------------------------------
+        # 4. RESOLVE IDENTITY
+        # -------------------------------------------------------------
+        contact_id = standard_message.phone_number # Default to 'from'
+        
+        # Resolve LID only if it's NOT a group
+        if not is_group:
+            contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
+        
+        # Display Name Logic
         sender_name = standard_message.sender_name
         if sender_name and ("@lid" in sender_name or not sender_name.strip()):
              sender_name = contact_id
-        if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
 
-        # Use V2 Processor
+        # Clean ID: Strip @c.us for users, but KEEP @g.us for groups (to be safe/explicit)
+        if "@c.us" in contact_id: 
+            contact_id = contact_id.split("@")[0]
+        
+        # -------------------------------------------------------------
+        # 5. PREPARE GROUP CONTEXT (Resolve LID & Inject Sender)
+        # -------------------------------------------------------------
+        final_message_content = standard_message.message
+        
+        if is_group:
+            # 1. Get raw LID (e.g. 271...@lid)
+            raw_participant = meta.get("participant", "")
+            participant_id = raw_participant.split("@")[0]
+            
+            # 2. Resolve to Real Number (e.g. 628...@c.us)
+            if "@lid" in raw_participant:
+                real_number = await resolve_lid_to_real_number(raw_participant, agent_id, "whatsapp", supabase)
+                if real_number and real_number != raw_participant:
+                    participant_id = real_number.split("@")[0]
+
+            # 3. Create Clean Context string
+            # Database receives: "[Kurnia] (@628...): hello" (Clean)
+            # Instead of: "[Kurnia] (@271...): hello" (Garbage)
+            if participant_id:
+                sender_display = sender_name or "Unknown"
+                final_message_content = f"[{sender_display}] (@{participant_id}): {standard_message.message}"
+
+        # -------------------------------------------------------------
+        # 6. EXECUTE PROCESSOR V2
+        # -------------------------------------------------------------
         result = await process_webhook_message_v2(
             agent=agent,
             channel="whatsapp",
-            contact=contact_id,
-            message_content=standard_message.message,
+            contact=contact_id, # Group ID (@g.us) OR User ID (clean)
+            message_content=final_message_content, # <--- Contains the "Mention Back" context
             customer_name=sender_name or contact_id,
             message_metadata={
                 "whatsapp_message_id": standard_message.message_id,
@@ -1108,9 +1028,15 @@ async def whatsapp_unofficial_webhook(
                 "timestamp": standard_message.timestamp,
                 "is_lid": "@lid" in standard_message.phone_number,
                 "media_url": standard_message.media_url,
+                "is_group": is_group,
+                "participant": meta.get("participant"),
+                "sender_display_name": sender_name,
                 **standard_message.metadata
             },
-            customer_metadata={"whatsapp_name": sender_name},
+            customer_metadata={
+                "whatsapp_name": sender_name,
+                "is_group": is_group
+            },
             supabase=supabase
         )
 
@@ -1124,8 +1050,6 @@ async def whatsapp_unofficial_webhook(
     except Exception as e:
         logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
         return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
-
-
 # ============================================
 # 3. TELEGRAM USERBOT WEBHOOK (Updated)
 # ============================================
@@ -1153,38 +1077,58 @@ async def telegram_userbot_webhook(
         if not data_content and payload.dataType != "media": 
             raise HTTPException(status_code=400, detail="Invalid JSON structure")
         
-        # 3. [FIXED] Redis Idempotency Check (Was DB Check)
+        # 3. Redis Idempotency Check
         msg_id = data_content.get("id", {}).get("id")
-        
-        # We perform the atomic Redis check HERE
         if msg_id:
             dedup_key = f"tg_{msg_id}" # Unique prefix for Telegram
             if await is_duplicate_message(dedup_key):
                 logger.info(f"⚡ Redis Dedup: Skipping duplicate Telegram ID {msg_id}")
                 return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
 
-        # 4. Identity Extraction
-        sender_id = str(data_content.get("from", ""))
-        sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
-        timestamp_unix = data_content.get("t")
-        
-        # Phone logic
-        raw_phone = data_content.get("phone")
-        final_phone = sender_id
-        if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
-            final_phone = str(raw_phone)
-
-        # 5. Agent Verification
-        supabase = get_supabase_client() # Move client init here
+        # 4. Agent Verification
+        supabase = get_supabase_client()
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
         if not agent_res.data: 
             raise HTTPException(404, "Agent not found")
         agent = agent_res.data[0]
         
-        # 6. Apply Agent Settings
         settings_data = await fetch_agent_settings(supabase, agent_id)
-        if settings_data: 
-            agent.update(settings_data)
+        if settings_data: agent.update(settings_data)
+
+        # 5. Identity & Group Extraction
+        # Note: In Telethon 'incoming' events:
+        # 'from' = User ID (Sender)
+        # 'to' = Chat ID (Group) OR Agent ID (if DM)
+        
+        sender_id = str(data_content.get("from", ""))
+        sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
+        timestamp_unix = data_content.get("t")
+        
+        raw_to = str(data_content.get("to", ""))
+        
+        # Check flags passed by listener.py
+        is_group_tele = data_content.get("is_group") or (raw_to != str(agent_id) and raw_to != "")
+        is_mentioned = data_content.get("mentioned", False)
+        
+        # 6. Group Filtering Logic
+        contact_target = sender_id # Default to DM
+        participant_id = None
+        
+        if is_group_tele:
+            # STRICT FILTER: Must be mentioned
+            if not is_mentioned:
+                return JSONResponse(content={"success": True, "status": "ignored_group_no_mention"})
+            
+            # Contact becomes the Group ID
+            contact_target = raw_to 
+            participant_id = sender_id
+            logger.info(f"🔔 Telegram Group Mention in {contact_target} by {sender_id}")
+
+        # Phone logic (Only applicable for DMs usually)
+        raw_phone = data_content.get("phone")
+        final_phone = sender_id
+        if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
+            final_phone = str(raw_phone)
 
         # 7. Content Extraction
         try:
@@ -1202,22 +1146,26 @@ async def telegram_userbot_webhook(
             "telegram_sender_id": sender_id, 
             "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None,
             "media_url": media_url,
-            "message_type": msg_type 
+            "message_type": msg_type,
+            "is_group": is_group_tele,
+            "participant": participant_id,
+            "sender_display_name": sender_display_name
         }
         
         cust_meta = { 
-            "telegram_id": sender_id, 
-            "phone": final_phone, 
-            "source": "telegram_userbot" 
+            "telegram_id": contact_target, 
+            "phone": final_phone if not is_group_tele else None, # Don't map group ID to phone
+            "source": "telegram_userbot",
+            "is_group": is_group_tele
         }
 
         # 9. Process via V2
         result = await process_webhook_message_v2(
             agent=agent, 
             channel="telegram", 
-            contact=sender_id, 
+            contact=contact_target, # User ID or Group ID
             message_content=message_text, 
-            customer_name=sender_display_name, 
+            customer_name=sender_display_name, # User Name
             message_metadata=msg_meta, 
             customer_metadata=cust_meta, 
             supabase=supabase
@@ -1242,6 +1190,4 @@ async def telegram_userbot_webhook(
     except Exception as e:
         logger.error(f"❌ Telegram Userbot Critical: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-
+    

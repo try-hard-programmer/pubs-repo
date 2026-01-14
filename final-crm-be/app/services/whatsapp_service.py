@@ -279,23 +279,30 @@ class WhatsAppService:
             logger.error(f"Failed to terminate session {session_id}: {e}")
             raise Exception(f"Session termination failed: {str(e)}")
 
-    async def send_text_message(self, session_id: str, phone_number: str, message: str) -> Dict[str, Any]:
+    async def send_text_message(
+        self, 
+        session_id: str, 
+        phone_number: str, 
+        message: str, 
+        mentions: Optional[List[str]] = None  # <--- [FIX] Add mentions param
+    ) -> Dict[str, Any]:
         try:
-            # [FIX] Simplified logic: Trust the ID if it contains '@'
+            # [FIX] Trust the ID if it contains '@'
             chat_id = str(phone_number).strip()
-            
-            # If it's a raw number, append @c.us. If it's @lid or @g.us, leave it alone.
             if "@" not in chat_id:
                 chat_id = f"{chat_id}@c.us"
             
-            logger.info(f"📤 Sending text message to: {chat_id} (Original: {phone_number})")
+            logger.info(f"📤 Sending text message to: {chat_id} (Mentions: {mentions})")
 
-            # Use the correct API payload based on Swagger
             payload = {
                 "chatId": chat_id,
                 "contentType": "string",
                 "content": message
             }
+
+            # [FIX] Add options.mentions if provided
+            if mentions:
+                payload["options"] = { "mentions": mentions }
 
             url = f"{self.base_url}/client/sendMessage/{session_id}"
 
@@ -306,11 +313,11 @@ class WhatsAppService:
                     headers=self._get_headers()
                 )
                 response.raise_for_status()
-                return {"success": True, "session_id": session_id, "phone_number": phone_number, "data": response.json()}
+                return {"success": True, "session_id": session_id, "data": response.json()}
         except Exception as e:
             logger.error(f"Failed to send text message: {e}")
             raise Exception(f"Message sending failed: {str(e)}")
-        
+            
     async def send_media_message(self, session_id: str, phone_number: str, media_url: str, caption: Optional[str] = None, media_type: str = "image") -> Dict[str, Any]:
         try:
             logger.info(f"📤 Sending media message to: {phone_number}")

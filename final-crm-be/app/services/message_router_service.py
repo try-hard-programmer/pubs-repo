@@ -35,7 +35,7 @@ class MessageRouterService:
     ) -> Dict[str, Any]:
         """
         Find existing customer or create new one based on contact info.
-        [FIX] Now blocks creation of customers with empty/invalid contact info.
+        [FIX] Naming logic reverted to standard (Sender Name), distinguishing Groups via metadata only.
         """
         try:
             # =========================================================
@@ -43,7 +43,6 @@ class MessageRouterService:
             # =========================================================
             if not contact or str(contact).strip() == "" or str(contact).lower() == "none":
                 logger.warning(f"🛑 [ROUTER] Aborting: Empty contact identifier received for {channel}")
-                # Return None or raise error to stop processing
                 raise ValueError(f"Cannot create customer with empty contact for {channel}")
 
             logger.info(f"🔍 Finding customer: channel={channel}, contact={contact}")
@@ -52,32 +51,25 @@ class MessageRouterService:
             # 2. BUILD QUERY
             # =========================================================
             if channel == "whatsapp":
-                # Find by phone number
                 query = self.supabase.table("customers") \
                     .select("*") \
                     .eq("organization_id", organization_id) \
                     .eq("phone", contact)
-
             elif channel == "telegram":
-                # Find by telegram_id in metadata
                 query = self.supabase.table("customers") \
                     .select("*") \
                     .eq("organization_id", organization_id) \
                     .eq("metadata->>telegram_id", contact)
-
             elif channel == "email":
-                # Find by email
                 query = self.supabase.table("customers") \
                     .select("*") \
                     .eq("organization_id", organization_id) \
                     .eq("email", contact)
-
             elif channel == "web":
                 query = self.supabase.table("customers") \
                     .select("*") \
                     .eq("organization_id", organization_id) \
                     .eq("metadata->>session_id", contact)
-
             else:
                 raise ValueError(f"Unsupported channel: {channel}")
 
@@ -92,15 +84,16 @@ class MessageRouterService:
                 current_name = customer.get('name', 'Unknown')
                 
                 # Check if name update is needed
-                def is_phone_number(value: str) -> bool:
-                    if not value: return False
-                    return value.replace("+", "").replace("-", "").replace(" ", "").isdigit()
+                def is_placeholder(value: str) -> bool:
+                    if not value: return True
+                    clean = value.replace("+", "").replace("-", "").replace(" ", "")
+                    return clean.isdigit() or "WhatsApp" in value or value == "Unknown"
 
+                # Update name if current is placeholder AND new name is valid
                 should_update = (
-                    (current_name == "Unknown" or is_phone_number(current_name) or "WhatsApp" in current_name) and
+                    is_placeholder(current_name) and
                     customer_name and
-                    customer_name != "Unknown" and
-                    not is_phone_number(customer_name)
+                    not is_placeholder(customer_name)
                 )
 
                 if should_update:
@@ -121,17 +114,27 @@ class MessageRouterService:
             phone_val = contact if channel == "whatsapp" else (metadata or {}).get("phone")
             email_val = contact if channel == "email" else (metadata or {}).get("email")
             
-            # Generate Name if missing
+            # [REVERTED] Standard Naming Logic (Consistent with other records)
             final_name = customer_name
             if not final_name or final_name == "Unknown":
                 final_name = self._extract_name_from_contact(contact, channel)
+
+            # Extract is_group flag
+            is_group = (metadata or {}).get("is_group", False)
 
             customer_data = {
                 "organization_id": organization_id,
                 "name": final_name,
                 "phone": phone_val,
                 "email": email_val,
-                "metadata": metadata or {}
+                "metadata": {
+                    **(metadata or {}),
+                    "is_group": is_group, # Metadata distinguishes the type
+                    "first_contact_at": datetime.utcnow().isoformat(),
+                    "first_contact_channel": channel,
+                    "message_count": 0,
+                    "channels_used": [channel]
+                }
             }
 
             # Enforce channel metadata
@@ -139,12 +142,6 @@ class MessageRouterService:
                 customer_data["metadata"]["telegram_id"] = contact
             elif channel == "web":
                 customer_data["metadata"]["session_id"] = contact
-
-            # Tracking Fields
-            customer_data["metadata"]["first_contact_at"] = datetime.utcnow().isoformat()
-            customer_data["metadata"]["first_contact_channel"] = channel
-            customer_data["metadata"]["message_count"] = 0
-            customer_data["metadata"]["channels_used"] = [channel]
 
             # Insert
             create_response = self.supabase.table("customers").insert(customer_data).execute()
@@ -160,7 +157,6 @@ class MessageRouterService:
         except Exception as e:
             logger.error(f"❌ Customer lookup/creation failed: {e}")
             raise
-
         
     async def find_active_chat(
         self,
@@ -384,6 +380,16 @@ class MessageRouterService:
                 chat_id = active_chat["id"]
                 chat_status = active_chat["status"]
                 handled_by = active_chat.get("handled_by", "unassigned")
+                current_assigned_id = active_chat.get("assigned_agent_id")
+
+                # [PROD FIX] Validate Assignment Integrity
+                # If chat claims to be 'assigned' but has no valid Agent ID, recover to AI.
+                if chat_status == "assigned" or handled_by == "human":
+                    if not current_assigned_id:
+                        logger.warning(f"⚠️ Chat {chat_id} is 'assigned' but has NO Agent ID. Auto-recovering to AI.")
+                        chat_status = "open"
+                        handled_by = "ai"
+                        # We will apply this status update to DB in the insert block below
 
                 if existing_message:
                     # MERGE SPLIT EVENTS (Your original logic)
@@ -405,20 +411,38 @@ class MessageRouterService:
                     # INSERT NEW MESSAGE
                     logger.info(f"📥 Adding message to existing chat: {chat_id}")
 
+                    # Prepare Chat Update Payload (Consolidated)
+                    chat_update = {
+                        "last_message_at": datetime.utcnow().isoformat()
+                    }
+
+                    # Handle Reopening logic
                     if chat_status == "resolved":
                         logger.info(f"♻️ Reopening resolved chat: {chat_id}")
                         if handled_by == "ai": new_status = "open"
                         elif handled_by == "human": new_status = "assigned"
                         else: new_status = "open"
 
-                        self.supabase.table("chats").update({
-                            "status": new_status,
-                            "last_message_at": datetime.utcnow().isoformat()
-                        }).eq("id", chat_id).execute()
-
                         chat_status = new_status
+                        chat_update["status"] = new_status
                         was_reopened = True
+                    
+                    # [PROD FIX] Apply Auto-Recovery Status if changed above
+                    if chat_status != active_chat["status"]:
+                        chat_update["status"] = chat_status
+                        if chat_status == "open":
+                            chat_update["handled_by"] = "ai"
+                            if not current_assigned_id:
+                                chat_update["assigned_agent_id"] = None
+                    
+                    # [PROD FIX] Increment Unread Count
+                    current_unread = active_chat.get("unread_count", 0) or 0
+                    chat_update["unread_count"] = current_unread + 1
 
+                    # Execute Consolidated Chat Update
+                    self.supabase.table("chats").update(chat_update).eq("id", chat_id).execute()
+
+                    # Insert Message
                     message_data = {
                         "chat_id": chat_id,
                         "sender_type": "customer",
@@ -431,7 +455,6 @@ class MessageRouterService:
                     if message_response.data:
                         message_id = message_response.data[0]["id"]
                         logger.info(f"✅ Message added to chat: {message_id}")
-                        self.supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
 
             else:
                 # CREATE NEW CHAT
@@ -503,7 +526,7 @@ class MessageRouterService:
         except Exception as e:
             logger.error(f"❌ Error routing message: {e}")
             raise
-        
+            
     def _extract_name_from_contact(self, contact: str, channel: str) -> str:
         """
         Extract a display name from contact information.

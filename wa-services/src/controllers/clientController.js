@@ -76,56 +76,100 @@ const sendMessage = async (req, res) => {
     const { chatId, content, contentType, options } = req.body;
     const client = sessions.get(req.params.sessionId);
 
-    // [DEBUG] Log incoming request to verify Python sent mentions
+    // 1. Initialize mutable content and clone options
+    let contentToSend = content;
+    let sendOptions = options ? { ...options } : {};
+
     console.log(`📤 [API] sendMessage to ${chatId}`);
-    if (options && options.mentions) {
+
+    // 2. Process Mentions & Resolve LIDs
+    if (
+      sendOptions.mentions &&
+      Array.isArray(sendOptions.mentions) &&
+      sendOptions.mentions.length > 0
+    ) {
       console.log(
-        `   🔎 Raw Mentions received:`,
-        JSON.stringify(options.mentions)
+        `   🔎 Processing ${sendOptions.mentions.length} mentions...`
+      );
+      const resolvedMentions = [];
+
+      for (let m of sendOptions.mentions) {
+        let finalId = m;
+        if (typeof m === "string") {
+          // Ensure suffix
+          finalId = m.includes("@") ? m : `${m}@c.us`;
+
+          // Handle LID Mapping (@lid -> @c.us)
+          if (finalId.includes("@lid")) {
+            try {
+              const contact = await client.getContactById(finalId);
+              if (contact && contact.number) {
+                const phoneId = `${contact.number}@c.us`;
+                console.log(`   🔄 Mapped LID ${finalId} -> ${phoneId}`);
+
+                // Update Content Body: Replace @LID with @Phone
+                if (typeof contentToSend === "string") {
+                  const lidUser = finalId.split("@")[0];
+                  const phoneUser = contact.number;
+                  // Regex replace to ensure all occurrences are caught
+                  const regex = new RegExp(lidUser, "g");
+                  if (regex.test(contentToSend)) {
+                    contentToSend = contentToSend.replace(regex, phoneUser);
+                    console.log(
+                      `   📝 Replaced @${lidUser} with @${phoneUser} in text`
+                    );
+                  }
+                }
+                finalId = phoneId;
+              }
+            } catch (e) {
+              console.error(
+                `   ⚠️ Failed to resolve LID ${finalId}:`,
+                e.message
+              );
+            }
+          }
+        }
+        resolvedMentions.push(finalId);
+      }
+      sendOptions.mentions = resolvedMentions;
+      console.log(
+        `   ✅ Mentions ready:`,
+        JSON.stringify(sendOptions.mentions)
       );
     }
 
-    if (
-      options &&
-      Array.isArray(options.mentions) &&
-      options.mentions.length > 0
-    ) {
-      // console.log(`   🔎 Converting ${options.mentions.length} mentions to Objects...`);
-      const mappedMentions = await Promise.all(
-        options.mentions.map(async (m) => {
-          if (typeof m === "string") {
-            try {
-              // Ensure ID has suffix (e.g. @c.us)
-              const contactId = m.includes("@") ? m : `${m}@c.us`;
-              // Fetch the real Contact Object from WWebJS
-              return await client.getContactById(contactId);
-            } catch (e) {
-              console.error(`   ⚠️ Mention lookup failed for ${m}:`, e.message);
-              return m; // Fallback (might not highlight, but won't crash)
-            }
-          }
-          return m;
-        })
+    if (contentType === "string") {
+      console.log(
+        `   🚀 Sending Final Content: ${JSON.stringify(contentToSend).substring(
+          0,
+          100
+        )}...`
       );
-      options.mentions = mappedMentions;
     }
 
     let messageOut;
     switch (contentType) {
       case "string":
-        if (options?.media) {
-          const media = options.media;
+        if (sendOptions?.media) {
+          const media = sendOptions.media;
           media.filename = null;
           media.filesize = null;
-          options.media = new MessageMedia(
+          sendOptions.media = new MessageMedia(
             media.mimetype,
             media.data,
             media.filename,
             media.filesize
           );
         }
-        messageOut = await client.sendMessage(chatId, content, options);
+        // [CRITICAL] Use contentToSend and sendOptions
+        messageOut = await client.sendMessage(
+          chatId,
+          contentToSend,
+          sendOptions
+        );
         break;
+
       case "MessageMediaFromURL": {
         const messageMediaFromURL = await MessageMedia.fromUrl(content, {
           unsafeMime: true,
@@ -133,7 +177,7 @@ const sendMessage = async (req, res) => {
         messageOut = await client.sendMessage(
           chatId,
           messageMediaFromURL,
-          options
+          sendOptions
         );
         break;
       }
@@ -144,7 +188,11 @@ const sendMessage = async (req, res) => {
           content.filename,
           content.filesize
         );
-        messageOut = await client.sendMessage(chatId, messageMedia, options);
+        messageOut = await client.sendMessage(
+          chatId,
+          messageMedia,
+          sendOptions
+        );
         break;
       }
       case "Location": {
@@ -153,7 +201,7 @@ const sendMessage = async (req, res) => {
           content.longitude,
           content.description
         );
-        messageOut = await client.sendMessage(chatId, location, options);
+        messageOut = await client.sendMessage(chatId, location, sendOptions);
         break;
       }
       case "Buttons": {
@@ -163,7 +211,7 @@ const sendMessage = async (req, res) => {
           content.title,
           content.footer
         );
-        messageOut = await client.sendMessage(chatId, buttons, options);
+        messageOut = await client.sendMessage(chatId, buttons, sendOptions);
         break;
       }
       case "List": {
@@ -174,7 +222,7 @@ const sendMessage = async (req, res) => {
           content.title,
           content.footer
         );
-        messageOut = await client.sendMessage(chatId, list, options);
+        messageOut = await client.sendMessage(chatId, list, sendOptions);
         break;
       }
       case "Contact": {
@@ -182,7 +230,7 @@ const sendMessage = async (req, res) => {
           ? content.contactId
           : `${content.contactId}@c.us`;
         const contact = await client.getContactById(contactId);
-        messageOut = await client.sendMessage(chatId, contact, options);
+        messageOut = await client.sendMessage(chatId, contact, sendOptions);
         break;
       }
       case "Poll": {
@@ -191,15 +239,11 @@ const sendMessage = async (req, res) => {
           content.pollOptions,
           content.options
         );
-        messageOut = await client.sendMessage(chatId, poll, options);
+        messageOut = await client.sendMessage(chatId, poll, sendOptions);
         break;
       }
       default:
-        return sendErrorResponse(
-          res,
-          404,
-          "contentType invalid, must be string, MessageMedia, MessageMediaFromURL, Location, Buttons, List, Contact or Poll"
-        );
+        return sendErrorResponse(res, 404, "contentType invalid");
     }
 
     res.json({ success: true, message: messageOut });

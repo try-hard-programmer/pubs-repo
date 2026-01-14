@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class LLMQueueService:
     def __init__(self):
         # CONFIG: How long to wait for "silence" before replying (Debounce)
-        self.debounce_window = 10.0 
+        self.debounce_window = 5.0 
         self.redis = get_redis()
         self.is_running = True # Flag to control supervisor loop
 

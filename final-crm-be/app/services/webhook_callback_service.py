@@ -122,7 +122,7 @@ class WebhookCallbackService:
             return {"success": False, "reason": "error", "error": str(e)}          
 
     async def send_whatsapp_callback(self, chat: Dict[str, Any], message_content: str, supabase) -> Dict[str, Any]:
-        """Send webhook callback to WhatsApp service."""
+        """Send webhook callback to WhatsApp service with Group Mention Support."""
         try:
             logger.info(f"📱 Sending WhatsApp message for chat: {chat['id']}")
             
@@ -140,9 +140,42 @@ class WebhookCallbackService:
 
             sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
             
-            payload = {"chatId": chat_id, "contentType": "string", "content": message_content}
+            # Base Payload
+            payload = {
+                "chatId": chat_id, 
+                "contentType": "string", 
+                "content": message_content
+            }
+
+            # [FIX] GROUP MENTION LOGIC
+            if "@g.us" in chat_id:
+                try:
+                    # Fetch the very last incoming message from the CUSTOMER in this chat
+                    last_msg = supabase.table("messages") \
+                        .select("metadata") \
+                        .eq("chat_id", chat["id"]) \
+                        .eq("sender_type", "customer") \
+                        .order("created_at", desc=True) \
+                        .limit(1) \
+                        .execute()
+
+                    if last_msg.data:
+                        meta = last_msg.data[0].get("metadata", {})
+                        participant = meta.get("group_participant") or meta.get("original_sender_id")
+                        
+                        if participant:
+                            # [CRITICAL FIX] Prepend "@User" to the text.
+                            # WhatsApp needs the text to contain the tag to highlight it.
+                            user_tag = participant.split('@')[0]
+                            payload["content"] = f"@{user_tag} {message_content}"
+                            
+                            # Add to payload options
+                            payload["options"] = { "mentions": [participant] }
+                            logger.info(f"🏷️  Auto-Mentioning Participant: {participant}")
+                except Exception as ex:
+                    logger.warning(f"⚠️ Failed to resolve mention for group: {ex}")
+
             base_url = settings.WHATSAPP_API_URL
-            
             if not base_url: return {"success": False, "reason": "api_url_not_configured"}
 
             endpoint_url = f"{base_url.rstrip('/')}/client/sendMessage/{sender_agent_id}"
@@ -162,7 +195,7 @@ class WebhookCallbackService:
         except Exception as e:
             logger.error(f"❌ WhatsApp message send failed: {e}")
             return {"success": False, "reason": "error", "error": str(e)}
-    
+        
     # [CRITICAL FIX] Added media_url argument
     async def send_telegram_callback(self, chat: Dict[str, Any], message_content: str, supabase, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:
