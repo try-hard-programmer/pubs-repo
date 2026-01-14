@@ -365,58 +365,74 @@ const initializeEvents = (client, sessionId) => {
 
   checkIfEventisEnabled("message").then((_) => {
     client.on("message", async (message) => {
+      // [PROPER LOG] Standardized Incoming Message Log
+      const timestamp = new Date().toISOString().split("T")[1].split(".")[0];
+      const sender = message.author || message.from;
+      const snippet = message.body
+        ? message.body.substring(0, 50).replace(/\n/g, " ")
+        : "[Media/Empty]";
+      console.log(`📥 [${timestamp}] [MSG] ${sender} > ${snippet}...`);
+
       if (isDuplicateMessage(message.id.id)) {
-        console.log(`Skipping duplicate message: ${message.id.id}`);
-        return;
+        return; // Silent
       }
+
+      // [LOGIC] Construct Identity Info (Silent)
+      const meInfo = {
+        wid: client.info?.wid?._serialized,
+        lid:
+          client.info?.wid?.lid?._serialized ||
+          client.info?.me?.lid?._serialized,
+        pushname: client.info?.pushname,
+      };
 
       // Check if it's a media message that fits our size limit
       const isMedia =
         message.hasMedia && message._data?.size < maxAttachmentSize;
 
       if (isMedia) {
-        // CASE 1: It is Media. WAIT for the download.
         checkIfEventisEnabled("media")
           .then(async (_) => {
             try {
-              // console.log(`⏳ Downloading media for ${message.id.id}...`);
-
-              // Create a race: Download vs 15s Timeout
               const downloadPromise = message.downloadMedia();
               const timeoutPromise = new Promise((_, reject) =>
                 setTimeout(() => reject(new Error("Download timeout")), 15000)
               );
-
               const messageMedia = await Promise.race([
                 downloadPromise,
                 timeoutPromise,
               ]);
 
               if (messageMedia && messageMedia.data) {
-                // ✅ Success: Send ONE webhook with type 'media' (includes Base64)
                 triggerWebhook(sessionWebhook, sessionId, "media", {
                   messageMedia,
                   message,
+                  me: meInfo, // <--- INJECTED
                 });
               } else {
                 throw new Error("Empty media object returned");
               }
             } catch (e) {
               console.error(
-                `⚠️ Media download failed/timeout (${e.message}). Sending as text fallback.`
+                `⚠️ Media failed: ${e.message}. Sending text fallback.`
               );
-
-              // ⚠️ Fallback: Send as 'message' (Text/Metadata only) so we don't lose the event
-              triggerWebhook(sessionWebhook, sessionId, "message", { message });
+              triggerWebhook(sessionWebhook, sessionId, "message", {
+                message,
+                me: meInfo,
+              });
             }
           })
           .catch(() => {
-            // If 'media' event is disabled in config, just send as text
-            triggerWebhook(sessionWebhook, sessionId, "message", { message });
+            triggerWebhook(sessionWebhook, sessionId, "message", {
+              message,
+              me: meInfo,
+            });
           });
       } else {
-        // CASE 2: Text Message (or too large). Send immediately.
-        triggerWebhook(sessionWebhook, sessionId, "message", { message });
+        triggerWebhook(sessionWebhook, sessionId, "message", {
+          message,
+          me: meInfo,
+        });
       }
 
       if (setMessagesAsSeen) {
