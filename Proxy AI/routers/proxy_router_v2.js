@@ -299,26 +299,37 @@ async function handleGemini(messages, files = [], temperature = 0.7) {
     });
   }
 
-  const response = await axios.post(
-    `${config.baseUrl}/models/${model}:generateContent?key=${apiKey}`,
-    {
-      contents,
-      generationConfig: { temperature, maxOutputTokens: config.maxTokens },
-    },
-    { headers: { "Content-Type": "application/json" }, timeout: 180000 }
-  );
-
-  return {
-    choices: [
+  try {
+    const response = await axios.post(
+      `${config.baseUrl}/models/${model}:generateContent?key=${apiKey}`,
       {
-        message: {
-          role: "assistant",
-          content: response.data.candidates[0].content.parts[0].text,
-        },
+        contents,
+        generationConfig: { temperature, maxOutputTokens: config.maxTokens },
       },
-    ],
-    usage: { prompt_tokens: 0, completion_tokens: 0 },
-  };
+      { headers: { "Content-Type": "application/json" }, timeout: 180000 }
+    );
+
+    // [FIX] Safety Check to prevent Crash
+    const candidate = response.data.candidates?.[0];
+    const text =
+      candidate?.content?.parts?.[0]?.text ||
+      "⚠️ I cannot answer this due to safety filters.";
+
+    return {
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: text,
+          },
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0 },
+    };
+  } catch (error) {
+    console.error("Gemini API Error:", error.response?.data || error.message);
+    throw error; // Let the main handler switch to fallback (OpenAI)
+  }
 }
 
 async function handleRunPod(messages, files = [], temperature = 0.7) {

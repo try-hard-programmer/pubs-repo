@@ -569,9 +569,10 @@ async def invite_user(
         logger.info(f"[{request_id}] 📧 Calling Supabase Admin Invite...")
         
         try:
-            base_url = settings.INVITATION_URL,
+            # [FIXED] Removed the trailing comma. This is now a String, not a Tuple.
+            base_url = settings.INVITATION_URL
             
-            # [FIXED]: Redirect to 'accept-invitation' with the DB token
+            # Redirect to 'accept-invitation' with the DB token
             redirect_url = f"{base_url}/accept-invitation?token={token}"
             
             client.auth.admin.invite_user_by_email(

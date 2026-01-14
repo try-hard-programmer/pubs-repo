@@ -299,33 +299,25 @@ class MessageRouterService:
         customer_metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        [FIXED] Entry point with Redis Spin-Lock.
-        This wrapper ensures we get a lock before running the heavy logic.
+        [FIXED] Routes message with Blocking Lock.
+        Prevents duplicate customers/chats by forcing sequential processing for the same contact.
         """
         organization_id = agent["organization_id"]
         
-        # LOCK KEY: Unique to the Organization + Contact (e.g. Phone Number)
+        # LOCK KEY: Unique to the Organization + Contact
         lock_key = f"router:{organization_id}:{contact}"
         
-        # SPIN LOCK: Try up to 5 times (2.5 seconds max wait)
-        for attempt in range(5):
-            async with acquire_lock(lock_key, expire=5) as acquired:
-                if acquired:
-                    # ✅ LOCK ACQUIRED: Run the original logic (The Worker)
-                    return await self._execute_routing_logic(
-                        agent, channel, contact, message_content, 
-                        customer_name, message_metadata, customer_metadata
-                    )
-            
-            # ⏳ Lock busy? Wait 0.5s and try again (Spinning)
-            await asyncio.sleep(0.5)
-        
-        # ⚠️ TIMEOUT: If we failed 5 times, we just proceed UNSAFE
-        logger.warning(f"⚠️ Router Lock Timeout for {contact}. Proceeding unsafely.")
-        return await self._execute_routing_logic(
-            agent, channel, contact, message_content, 
-            customer_name, message_metadata, customer_metadata
-        )
+        # Wait up to 5 seconds for the lock. 
+        async with acquire_lock(lock_key, expire=20, wait_time=5) as acquired:
+            if not acquired:
+                logger.warning(f"🔒 Router Lock Timeout for {contact}. Rejecting request to prevent duplicate.")
+                raise Exception("System busy processing previous message for this user. Please retry.")
+
+            # ✅ LOCK ACQUIRED: Run logic safely. 
+            return await self._execute_routing_logic(
+                agent, channel, contact, message_content, 
+                customer_name, message_metadata, customer_metadata
+            )
     async def _execute_routing_logic(self, agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata):
         """
         Internal method containing 100% of your original routing logic.

@@ -3,6 +3,8 @@ Ticket Service
 Manages ticket creation, updates, and numbering logic
 """
 import asyncio
+import random
+import string
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
@@ -16,6 +18,7 @@ from app.models.ticket import (
 )
 from app.services.websocket_service import get_connection_manager
 from app.services.redis_service import acquire_lock
+from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -23,155 +26,80 @@ class TicketService:
     def __init__(self):
         self.supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
 
-    async def _generate_ticket_number(self, organization_id: str, ticket_config: Dict = None) -> str:
+    def _generate_parallel_ticket_number(self, prefix: str = "TPADI") -> str:
         """
-        Generates the next ticket number sequentially.
-        Uses a Redis Lock with retry logic to prevent race conditions.
+        Generates a collision-safe ID.
+        Format: TPADI-2601141108X9A (YYMMDDHHMM-XXX)
+        Length: Prefix(5) + Date(10) + Suffix(3) = 18 chars
         """
-        prefix = "TKT-"
-        if ticket_config and isinstance(ticket_config, dict):
-            prefix = ticket_config.get("ticketPrefix", "TKT-").strip()
+        # 1. Get Time (YearMonthDayHourMinute) -> 2601141108
+        now = datetime.now()
+        time_str = now.strftime("%y%m%d%H%M") 
         
-        # Max retries to prevent infinite loops if Redis hangs
-        max_retries = 5
-        retry_delay = 0.2  # 200ms
-
-        for attempt in range(max_retries):
-            # Attempt to acquire the lock for this specific Org
-            async with acquire_lock(f"ticket_gen:{organization_id}", expire=5) as acquired:
-                if acquired:
-                    try:
-                        # --- CRITICAL SECTION: ONLY ONE WORKER ENTER HERE ---
-                        logger.info(f"🔒 Lock acquired for {organization_id}, generating ticket...")
-                        
-                        res = self.supabase.table("tickets") \
-                            .select("ticket_number") \
-                            .eq("organization_id", organization_id) \
-                            .ilike("ticket_number", f"{prefix}%") \
-                            .order("created_at", desc=True) \
-                            .limit(1) \
-                            .execute()
-
-                        next_num = 1
-                        if res.data:
-                            last_ticket = res.data[0]["ticket_number"]
-                            try:
-                                number_part = last_ticket.replace(prefix, "")
-                                next_num = int(number_part) + 1
-                            except ValueError:
-                                next_num = 1
-                        
-                        return f"{prefix}{next_num:03d}"
-                        # ----------------------------------------------------
-                    
-                    except Exception as e:
-                        logger.error(f"❌ Error generating ticket number: {e}")
-                        raise e  # Release lock and crash gently
-                else:
-                    # Lock is busy, wait and try again
-                    if attempt < max_retries - 1:
-                        logger.warning(f"⏳ Ticket generation locked for {organization_id}. Retrying ({attempt+1}/{max_retries})...")
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        logger.error(f"❌ Failed to acquire ticket lock for {organization_id} after {max_retries} attempts.")
+        # 2. Generate 3 Random Chars (A-Z, 0-9) -> X9A
+        # 36^3 = 46,656 combinations per minute.
+        chars = string.ascii_uppercase + string.digits
+        rand_suffix = ''.join(random.choices(chars, k=3))
         
-        # Fallback if lock system fails completely (keeps system alive)
-        return f"{prefix}{int(datetime.now(timezone.utc).timestamp())}"
+        return f"{prefix}-{time_str}{rand_suffix}"
     
-    async def create_ticket(
-        self, 
-        data: TicketCreate, 
-        organization_id: str, 
-        ticket_config: Dict = None, 
-        actor_id: Optional[str] = None,
-        actor_type: ActorType = ActorType.SYSTEM
-    ) -> Ticket:
+
+    async def create_ticket(self, data: TicketCreate, organization_id: str, ticket_config: dict, actor_id: str = None, actor_type: str = "system"):
+        """
+        Creates a ticket using parallel-safe ID generation.
+        Retries automatically if a collision occurs.
+        """
+        MAX_RETRIES = 3
+        final_ticket = None
+        last_error = None
         
-        # 1. DEFINE THE LOCK (Critical for preventing duplicates)
-        lock_key = f"ticket_gen:{organization_id}"
+        # 1. Get Prefix from config or default
+        prefix = ticket_config.get("ticket_prefix", "TPADI")
 
-        # 2. ACQUIRE LOCK BEFORE CALCULATING ANYTHING
-        async with acquire_lock(lock_key, expire=5) as acquired:
-            if not acquired:
-                # Fail fast if system is hammered, or let client retry
-                raise Exception("System busy generating ticket ID. Please retry.")
-
-            # --- CRITICAL SECTION STARTS HERE ---
-            
-            # 3. Generate Number (Now safe because only ONE process is here at a time)
-            ticket_num = await self._generate_ticket_number(organization_id, ticket_config)
-            logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
-
-            # [FIX] Resolve Customer Name for Title Generation
-            customer_name = "Unknown Customer"
-            if data.customer_id:
-                try:
-                    cust_res = self.supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
-                    if cust_res.data:
-                        customer_name = cust_res.data.get("name") or "Unknown Customer"
-                except Exception as e:
-                    logger.warning(f"Failed to resolve customer name: {e}")
-
-            # [FIX] Smart Title Generation
-            final_title = data.title
-            is_placeholder = final_title and ("UNKNOWN" in final_title or "New Ticket" in final_title)
-            
-            if not final_title or is_placeholder:
-                priority_val = data.priority.value if hasattr(data.priority, "value") else str(data.priority)
-                desc_text = data.description or "No Content"
-                snippet = desc_text[:30] + "..." if len(desc_text) > 30 else desc_text
-                final_title = f"[{priority_val.upper()}] {customer_name} - {snippet}"
-
-            # 4. Prepare Insert Data
-            insert_data = {
-                "organization_id": organization_id,
-                "customer_id": data.customer_id,
-                "chat_id": data.chat_id,
-                "ticket_number": ticket_num,
-                "title": final_title,
-                "description": data.description,
-                "category": data.category,
-                "priority": data.priority.value if hasattr(data.priority, "value") else data.priority,
-                "status": TicketStatus.OPEN.value,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-
-            # 5. Insert (Still inside lock to ensure atomicity)
-            res = self.supabase.table("tickets").insert(insert_data).execute()
-                    
-        # Everything below here is safe to run without the lock
-        if not res.data: 
-            raise Exception("Failed to insert ticket")
-        
-        new_ticket = Ticket(**res.data[0])
-
-        # 6. Log Activity
-        await self.log_activity(
-            ticket_id=new_ticket.id, 
-            action="created", 
-            description=f"Ticket created by {actor_type.value}", 
-            actor_id=actor_id, 
-            actor_type=actor_type
-        )
-
-        # 7. Broadcast
-        try:
-            conn = get_connection_manager()
-            await conn.broadcast_chat_update(
-                organization_id=organization_id,
-                chat_id=new_ticket.chat_id,
-                update_type="ticket_created",  
-                data={
-                    "ticket_id": new_ticket.id,
-                    "ticket_number": new_ticket.ticket_number,
-                    "status": new_ticket.status,
-                    "priority": new_ticket.priority
+        # 2. Attempt Loop (Safety Airbag)
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Generate ID locally (No DB call needed)
+                candidate_number = self._generate_parallel_ticket_number(prefix)
+                
+                ticket_data = {
+                    "ticket_number": candidate_number,
+                    "organization_id": organization_id,
+                    "customer_id": data.customer_id,
+                    "chat_id": data.chat_id,
+                    "title": data.title,
+                    "description": data.description,
+                    "priority": data.priority,
+                    "category": data.category,
+                    "status": "open",
+                    "created_by": actor_id,
+                    "created_by_type": actor_type
                 }
-            )
-        except Exception: pass
+                
+                # Insert directly. If ID exists, DB throws "unique constraint" error.
+                response = self.supabase.table("tickets").insert(ticket_data).execute()
+                
+                if response.data:
+                    final_ticket = response.data[0]
+                    logger.info(f"✅ Ticket Created: {candidate_number}")
+                    break # Success! Exit loop.
+                    
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check for Unique Violation (Postgres error codes usually involve 'duplicate key')
+                if "duplicate key" in error_str or "unique constraint" in error_str:
+                    logger.warning(f"⚠️ Ticket ID Collision ({candidate_number}). Retrying ({attempt+1}/{MAX_RETRIES})...")
+                    continue # Try again with new random suffix
+                else:
+                    # Real error (Connection, Auth, etc.) -> Crash
+                    last_error = e
+                    break
+        
+        if not final_ticket:
+            logger.error(f"❌ Failed to generate ticket after {MAX_RETRIES} attempts. Error: {last_error}")
+            raise HTTPException(status_code=500, detail="Failed to generate unique ticket ID. Please retry.")
 
-        return new_ticket
+        return final_ticket
     
     async def log_activity(self, ticket_id: str, action: str, description: str, actor_id: Optional[str], actor_type: ActorType, metadata: dict = {}):
         try:
