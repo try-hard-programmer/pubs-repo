@@ -5,7 +5,6 @@ from src.database import db
 from src.services.webhook_sender import forward_to_main_service
 
 logger = logging.getLogger(__name__)
-
 async def handle_incoming_message(message_data: dict) -> None:
     """
     1. Save to SQLite (Local History)
@@ -13,7 +12,7 @@ async def handle_incoming_message(message_data: dict) -> None:
     3. Forward to Main AI Service
     """
     try:
-        # --- 1. Save to Local DB (Keep using the simple format here) ---
+        # --- 1. Save to Local DB ---
         await db.get_or_create_conversation(
             telegram_account_id=message_data["account_id"],
             chat_id=message_data["chat_id"],
@@ -30,31 +29,37 @@ async def handle_incoming_message(message_data: dict) -> None:
             status="received"
         )
         
-        
         # --- 2. Prepare Payload (The "Translation" Step) ---
-        # We convert the Telegram data into the structure your Boss provided
         
+        # [FIX] Determine Author vs Chat
+        # If message_data has a specific 'sender_id', use it as author.
+        # Otherwise, fall back to 'chat_id' (typical for DMs).
+        chat_id = str(message_data["chat_id"])
+        sender_id = str(message_data.get("sender_id", chat_id))
+
         payload = {
             "dataType": "message",
-            # The 'sessionId' is your Agent/Account ID
             "sessionId": message_data["account_id"], 
             "data": {
                 "message": {
                     "_data": {
-                        # 'body' is the message text
                         "body": message_data["text"],
-                        # 'from' is the sender's ID (Telegram User ID)
-                        "from": str(message_data["chat_id"]),
-                        # 'notifyName' is the sender's display name
+                        
+                        # [FIX] 'from' is the Chat/Group ID (The "Customer" entity)
+                        "from": chat_id,
+                        
+                        # [FIX] 'author' is the specific User ID (Who said it)
+                        "author": sender_id,
+                        
                         "notifyName": message_data.get("sender_name", "Unknown"),
                         "type": "chat",
-                        "t": int(time.time()),  # Current timestamp
+                        "t": int(time.time()),
                         "id": {
                             "fromMe": False,
                             "id": str(message_data["message_id"]),
-                            "remote": str(message_data["chat_id"])
+                            "remote": chat_id
                         },
-                        "phone":str(message_data["customer_data"]["phone"])
+                        "phone": str(message_data.get("customer_data", {}).get("phone", ""))
                     }
                 }
             }
@@ -65,3 +70,5 @@ async def handle_incoming_message(message_data: dict) -> None:
 
     except Exception as e:
         logger.error(f"Error handling incoming message: {e}", exc_info=True)
+
+        

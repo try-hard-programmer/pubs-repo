@@ -39,9 +39,20 @@ async def start_listening(client: TelegramClient, agent_id: str):
     @client.on(events.NewMessage(incoming=True))
     async def handler(event):
         try:
+            # --- 1. GROUP FILTER: Ignore if group and NOT mentioned ---
+            # event.is_group checks if it's a Chat or Channel
+            # event.mentioned checks if the authenticated user (bot) was tagged
+            if event.is_group and not event.message.mentioned:
+                return
+
             # 2. EXTRACT DATA
             sender = await event.get_sender()
             sender_id = str(sender.id)
+            
+            # [FIX] Routing ID: Use Chat ID (Group ID) if group, else Sender ID
+            # In Telethon, event.chat_id is the Group ID for groups, and User ID for DMs.
+            # This ensures the CRM creates the "Customer" as the Group, not the individual.
+            routing_id = str(event.chat_id)
             
             # Name Extraction
             first = getattr(sender, 'first_name', '') or ''
@@ -51,7 +62,7 @@ async def start_listening(client: TelegramClient, agent_id: str):
             # 3. PREPARE PAYLOAD (Text vs Media)
             if event.message.media:
                 # --- MEDIA HANDLING ---
-                logger.info(f"📥 Downloading media from {sender_id}...")
+                logger.info(f"📥 Downloading media from {sender_id} (Chat: {routing_id})...")
                 
                 # Download to memory (bytes)
                 media_bytes = await event.message.download_media(file=bytes)
@@ -76,8 +87,9 @@ async def start_listening(client: TelegramClient, agent_id: str):
                         },
                         "message": { 
                             "_data": { # Helper for routing
-                                "from": sender_id, 
+                                "from": routing_id,  # <--- [FIX] Used routing_id (Chat ID)
                                 "to": agent_id,
+                                "author": sender_id, # <--- [FIX] Added original sender for reference
                                 "id": { "id": str(event.message.id) }
                             }
                         }
@@ -93,13 +105,14 @@ async def start_listening(client: TelegramClient, agent_id: str):
                             "_data": {
                                 "body": event.message.message,
                                 "type": "chat", 
-                                "from": sender_id, 
+                                "from": routing_id, # <--- [FIX] Used routing_id (Chat ID)
                                 "to": agent_id,
+                                "author": sender_id, # <--- [FIX] Added original sender for reference
                                 "notifyName": notify_name,
                                 "id": {
                                     "fromMe": False,
                                     "id": str(event.message.id),
-                                    "_serialized": f"{event.message.id}_{sender_id}"
+                                    "_serialized": f"{event.message.id}_{routing_id}"
                                 },
                                 "t": int(event.date.timestamp())
                             }
@@ -117,7 +130,7 @@ async def start_listening(client: TelegramClient, agent_id: str):
                 response = await http.post(TARGET_URL, json=payload, headers=headers)
                 
                 if response.status_code == 200:
-                    logger.info(f"✅ Forwarded msg {event.message.id} from {sender_id}")
+                    logger.info(f"✅ Forwarded msg {event.message.id} from {routing_id}")
                 else:
                     logger.error(f"❌ Forward failed ({response.status_code}): {response.text}")
 
