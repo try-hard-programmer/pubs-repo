@@ -54,7 +54,7 @@ const API_CONFIGS = {
     baseUrl: "https://api.openai.com/v1",
     chatModel: "gpt-4o-mini",
     visionModel: "gpt-4o-mini",
-    embeddingModel: "text-embedding-3-small",
+    embeddingModel: "text-embedding-3-large",
     maxTokens: 4096,
     supportsVision: true,
   },

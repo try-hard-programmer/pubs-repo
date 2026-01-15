@@ -135,51 +135,78 @@ class CRMChromaServiceV2:
             return False
 
     async def query_context(self, query: str, agent_id: str, n_results: int = 5) -> str:
+        """
+        Query relevant documents from ChromaDB with exact code/number matching.
+        Generic implementation for any domain.
+        """
         try:
-            collection = self.get_or_create_collection(agent_id)
+            import re
             
-            # 1. Ask Chroma for Distances (Scores)
+            def extract_codes(text: str) -> list:
+                """
+                Extract codes BEFORE normalizing entire text.
+                Matches patterns like: RC 503, RC-503, ERR_404, A123, 503
+                """
+                # Pattern: optional letters + optional separator + digits + optional alphanumeric
+                pattern = r'\b([A-Za-z]{0,10}[-_\s]?\d+[A-Za-z0-9]*)\b'
+                raw_codes = re.findall(pattern, text)
+                # Normalize each code individually (remove spaces/dashes, uppercase)
+                return [re.sub(r'[-_\s]', '', c).upper() for c in raw_codes]
+            
+            # Extract codes from original query (not normalized)
+            query_codes = extract_codes(query)
+            
+            if query_codes:
+                logger.info(f"🔢 Detected codes in query: {query_codes}")
+            
+            collection = self.get_or_create_collection(agent_id)
             results = collection.query(
                 query_texts=[query], 
                 n_results=n_results,
-                include=['documents', 'distances'] # <--- REQUIRED to see scores
+                include=['documents', 'distances']
             )
 
             if not results["documents"] or not results["documents"][0]: 
                 return ""
 
             valid_documents = []
-            
-            # 2. FILTERING LOGIC
-            # Distance 0 = Exact Match. 
-            # Distance > 1.2 usually means "Not relevant".
-            # Adjust this threshold based on your needs (1.0 to 1.5).
-            THRESHOLD = 1.2 
+            THRESHOLD = 1.2
 
             logger.info(f"🔎 RAG Query: '{query}'")
-            
+
             if results['distances']:
                 for i, distance in enumerate(results['distances'][0]):
-                    doc_preview = results['documents'][0][i][:50].replace('\n', ' ')
+                    doc = results['documents'][0][i]
+                    doc_preview = doc[:50].replace('\n', ' ')
                     
+                    # Exact code matching (only if query contains codes)
+                    if query_codes:
+                        doc_codes = extract_codes(doc)
+                        
+                        # Check if ANY query code exists EXACTLY in doc
+                        has_match = any(qc in doc_codes for qc in query_codes)
+                        
+                        if not has_match:
+                            logger.info(f"   🗑️ DROP (No exact code match): Query={query_codes}, Doc={doc_codes[:5]}")
+                            continue
+                    
+                    # Distance threshold check
                     if distance < THRESHOLD:
-                        # ✅ Good Match
-                        valid_documents.append(results['documents'][0][i])
+                        valid_documents.append(doc)
                         logger.info(f"   ✅ KEEP (Score: {distance:.4f}): {doc_preview}...")
                     else:
-                        # ❌ Bad Match - Discard it!
                         logger.info(f"   🗑️ DROP (Score: {distance:.4f}): {doc_preview}...")
 
             if not valid_documents:
-                logger.warning(f"⚠️ No relevant documents found (All scores > {THRESHOLD})")
-                return "" # Return empty string so AI knows it has no context
+                logger.warning(f"⚠️ No relevant documents found")
+                return ""
 
             return "\n\n###\n\n".join(valid_documents)
 
         except Exception as e:
             logger.error(f"⚠️ Query failed: {e}")
             return ""
-
+        
     def delete_document(self, agent_id: str, file_id: str):
         """
         [FIX] Smart Delete:

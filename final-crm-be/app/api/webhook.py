@@ -527,7 +527,7 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         
         # [FIX] Clean "Group g.us" - Use Sender Name if Subject is Bad
         if not group_subject or "@g.us" in str(group_subject):
-            group_subject = f"Group: {real_sender_name}"
+            group_subject = f"{real_sender_name}"
             
         final_customer_name = group_subject
     else:
@@ -630,18 +630,18 @@ async def process_webhook_message_v2(
 
     # 2. UPDATE CUSTOMER DATA (Phone & Metadata)
     is_group = message_metadata.get("is_group", False)
-    
-    # [FIX] Always try to update metadata (To save the resolved 'real_number')
+
     if cust_id and customer_metadata:
         try:
-            # We fetch the current metadata first to merge, or just overwrite specific fields
-            update_payload = {"metadata": customer_metadata}
+            cust_res = supabase.table("customers").select("metadata").eq("id", cust_id).single().execute()
+            current = {}
+            if cust_res.data:
+                raw = cust_res.data.get("metadata")
+                if raw:
+                    current = json.loads(raw) if isinstance(raw, str) else raw
             
-            # If it's a DM, we also update the main phone column
-            if not is_group and customer_metadata.get("phone"):
-                update_payload["phone"] = customer_metadata["phone"]
-                
-            supabase.table("customers").update(update_payload).eq("id", cust_id).execute()
+            merged = {**current, **customer_metadata}
+            supabase.table("customers").update({"metadata": merged}).eq("id", cust_id).execute()
         except Exception as e:
             logger.warning(f"⚠️ Failed to update customer metadata: {e}")
 
@@ -941,9 +941,9 @@ async def whatsapp_unofficial_webhook(
                 **standard_message.metadata
             },
             customer_metadata={
-                "whatsapp_name": meta.get("real_sender_name"), 
-                "is_group": is_group,
-                "real_number": final_participant_number
+                "whatsapp_name": meta.get("real_sender_name"),
+                "real_number": final_participant_number,
+                **({"is_group": True} if is_group else {})
             },
             supabase=supabase
         )

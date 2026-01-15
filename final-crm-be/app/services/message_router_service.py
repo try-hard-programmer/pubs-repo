@@ -129,7 +129,7 @@ class MessageRouterService:
                 "email": email_val,
                 "metadata": {
                     **(metadata or {}),
-                    "is_group": is_group, # Metadata distinguishes the type
+                    **({"is_group": True} if is_group else {}),
                     "first_contact_at": datetime.utcnow().isoformat(),
                     "first_contact_channel": channel,
                     "message_count": 0,

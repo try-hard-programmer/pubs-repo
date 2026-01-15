@@ -78,19 +78,23 @@ class DynamicCRMAgentV2:
                 )
 
             if custom_instructions:
-                system_prompt += f"OPERATIONAL INSTRUCTIONS:\n{custom_instructions}\n\n"
+                system_prompt += f"MUST FOLLOWING THIS INSTRUCTIONS:\n{custom_instructions}\n\n"
 
             system_prompt += (
                 f"STRICT KNOWLEDGE BOUNDARIES:\n"
                 f"1. You are a CLOSED-DOMAIN agent. NO outside knowledge allowed.\n"
                 f"2. You MUST answer using ONLY the 'CONTEXT' below.\n"
-                f"3. If the answer is NOT in the CONTEXT, politely refuse.\n\n"
+                f"3. If the CONTEXT is empty or does not contain the answer, say: 'Maaf, saya tidak memiliki informasi mengenai hal tersebut.'\n"
+                f"4. NEVER invent, assume, or guess information not in CONTEXT.\n\n"
                 f"CONTEXT (SOURCE OF TRUTH):\n"
-                f"###\n{rag_context}\n###\n\n"
+                f"###\n{rag_context if rag_context else '[NO RELEVANT INFORMATION FOUND]'}\n###\n\n"
                 f"FINAL GUIDELINES:\n"
                 f"- Address customer as '{name_user}'.\n"
+                f"- Always respond to the customer's LAST message only.\n"
+                f"- If the last message is an acknowledgment or thank you, respond briefly and ask if they need anything else.\n"
+                f"- Do NOT repeat previous answers.\n"
             )
-
+            
             # 4. BUILD MESSAGE CHAIN (TEXT ONLY - Images go in files array)
             messages = [{"role": "system", "content": system_prompt}]
             

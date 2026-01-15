@@ -178,10 +178,12 @@ async def send_message_via_channel(
                     )
                 else:
                     # [FIX] Text Sending with Mentions
+                    final_content = msg_meta.get("content_for_api") or message_content
+
                     res = await svc.send_text_message(
                         session_id=sender_id, 
-                        phone_number=final_target, 
-                        message=message_content,
+                        phone_number=final_target,   # ← The phone/group ID
+                        message=final_content,       # ← The message text
                         mentions=mentions_list # <--- Payload Passed Here
                     )
                 
@@ -1593,12 +1595,21 @@ async def create_message(
                             # 1. Add ID to metadata (CRITICAL for WhatsApp API)
                             msg_metadata["mentions"] = [target_id]
                             
-                            # 2. Prepend @Name to text (CRITICAL for Visuals)
-                            safe_label = str(display_name).replace("@", "").strip()
+                            # # 2. Prepend @Name to text (CRITICAL for Visuals)
+                            # safe_label = str(display_name).replace("@", "").strip()
                             
-                            if f"@{safe_label}" not in content:
-                                content = f"@{safe_label} {content}"
-                                logger.info(f"✅ Auto-mentioned: @{safe_label}")
+                            # if f"@{safe_label}" not in content:
+                            #     content = f"@{safe_label} {content}"
+                            #     logger.info(f"✅ Auto-mentioned: @{safe_label}")
+
+                            # 1. Add ID to metadata (for WhatsApp API)
+                            msg_metadata["mentions"] = [target_id]
+                            
+                            # 2. Build mention text for API only (NOT for DB)
+                            mention_tag = target_id.split('@')[0]
+                            msg_metadata["content_for_api"] = f"@{mention_tag} {content}"
+                            
+                            logger.info(f"✅ Auto-mention prepared for API: @{mention_tag}")
                                 
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to auto-mention in group: {e}")

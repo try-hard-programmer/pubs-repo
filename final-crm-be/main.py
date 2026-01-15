@@ -2,6 +2,9 @@
 File Manager API - Main Entry Point
 Clean, modular structure with multi-agent architecture
 """
+import logging 
+import os
+import asyncio 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -9,15 +12,10 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from starlette.middleware.base import BaseHTTPMiddleware
-import logging
-import os
-# Test Update docker build
 
 # Import configuration
 from app.config import settings
-
-#Import ML Guard for startup verification
-from app.utils.ml_guard import ml_guard
+from app.services.llm_queue_service import get_llm_queue
 
 # Import API routers
 from app.api import documents, agents, chat, organizations, file_manager, crm_agents, crm_chats, whatsapp, webhook, websocket as ws_router, telegram
@@ -66,15 +64,16 @@ async def lifespan(app: FastAPI):
     agent_service = get_agent_service()
     await agent_service.initialize_agents()
 
-    # [ADDED] Force Load NLP Model (to verify it works on startup)
-    logger.info("🧠 Verifying NLP Guard Model...")
-    ml_guard._load_model()
+    # [NEW] Start LLM Queue Worker
+    queue_service = get_llm_queue()
+    asyncio.create_task(queue_service.start_worker())
     
     logger.info("Application startup complete")
     yield
 
     # Shutdownbantu saya
     logger.info("Application shutdown")
+    queue_service.is_running = False
 
 
 # Create FastAPI application

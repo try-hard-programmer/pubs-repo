@@ -4,7 +4,7 @@ Sends webhook callbacks to external WhatsApp/Telegram/Email services
 """
 import logging
 import os
-
+import json
 import httpx
 import re
 from typing import Dict, Any, Optional
@@ -147,33 +147,40 @@ class WebhookCallbackService:
                 "content": message_content
             }
 
-            # [FIX] GROUP MENTION LOGIC
+            # [FIX] GROUP MENTION LOGIC - Use Customer Metadata
             if "@g.us" in chat_id:
                 try:
-                    # Fetch the very last incoming message from the CUSTOMER in this chat
-                    last_msg = supabase.table("messages") \
+                    # Get customer metadata (has real_number and is_group)
+                    cust_meta_res = supabase.table("customers") \
                         .select("metadata") \
-                        .eq("chat_id", chat["id"]) \
-                        .eq("sender_type", "customer") \
-                        .order("created_at", desc=True) \
-                        .limit(1) \
+                        .eq("id", customer_id) \
+                        .single() \
                         .execute()
+                    
+                    customer_id = chat.get("customer_id")
+                    if not customer_id: raise Exception("Missing customer_id")
 
-                    if last_msg.data:
-                        meta = last_msg.data[0].get("metadata", {})
-                        participant = meta.get("group_participant") or meta.get("original_sender_id")
+                    
+                    if cust_meta_res.data:
+                        cust_meta = cust_meta_res.data.get("metadata", {})
+                        if isinstance(cust_meta, str):
+                            cust_meta = json.loads(cust_meta)
                         
-                        if participant:
-                            # [CRITICAL FIX] Prepend "@User" to the text.
-                            # WhatsApp needs the text to contain the tag to highlight it.
-                            user_tag = participant.split('@')[0]
-                            payload["content"] = f"@{user_tag} {message_content}"
+                        # Only add mention if it's a group
+                        if cust_meta.get("is_group"):
+                            real_number = cust_meta.get("real_number")
                             
-                            # Add to payload options
-                            payload["options"] = { "mentions": [participant] }
-                            logger.info(f"🏷️  Auto-Mentioning Participant: {participant}")
+                            if real_number:
+                                # Format: just the number for text, full ID for mentions array
+                                mention_tag = str(real_number).split('@')[0]
+                                mention_id = f"{mention_tag}@lid" if mention_tag.isdigit() and len(mention_tag) > 10 else f"{mention_tag}@c.us"
+                                
+                                payload["content"] = f"@{mention_tag} {message_content}"
+                                payload["options"] = {"mentions": [mention_id]}
+                                logger.info(f"🏷️ Auto-Mentioning: @{mention_tag}")
                 except Exception as ex:
                     logger.warning(f"⚠️ Failed to resolve mention for group: {ex}")
+
 
             base_url = settings.WHATSAPP_API_URL
             if not base_url: return {"success": False, "reason": "api_url_not_configured"}
