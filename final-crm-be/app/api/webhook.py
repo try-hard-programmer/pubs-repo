@@ -10,6 +10,7 @@ import base64
 import json 
 import uuid
 import time
+import re
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -417,62 +418,66 @@ async def _upload_media_to_supabase(
     file_extension: str
 ) -> str:
     """
-    Upload media file to Supabase storage bucket 'tmp'
-
-    Args:
-        media_data: Base64 encoded media data
-        mime_type: MIME type of the media (e.g., "image/jpeg", "audio/ogg")
-        file_extension: File extension (e.g., "jpg", "ogg")
-
-    Returns:
-        Signed public URL with token
-
-    Raises:
-        Exception: If upload fails
+    Upload media to 'tmp' bucket.
+    Storage Policy: Files are temporary.
+    Link Expiry: 3 Days (259200 seconds).
     """
     try:
-        # Decode base64 data
+        # Decode
         file_content = base64.b64decode(media_data)
-
-        # Generate unique file ID
         file_id = str(uuid.uuid4())
         filename = f"{file_id}.{file_extension}"
-
-        # Get Supabase client
+        
+        # TARGET: 'tmp' bucket
+        bucket_name = "tmp" 
         supabase = get_supabase_client()
+        
+        logger.info(f"   📤 [UPLOAD] Uploading to {bucket_name}/{filename} (Size: {len(media_data)})")
 
-        # Upload to tmp bucket
-        bucket_name = "tmp"
-        storage_path = filename
+        # --- ATTEMPT 1: Optimistic Upload ---
+        try:
+            supabase.storage.from_(bucket_name).upload(
+                path=filename,
+                file=file_content,
+                file_options={"content-type": mime_type, "upsert": "false"}
+            )
+        except Exception as e:
+            # --- ATTEMPT 2: Self-Healing (Auto-Create Bucket) ---
+            logger.warning(f"   ⚠️ Upload failed: {e}. Checking bucket...")
+            try:
+                buckets = supabase.storage.list_buckets()
+                if not any(b.name == bucket_name for b in buckets):
+                    logger.info(f"   🛠️ Creating bucket '{bucket_name}'...")
+                    supabase.storage.create_bucket(bucket_name, options={"public": False})
+                
+                supabase.storage.from_(bucket_name).upload(
+                    path=filename,
+                    file=file_content,
+                    file_options={"content-type": mime_type, "upsert": "false"}
+                )
+            except Exception as retry_e:
+                logger.error(f"   ❌ FATAL: Retry failed: {retry_e}")
+                raise retry_e
 
-        # Upload file
-        response = supabase.storage.from_(bucket_name).upload(
-            path=storage_path,
-            file=file_content,
-            file_options={
-                "content-type": mime_type,
-                "cache-control": "3600",
-                "upsert": "false"
-            }
-        )
+        # [FIX] Set Expiry to 3 Days (259200 seconds)
+        url_response = supabase.storage.from_(bucket_name).create_signed_url(filename, 259200)
+        
+        if isinstance(url_response, dict):
+             public_url = url_response.get("signedURL") or url_response.get("signedUrl")
+        else:
+             public_url = url_response
 
-        logger.info(f"✅ Uploaded media to storage: {bucket_name}/{storage_path}")
+        if not public_url:
+            raise Exception("Generated URL is empty")
 
-        # Get signed URL (valid for 1 hour)
-        url_response = supabase.storage.from_(bucket_name).create_signed_url(
-            storage_path,
-            3600  # 1 hour
-        )
-
-        public_url = url_response.get("signedURL")
-        logger.info(f"✅ Generated signed URL for media: {public_url}")
-
+        logger.info(f"   🔗 [UPLOAD] URL: {public_url[:50]}...")
         return public_url
 
     except Exception as e:
-        logger.error(f"Failed to upload media to Supabase: {e}")
-        raise Exception(f"Media upload failed: {str(e)}")
-
+        logger.error(f"❌ [UPLOAD FAILED] Critical: {e}", exc_info=True)
+        # Return 500 to Worker so we know it failed
+        raise HTTPException(status_code=500, detail=f"Media Upload Error: {str(e)}")
+    
 def _extract_phone_number(whatsapp_id: str) -> str:
     if not whatsapp_id: return ""
     if "@lid" in whatsapp_id: return whatsapp_id
@@ -613,12 +618,17 @@ async def process_webhook_message_v2(
 ) -> Dict:
     """
     V2 Processor: Route -> Broadcast -> Busy/Schedule -> Ticket/AI
+    STATUS: STABLE (Includes 3s Poll for Media Consistency)
     """
     agent_id = agent["id"]
     org_id = agent["organization_id"]
+    status = agent.get("status", "active")
 
-    if agent.get("status") == "inactive":
-        return {"success": False, "status": "dropped_inactive"}
+    # [FIX] Handle BOTH Inactive and Archived
+    # Return early with a specific status flag
+    if status in ["inactive", "archived"]:
+        logger.info(f"🛑 Agent {agent_id} is {status}. Dropping message.")
+        return {"success": False, "status": f"dropped_{status}"}
 
     # 1. ROUTING
     router = get_message_router_service(supabase)
@@ -628,8 +638,6 @@ async def process_webhook_message_v2(
     chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
 
     # 2. UPDATE CUSTOMER DATA (Phone & Metadata)
-    is_group = message_metadata.get("is_group", False)
-
     if cust_id and customer_metadata:
         try:
             cust_res = supabase.table("customers").select("metadata").eq("id", cust_id).single().execute()
@@ -644,22 +652,30 @@ async def process_webhook_message_v2(
         except Exception as e:
             logger.warning(f"⚠️ Failed to update customer metadata: {e}")
 
-    # 3. WEBSOCKET BROADCAST
+    # 3. WEBSOCKET BROADCAST (WITH STABILITY LOOP)
     if app_settings.WEBSOCKET_ENABLED:
         try:
             fresh_metadata = message_metadata
+            
+            # [RESTORED] STABILITY LOOP
+            # If it's a media message, wait briefly and check DB to ensure we have the Final URL.
+            # This fixes "Blurry Images" caused by the Frontend getting the event before the DB is consistent.
             if channel == "whatsapp" and message_metadata.get("message_type") in ["image", "video", "document"]:
                 initial_url = message_metadata.get("media_url")
-                for _ in range(3):
-                    await asyncio.sleep(1)
+                
+                # Try 3 times (1s interval)
+                for i in range(3):
+                    await asyncio.sleep(1) # Wait for DB consistency
                     try:
                         msg_res = supabase.table("messages").select("metadata").eq("id", msg_id).single().execute()
                         if msg_res.data and msg_res.data.get("metadata"):
                             db_meta = msg_res.data["metadata"]
+                            # If DB has a DIFFERENT URL (e.g. Supabase Storage link instead of None/Blurhash), use it!
                             if db_meta.get("media_url") and db_meta.get("media_url") != initial_url:
                                 fresh_metadata = db_meta
+                                logger.info(f"📸 Found updated media URL for {msg_id} after {i+1}s wait.")
                                 break
-                    except: pass
+                    except Exception: pass
             
             attachment_data = None
             if fresh_metadata.get("media_url"):
@@ -669,7 +685,6 @@ async def process_webhook_message_v2(
                     "name": "Media Attachment"
                 }
 
-            # [BROADCAST Group / Personal] 
             sender_display = customer_name
 
             await get_connection_manager().broadcast_new_message(
@@ -709,7 +724,12 @@ async def process_webhook_message_v2(
     queue_svc = get_llm_queue()
     ticket_svc = get_ticket_service()
     ai_priority = "medium"
+    
+    # [FIX] Gating Flag: Only run AI if this becomes True
+    ticket_ready = False
 
+    # Note: We keep the lock here to prevent two parallel webhooks from creating 
+    # two duplicates tickets for the same chat.
     async with acquire_lock(f"webhook:ticket:{chat_id}", expire=30, wait_time=5) as acquired:
         if acquired:
             try:
@@ -718,10 +738,15 @@ async def process_webhook_message_v2(
                     .eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
                 
                 if ticket_query.data:
+                    # Case A: Existing Ticket Found
                     active_ticket = ticket_query.data[0]
-                    if active_ticket.get("assigned_agent_id"): return {**res, "handled_by": "human_ticket"}
+                    if active_ticket.get("assigned_agent_id"): 
+                        return {**res, "handled_by": "human_ticket"}
+                    
                     ai_priority = str(active_ticket.get("priority", "medium")).lower()
+                    ticket_ready = True # ✅ Safe to run AI
                 else:
+                    # Case B: Create New Ticket
                     ticket_config = parse_agent_config(agent.get("ticketing_config"))
                     new_ticket_data = TicketCreate(
                         chat_id=chat_id, customer_id=cust_id,
@@ -729,14 +754,27 @@ async def process_webhook_message_v2(
                         description=f"First Message: {message_content}\n\n[Auto-created: Low Priority Default]",
                         priority=TicketPriority.LOW, category="General"
                     )
+                    # This call is now SYNCHRONOUS safe if you applied the TicketService fix
                     await ticket_svc.create_ticket(new_ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
+                    
                     ai_priority = "low"
+                    ticket_ready = True # ✅ Safe to run AI
             except Exception as e:
                 logger.error(f"❌ Ticket Creation Flow Error: {e}")
-                
-    await queue_svc.enqueue(chat_id=chat_id, message_id=msg_id, supabase_client=supabase, priority=ai_priority)
-    return {**res, "handled_by": "ai_v2_queued"}
+                # ticket_ready remains False, AI will NOT run
+        else:
+            logger.warning(f"⏳ Could not acquire ticket lock for {chat_id}. Skipping ticket creation check.")
+            # ticket_ready remains False. 
+            # Better to skip AI than to run it without a ticket context.
 
+    # [FIX] Only enqueue if we are SURE the ticket exists
+    if ticket_ready:
+        await queue_svc.enqueue(chat_id=chat_id, message_id=msg_id, supabase_client=supabase, priority=ai_priority)
+        return {**res, "handled_by": "ai_v2_queued"}
+    else:
+        logger.error(f"🛑 Skipping AI for chat {chat_id}: Ticket context missing or lock failed.")
+        return {**res, "handled_by": "error_no_ticket"}
+    
 # ============================================
 # 2. WHATSAPP UNOFFICIAL WEBHOOK (Updated)
 # ============================================
@@ -856,12 +894,19 @@ async def whatsapp_unofficial_webhook(
 
                 if not is_mentioned:
                     import re
+                    # Find any LID-like pattern (starts with 2, 10-17 digits)
                     lid_matches = re.findall(r"@\s?(2\d{10,17})", final_content)
                     if lid_matches:
                         detected_lid = lid_matches[0]
-                        is_mentioned = True
-                        final_content = re.sub(r"@\s?" + detected_lid, "", final_content).strip()
-                        logger.info(f"🦸‍♂️ Heuristic Match: Found LID @{detected_lid}. Stripped & Processing.")
+                        
+                        # [FIX] Check if the mentioned LID is actually THIS Agent
+                        if detected_lid in potential_ids:
+                            is_mentioned = True
+                            final_content = re.sub(r"@\s?" + detected_lid, "", final_content).strip()
+                            logger.info(f"🦸‍♂️ Heuristic Match: Found MY LID @{detected_lid}. Stripped & Processing.")
+                        else:
+                            # Mention found, but it wasn't for me. Explicitly ignore.
+                            return JSONResponse(content={"status": "ignored", "reason": "group_mention_not_for_me"})
 
             if not is_mentioned:
                 return JSONResponse(content={"status": "ignored", "reason": "group_no_mention"})
@@ -898,6 +943,8 @@ async def whatsapp_unofficial_webhook(
         if "@c.us" in contact_id: 
             contact_id = contact_id.split("@")[0]
         
+        # [FIX] Always use the raw message content. 
+        # We do NOT prepend "Sender Name:" anymore to prevent double headers.
         final_message_content = standard_message.message
         
         if is_group:
@@ -913,11 +960,6 @@ async def whatsapp_unofficial_webhook(
                         final_participant_number = real_phone.split("@")[0]
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to resolve Group Participant LID: {e}")
-
-            if participant_id:
-                sender_display = meta.get("real_sender_name") or "Unknown"
-                # [FIX] Clean format: "Name: Message" (No ugly ID/LID)
-                final_message_content = f"{sender_display}: {standard_message.message}"
 
         # -------------------------------------------------------------
         # 6. EXECUTE PROCESSOR V2
@@ -947,11 +989,24 @@ async def whatsapp_unofficial_webhook(
             supabase=supabase
         )
 
+        # [FIX] CRASH PREVENTION
+        # If the message was dropped (inactive/archived), result has no 'chat_id'.
+        # We must return early to prevent KeyError.
+        if result.get("status", "").startswith("dropped_"):
+            return JSONResponse(content={"success": True, "status": result["status"]})
+
+        # Normal Flow (Active/Busy)
         return WebhookRouteResponse(
-            success=True, chat_id=result["chat_id"], message_id=result["message_id"],
-            customer_id=result["customer_id"], is_new_chat=result["is_new_chat"],
-            was_reopened=result["was_reopened"], handled_by=result["handled_by"],
-            status=result["status"], channel="whatsapp", message=_generate_status_message(result)
+            success=True, 
+            chat_id=result["chat_id"], 
+            message_id=result["message_id"],
+            customer_id=result["customer_id"], 
+            is_new_chat=result["is_new_chat"],
+            was_reopened=result.get("was_reopened", False), 
+            handled_by=result["handled_by"],
+            status=result["status"], 
+            channel="whatsapp", 
+            message=_generate_status_message(result)
         )
 
     except Exception as e:
@@ -988,9 +1043,8 @@ async def telegram_userbot_webhook(
         # 3. Redis Idempotency Check
         msg_id = data_content.get("id", {}).get("id")
         if msg_id:
-            dedup_key = f"tg_{msg_id}" # Unique prefix for Telegram
+            dedup_key = f"tg_{msg_id}"
             if await is_duplicate_message(dedup_key):
-                logger.info(f"⚡ Redis Dedup: Skipping duplicate Telegram ID {msg_id}")
                 return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
 
         # 4. Agent Verification
@@ -1004,60 +1058,44 @@ async def telegram_userbot_webhook(
         if settings_data: agent.update(settings_data)
 
         # 5. Identity & Group Extraction
-        # Note: In Telethon 'incoming' events:
-        # 'from' = User ID (Sender)
-        # 'to' = Chat ID (Group) OR Agent ID (if DM)
-        
         sender_id = str(data_content.get("from", ""))
         sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
         timestamp_unix = data_content.get("t")
         
-        raw_to = str(data_content.get("to", ""))
-        
-        # Check flags passed by listener.py
-        # is_group_tele = data_content.get("is_group") or (raw_to != str(agent_id) and raw_to != "")
         is_group_tele = data_content.get("is_group", False)
         is_mentioned = data_content.get("mentioned", False)
-        
-        # 6. Group Filtering Logic
-        contact_target = sender_id # Default to DM
+        contact_target = sender_id 
         participant_id = None
         
         if is_group_tele:
-            # STRICT FILTER: Must be mentioned
             if not is_mentioned:
-                # Log it so we know WHY it was dropped
-                logger.info(f"🚫 Ignoring Group Msg in {raw_to} (No Mention)")
                 return JSONResponse(content={"success": True, "status": "ignored_group_no_mention"})
-            
-            # In Groups, the "Contact" is the Group ID
-            # In DMs, the "Contact" is the User ID (sender_id)
             contact_target = str(data_content.get("to", "")) 
             participant_id = sender_id
-            logger.info(f"🔔 Telegram Group Mention in {contact_target} by {sender_id}")
 
-        # Phone logic (Only applicable for DMs usually)
+        # 6. Phone Logic
         raw_phone = data_content.get("phone")
         final_phone = sender_id
         if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
             final_phone = str(raw_phone)
 
         # 7. Content Extraction
-        try:
-            message_text, msg_type, media_url = await _handle_message_content_for_telegram(content_source, payload.dataType)
-        except Exception as e:
-            logger.error(f"❌ Telegram Content Parse Error: {e}")
-            message_text = ""
-            msg_type = "text"
-            media_url = None
+        message_text, msg_type, media_url = await _handle_message_content_for_telegram(
+            content_source, 
+            payload.dataType
+        )
+        
+        # 1. CLEAN TELEGRAM SPAM: Removes "[Account](tg://user?id=123)"
+        if message_text:
+            message_text = re.sub(r"\[.*?\]\(tg://user\?id=\d+\)\s*", "", message_text).strip()
 
-        # 8. Prepare Metadata
+        # 8. Prepare Metadata (URL is still saved here for the FE to render as an attachment)
         msg_meta = {
             "source_format": "wa_unofficial_json", 
             "telegram_message_id": msg_id, 
             "telegram_sender_id": sender_id, 
             "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None,
-            "media_url": media_url,
+            "media_url": media_url, # <--- FE reads this to show the image
             "message_type": msg_type,
             "is_group": is_group_tele,
             "participant": participant_id,
@@ -1066,24 +1104,23 @@ async def telegram_userbot_webhook(
         
         cust_meta = { 
             "telegram_id": contact_target, 
-            "phone": final_phone if not is_group_tele else None, # Don't map group ID to phone
+            "phone": final_phone if not is_group_tele else None,
             "source": "telegram_userbot",
             "is_group": is_group_tele
         }
 
-        # 9. Process via V2
+        # 9. Process
         result = await process_webhook_message_v2(
             agent=agent, 
             channel="telegram", 
-            contact=contact_target, # User ID or Group ID
+            contact=contact_target, 
             message_content=message_text, 
-            customer_name=sender_display_name, # User Name
+            customer_name=sender_display_name, 
             message_metadata=msg_meta, 
             customer_metadata=cust_meta, 
             supabase=supabase
         )
         
-        # 10. Return Response
         return WebhookRouteResponse(
             success=True, 
             chat_id=result.get("chat_id"), 
@@ -1100,6 +1137,6 @@ async def telegram_userbot_webhook(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Telegram Userbot Critical: {e}")
+        logger.error(f"❌ Telegram Userbot Critical: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     

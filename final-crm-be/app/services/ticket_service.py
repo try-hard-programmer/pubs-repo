@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
+import uuid
 
 from supabase import create_client
 from app.config import settings
@@ -15,7 +16,6 @@ from app.models.ticket import (
     TicketStatus
 )
 from app.services.websocket_service import get_connection_manager
-from app.services.redis_service import acquire_lock
 
 logger = logging.getLogger(__name__)
 
@@ -23,60 +23,23 @@ class TicketService:
     def __init__(self):
         self.supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
 
-    async def _generate_ticket_number(self, organization_id: str, ticket_config: Dict = None) -> str:
+    def _generate_ticket_number(self, organization_id: str, ticket_config: Dict = None) -> str:
         """
-        Generates the next ticket number sequentially.
-        Uses a Redis Lock with retry logic to prevent race conditions.
+        Generates a unique ticket ID based on Time + Randomness.
+        Format: TKT-YYMMDDHHMMSS-RAND (e.g., TKT-240118120001-A1B2)
         """
         prefix = "TKT-"
         if ticket_config and isinstance(ticket_config, dict):
             prefix = ticket_config.get("ticketPrefix", "TKT-").strip()
+            
+        # 1. Get compact timestamp (Year, Month, Day, Hour, Minute, Second)
+        timestamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
         
-        # Max retries to prevent infinite loops if Redis hangs
-        max_retries = 5
-        retry_delay = 0.2  # 200ms
-
-        for attempt in range(max_retries):
-            # Attempt to acquire the lock for this specific Org
-            async with acquire_lock(f"ticket_gen:{organization_id}", expire=5) as acquired:
-                if acquired:
-                    try:
-                        # --- CRITICAL SECTION: ONLY ONE WORKER ENTER HERE ---
-                        logger.info(f"🔒 Lock acquired for {organization_id}, generating ticket...")
-                        
-                        res = self.supabase.table("tickets") \
-                            .select("ticket_number") \
-                            .eq("organization_id", organization_id) \
-                            .ilike("ticket_number", f"{prefix}%") \
-                            .order("created_at", desc=True) \
-                            .limit(1) \
-                            .execute()
-
-                        next_num = 1
-                        if res.data:
-                            last_ticket = res.data[0]["ticket_number"]
-                            try:
-                                number_part = last_ticket.replace(prefix, "")
-                                next_num = int(number_part) + 1
-                            except ValueError:
-                                next_num = 1
-                        
-                        return f"{prefix}{next_num:03d}"
-                        # ----------------------------------------------------
-                    
-                    except Exception as e:
-                        logger.error(f"❌ Error generating ticket number: {e}")
-                        raise e  # Release lock and crash gently
-                else:
-                    # Lock is busy, wait and try again
-                    if attempt < max_retries - 1:
-                        logger.warning(f"⏳ Ticket generation locked for {organization_id}. Retrying ({attempt+1}/{max_retries})...")
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        logger.error(f"❌ Failed to acquire ticket lock for {organization_id} after {max_retries} attempts.")
+        # 2. Add entropy (4 random hex characters)
+        # This guarantees uniqueness without needing a database lock
+        random_part = uuid.uuid4().hex[:4].upper()
         
-        # Fallback if lock system fails completely (keeps system alive)
-        return f"{prefix}{int(datetime.now(timezone.utc).timestamp())}"
+        return f"{prefix}{timestamp}-{random_part}"
     
     async def create_ticket(
         self, 
@@ -87,66 +50,55 @@ class TicketService:
         actor_type: ActorType = ActorType.SYSTEM
     ) -> Ticket:
         
-        # 1. DEFINE THE LOCK (Critical for preventing duplicates)
-        lock_key = f"ticket_gen:{organization_id}"
+        ticket_num = self._generate_ticket_number(ticket_config)
+        
+        logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
 
-        # 2. ACQUIRE LOCK BEFORE CALCULATING ANYTHING
-        async with acquire_lock(lock_key, expire=5) as acquired:
-            if not acquired:
-                # Fail fast if system is hammered, or let client retry
-                raise Exception("System busy generating ticket ID. Please retry.")
+        # [FIX] Resolve Customer Name (This part was good, keep it)
+        customer_name = "Unknown Customer"
+        if data.customer_id:
+            try:
+                cust_res = self.supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
+                if cust_res.data:
+                    customer_name = cust_res.data.get("name") or "Unknown Customer"
+            except Exception as e:
+                logger.warning(f"Failed to resolve customer name: {e}")
 
-            # --- CRITICAL SECTION STARTS HERE ---
-            
-            # 3. Generate Number (Now safe because only ONE process is here at a time)
-            ticket_num = await self._generate_ticket_number(organization_id, ticket_config)
-            logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
+        # [FIX] Smart Title Generation (This was also good)
+        final_title = data.title
+        is_placeholder = final_title and ("UNKNOWN" in final_title or "New Ticket" in final_title)
+        
+        if not final_title or is_placeholder:
+            priority_val = data.priority.value if hasattr(data.priority, "value") else str(data.priority)
+            desc_text = data.description or "No Content"
+            snippet = desc_text[:30] + "..." if len(desc_text) > 30 else desc_text
+            final_title = f"[{priority_val.upper()}] {customer_name} - {snippet}"
 
-            # [FIX] Resolve Customer Name for Title Generation
-            customer_name = "Unknown Customer"
-            if data.customer_id:
-                try:
-                    cust_res = self.supabase.table("customers").select("name").eq("id", data.customer_id).single().execute()
-                    if cust_res.data:
-                        customer_name = cust_res.data.get("name") or "Unknown Customer"
-                except Exception as e:
-                    logger.warning(f"Failed to resolve customer name: {e}")
+        # 3. Prepare Insert Data
+        insert_data = {
+            "organization_id": organization_id,
+            "customer_id": data.customer_id,
+            "chat_id": data.chat_id,
+            "ticket_number": ticket_num,
+            "title": final_title,
+            "description": data.description,
+            "category": data.category,
+            "priority": data.priority.value if hasattr(data.priority, "value") else data.priority,
+            "status": TicketStatus.OPEN.value,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
 
-            # [FIX] Smart Title Generation
-            final_title = data.title
-            is_placeholder = final_title and ("UNKNOWN" in final_title or "New Ticket" in final_title)
-            
-            if not final_title or is_placeholder:
-                priority_val = data.priority.value if hasattr(data.priority, "value") else str(data.priority)
-                desc_text = data.description or "No Content"
-                snippet = desc_text[:30] + "..." if len(desc_text) > 30 else desc_text
-                final_title = f"[{priority_val.upper()}] {customer_name} - {snippet}"
-
-            # 4. Prepare Insert Data
-            insert_data = {
-                "organization_id": organization_id,
-                "customer_id": data.customer_id,
-                "chat_id": data.chat_id,
-                "ticket_number": ticket_num,
-                "title": final_title,
-                "description": data.description,
-                "category": data.category,
-                "priority": data.priority.value if hasattr(data.priority, "value") else data.priority,
-                "status": TicketStatus.OPEN.value,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-
-            # 5. Insert (Still inside lock to ensure atomicity)
-            res = self.supabase.table("tickets").insert(insert_data).execute()
-                    
-        # Everything below here is safe to run without the lock
+        # 4. Insert (One shot, no indentation level)
+        res = self.supabase.table("tickets").insert(insert_data).execute()
+        
+        # Everything below here is correct...
         if not res.data: 
             raise Exception("Failed to insert ticket")
         
         new_ticket = Ticket(**res.data[0])
 
-        # 6. Log Activity
+        # 5. Log Activity
         await self.log_activity(
             ticket_id=new_ticket.id, 
             action="created", 
@@ -155,7 +107,7 @@ class TicketService:
             actor_type=actor_type
         )
 
-        # 7. Broadcast
+        # 6. Broadcast
         try:
             conn = get_connection_manager()
             await conn.broadcast_chat_update(

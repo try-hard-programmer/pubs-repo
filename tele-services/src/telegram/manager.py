@@ -96,15 +96,14 @@ class TelegramClientManager:
                
     async def _process_update(self, account_id: str, event):
         """
-        Normalize Telegram event and DELEGATE to handlers (messaging.py).
-        Added Rule: Ignore Group messages unless mentioned.
+        Normalize Telegram event and DELEGATE to handlers.
         """
         try:
             sender = await event.get_sender()
             
             # Context Flags
             is_group = event.is_group
-            is_mentioned = event.message.mentioned # [FIX] Capture this explicitly
+            is_mentioned = event.message.mentioned 
             
             # Filter: Ignore Groups if not mentioned
             if is_group and not is_mentioned:
@@ -112,41 +111,69 @@ class TelegramClientManager:
 
             chat_id = str(event.chat_id)
             sender_id = str(sender.id) if sender else chat_id
-            
-            logger.info(f"📥 [INBOUND] New Message on Account {account_id}")
-            logger.info(f"   📍 Context: IsGroup={is_group} | Mentioned={is_mentioned}")
-            
-            # [FIX] Add 'mentioned' to the data packet
+            msg_id = str(event.message.id)
+
+            logger.info(f"🔍 [TRACE-START] Processing MsgID: {msg_id} | Account: {account_id}")
+
             message_data = {
                 "account_id": account_id,
                 "chat_id": chat_id,           
                 "sender_id": sender_id,       
-                "message_id": str(event.message.id),
+                "message_id": msg_id,
                 "text": event.message.text or "",
                 "sender_name": getattr(sender, 'first_name', "Unknown"),
                 "is_group": is_group,
-                "mentioned": is_mentioned, # <--- CRITICAL ADDITION
+                "mentioned": is_mentioned,
                 "timestamp": int(event.date.timestamp()),
                 "customer_data": {
                     "phone": getattr(sender, 'phone', None),
                     "username": getattr(sender, 'username', "")
-                }
+                },
+                "has_media": False
             }
             
+            # --- TRACE MEDIA DOWNLOAD ---
             if event.message.media:
-                message_data["has_media"] = True
-            
+                logger.info(f"   📸 [TRACE] Media Detected in MsgID: {msg_id}")
+                try:
+                    # 1. Start Download
+                    logger.info(f"   ⏳ [TRACE] Starting download for MsgID: {msg_id}...")
+                    media_bytes = await event.message.download_media(file=bytes)
+                    
+                    if media_bytes:
+                        size_kb = len(media_bytes) / 1024
+                        logger.info(f"   ✅ [TRACE] Download Success! Size: {size_kb:.2f} KB")
+
+                        # 2. Convert to Base64
+                        b64_data = base64.b64encode(media_bytes).decode('utf-8')
+                        message_data["media_b64"] = b64_data
+                        message_data["has_media"] = True
+                        
+                        # 3. Get Mime Type
+                        mime_type = "application/octet-stream"
+                        if hasattr(event.message, 'file') and event.message.file:
+                            mime_type = event.message.file.mime_type
+                        message_data["mime_type"] = mime_type
+                        
+                        logger.info(f"   📋 [TRACE] MimeType: {mime_type} | B64 Length: {len(b64_data)}")
+                    else:
+                        logger.error(f"   ❌ [TRACE] Download returned EMPTY bytes for MsgID: {msg_id}")
+
+                except Exception as e:
+                    logger.error(f"   ❌ [TRACE] Download CRASHED: {e}", exc_info=True)
+            else:
+                logger.info(f"   📝 [TRACE] No media detected (Text only).")
+
+            # --- HAND OFF TO MESSAGING SERVICE ---
             if self.message_handlers:
                 for handler in self.message_handlers:
-                    try:
-                        await handler(message_data)
-                    except Exception as e:
-                        logger.error(f"   ❌ Handler failed: {e}", exc_info=True)
+                    logger.info(f"   🚀 [TRACE] Handing off to messaging service...")
+                    await handler(message_data)
             else:
-                logger.warning("   ⚠️ No handlers registered! Message was dropped.")
+                logger.warning("   ⚠️ [TRACE] No handlers registered! Message Dropped.")
 
         except Exception as e:
-            logger.error(f"❌ Error processing update: {e}", exc_info=True)
-
+            logger.error(f"❌ [TRACE] Fatal Error in _process_update: {e}", exc_info=True)
+            
 # Singleton
 telegram_manager = TelegramClientManager()

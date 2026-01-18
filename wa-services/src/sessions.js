@@ -37,7 +37,7 @@ const {
 process.on("uncaughtException", (error) => {
   console.error(
     "🔥 Uncaught Exception (Prevented Crash):",
-    error.message || error
+    error.message || error,
   );
 });
 
@@ -111,7 +111,7 @@ const restoreSessions = () => {
       }
     } catch (err) {
       console.log(
-        "⚠️ Warning: Could not clean locks (normal if folder is empty)."
+        "⚠️ Warning: Could not clean locks (normal if folder is empty).",
       );
     }
 
@@ -203,12 +203,12 @@ const setupSession = (sessionId) => {
     client.on("qr", async () => {
       qrRetryCount++;
       console.log(
-        `⚠️ Session ${sessionId} generated QR ${qrRetryCount}/${MAX_QR_RETRIES}`
+        `⚠️ Session ${sessionId} generated QR ${qrRetryCount}/${MAX_QR_RETRIES}`,
       );
 
       if (qrRetryCount >= MAX_QR_RETRIES) {
         console.log(
-          `💀 ZOMBIE DETECTED: Session ${sessionId} ignored 5 QR codes. Auto-killing...`
+          `💀 ZOMBIE DETECTED: Session ${sessionId} ignored 5 QR codes. Auto-killing...`,
         );
 
         try {
@@ -248,7 +248,7 @@ const initializeEvents = (client, sessionId) => {
         const restartSession = async (sessionId) => {
           if (restoringSessions.has(sessionId)) {
             console.log(
-              `⚠️ Session ${sessionId} is already restoring. Skipping.`
+              `⚠️ Session ${sessionId} is already restoring. Skipping.`,
             );
             return;
           }
@@ -269,7 +269,7 @@ const initializeEvents = (client, sessionId) => {
               await client
                 .destroy()
                 .catch((e) =>
-                  console.log("Destroy error (ignored):", e.message)
+                  console.log("Destroy error (ignored):", e.message),
                 );
             }
 
@@ -302,7 +302,7 @@ const initializeEvents = (client, sessionId) => {
         client.pupPage.once("error", function () {
           // emitted when the page crashes
           console.log(
-            `Error occurred on browser page for ${sessionId}. Restoring`
+            `Error occurred on browser page for ${sessionId}. Restoring`,
           );
           restartSession(sessionId);
         });
@@ -407,29 +407,42 @@ const initializeEvents = (client, sessionId) => {
       if (isMedia) {
         checkIfEventisEnabled("media")
           .then(async (_) => {
-            try {
-              const downloadPromise = message.downloadMedia();
-              const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error("Download timeout")), 15000)
-              );
-              const messageMedia = await Promise.race([
-                downloadPromise,
-                timeoutPromise,
-              ]);
+            let messageMedia = null;
+            let downloadAttempts = 0;
+            const MAX_RETRIES = 3;
 
-              if (messageMedia && messageMedia.data) {
-                triggerWebhook(sessionWebhook, sessionId, "media", {
-                  messageMedia,
-                  message,
-                  me: meInfo, // <--- INJECTED
-                });
-              } else {
-                throw new Error("Empty media object returned");
+            // 1. RETRY LOOP (The Fix)
+            while (downloadAttempts < MAX_RETRIES && !messageMedia) {
+              downloadAttempts++;
+              try {
+                const downloadPromise = message.downloadMedia();
+                // 2. INCREASED TIMEOUT (The Fix)
+                const timeoutPromise = new Promise((_, reject) =>
+                  setTimeout(
+                    () => reject(new Error("Download timeout")),
+                    45000,
+                  ),
+                );
+                messageMedia = await Promise.race([
+                  downloadPromise,
+                  timeoutPromise,
+                ]);
+              } catch (err) {
+                console.error(
+                  `⚠️ Media Attempt ${downloadAttempts} failed. Retrying...`,
+                );
+                await new Promise((r) => setTimeout(r, 2000)); // Wait 2s
               }
-            } catch (e) {
-              console.error(
-                `⚠️ Media failed: ${e.message}. Sending text fallback.`
-              );
+            }
+
+            if (messageMedia && messageMedia.data) {
+              triggerWebhook(sessionWebhook, sessionId, "media", {
+                messageMedia,
+                message,
+                me: meInfo,
+              });
+            } else {
+              console.error(`❌ Media Failed. Sending fallback.`);
               triggerWebhook(sessionWebhook, sessionId, "message", {
                 message,
                 me: meInfo,
@@ -455,7 +468,7 @@ const initializeEvents = (client, sessionId) => {
           await chat.sendSeen();
         } catch (e) {
           console.error(
-            `⚠️ Failed to send seen status (message): ${e.message}`
+            `⚠️ Failed to send seen status (message): ${e.message}`,
           );
         }
       }
@@ -474,7 +487,7 @@ const initializeEvents = (client, sessionId) => {
           await chat.sendSeen();
         } catch (e) {
           console.error(
-            `⚠️ Failed to send seen status (message): ${e.message}`
+            `⚠️ Failed to send seen status (message): ${e.message}`,
           );
         }
       }
@@ -490,7 +503,7 @@ const initializeEvents = (client, sessionId) => {
           await chat.sendSeen();
         } catch (e) {
           console.error(
-            `⚠️ Failed to send seen status (message): ${e.message}`
+            `⚠️ Failed to send seen status (message): ${e.message}`,
           );
         }
       }
