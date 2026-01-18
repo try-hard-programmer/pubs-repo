@@ -8,8 +8,7 @@ from telethon import TelegramClient, events
 logger = logging.getLogger(__name__)
 
 # 1. LOAD CONFIG
-# We get the raw URL from env, e.g., "http://localhost:8000/api/webhook/telegram"
-RAW_URL = os.getenv("MAIN_SERVICE_URL", "http://localhost:8000")
+RAW_URL = os.getenv("MAIN_SERVICE_URL", "http://localhost:8000/webhook/telegram-userbot")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET_KEY", "your_secret_key")
 
 def get_target_url():

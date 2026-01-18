@@ -10,7 +10,6 @@ from typing import Optional, Dict, Any, List
 
 from fastapi import HTTPException, status
 
-from app.config.settings import settings
 import os
 import asyncio
 from app.config import settings as app_settings
@@ -317,83 +316,7 @@ class WhatsAppService:
         except Exception as e:
             logger.error(f"Failed to send text message: {e}")
             raise Exception(f"Message sending failed: {str(e)}")
-            
-    async def send_media_message(self, session_id: str, phone_number: str, media_url: str, caption: Optional[str] = None, media_type: str = "image") -> Dict[str, Any]:
-        try:
-            logger.info(f"📤 Sending media message to: {phone_number}")
-            
-            # [FIX] LID RESOLUTION FOR MEDIA
-            chat_id = phone_number
-            if "@lid" in str(phone_number):
-                logger.info(f"🔍 Attempting to resolve LID for media send: {phone_number}")
-                contact_data = await self.get_contact_by_id(session_id, phone_number)
-                if contact_data.get("success") and contact_data.get("number"):
-                    chat_id = contact_data.get("number")
-                    logger.info(f"✅ Resolved LID {phone_number} to {chat_id}")
-                else:
-                    logger.warning(f"⚠️ Could not resolve LID {phone_number}, using as is.")
-                    chat_id = phone_number # Keep @lid
-
-            chat_id = self._format_chat_id(chat_id)
-
-            payload = {
-                "chatId": chat_id,
-                "contentType": media_type,
-                "content": media_url
-            }
-            if caption:
-                payload["caption"] = caption
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{self.base_url}/client/sendMessage/{session_id}", 
-                    json=payload, 
-                    headers=self._get_headers()
-                )
-                response.raise_for_status()
-                return {"success": True, "session_id": session_id, "media_url": media_url, "data": response.json()}
-        except Exception as e:
-            logger.error(f"Failed to send media message: {e}")
-            raise Exception(f"Media message sending failed: {str(e)}")
-
-    async def send_file_message(self, session_id: str, phone_number: str, file_url: str, filename: Optional[str] = None, caption: Optional[str] = None) -> Dict[str, Any]:
-        try:
-            logger.info(f"📤 Sending file message to: {phone_number}")
-            
-            # [FIX] LID RESOLUTION FOR FILES
-            chat_id = phone_number
-            if "@lid" in str(phone_number):
-                logger.info(f"🔍 Attempting to resolve LID for file send: {phone_number}")
-                contact_data = await self.get_contact_by_id(session_id, phone_number)
-                if contact_data.get("success") and contact_data.get("number"):
-                    chat_id = contact_data.get("number")
-                    logger.info(f"✅ Resolved LID {phone_number} to {chat_id}")
-                else:
-                    logger.warning(f"⚠️ Could not resolve LID {phone_number}, using as is.")
-                    chat_id = phone_number # Keep @lid
-
-            chat_id = self._format_chat_id(chat_id)
-
-            payload = {
-                "chatId": chat_id,
-                "contentType": "MessageMediaDocument",
-                "content": file_url
-            }
-            if filename: payload["filename"] = filename
-            if caption: payload["caption"] = caption
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{self.base_url}/client/sendMessage/{session_id}", 
-                    json=payload, 
-                    headers=self._get_headers()
-                )
-                response.raise_for_status()
-                return {"success": True, "session_id": session_id, "file_url": file_url, "data": response.json()}
-        except Exception as e:
-            logger.error(f"Failed to send file message: {e}")
-            raise Exception(f"File message sending failed: {str(e)}")
-
+        
     async def get_client_class_info(self, session_id: str) -> Dict[str, Any]:
         """
         Get client class information including phone number for authenticated session

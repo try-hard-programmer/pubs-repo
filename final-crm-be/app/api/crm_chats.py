@@ -29,7 +29,6 @@ from app.services.websocket_service import get_connection_manager
 from app.config import settings as app_settings
 from app.services.webhook_callback_service import get_webhook_callback_service
 from app.services.ticket_service import get_ticket_service
-from app.models.ticket import ActorType
 from app.services.redis_service import acquire_lock
 
 logger = logging.getLogger(__name__)
@@ -150,7 +149,6 @@ async def send_message_via_channel(
             # Priority: Metadata LID > Phone > Metadata ID
             metadata = customer_data.get("metadata", {}) or {}
             target = metadata.get("whatsapp_lid") or customer_data.get("phone") or metadata.get("whatsapp_id")
-            
             if not target: return {"success": False, "message": "No target ID"}
             
             final_target = str(target).strip()
@@ -205,6 +203,7 @@ async def send_message_via_channel(
     except Exception as e:
         logger.error(f"Send Error: {e}")
         return {"success": False, "message": str(e)}
+                    
                     
 def _extract_attachment(metadata: Dict[str, Any]) -> Optional[MessageAttachment]:
     """Helper to extract attachment data from metadata"""
@@ -1592,16 +1591,6 @@ async def create_message(
                             display_name = last_meta.get("real_contact_number")
 
                         if target_id:
-                            # 1. Add ID to metadata (CRITICAL for WhatsApp API)
-                            msg_metadata["mentions"] = [target_id]
-                            
-                            # # 2. Prepend @Name to text (CRITICAL for Visuals)
-                            # safe_label = str(display_name).replace("@", "").strip()
-                            
-                            # if f"@{safe_label}" not in content:
-                            #     content = f"@{safe_label} {content}"
-                            #     logger.info(f"✅ Auto-mentioned: @{safe_label}")
-
                             # 1. Add ID to metadata (for WhatsApp API)
                             msg_metadata["mentions"] = [target_id]
                             
@@ -1673,9 +1662,6 @@ async def create_message(
         
         logger.info(f"Message created in chat {chat_id}")
 
-        # ============================================
-        # 3. SEND EXTERNAL
-        # ============================================
         if sender_type in ["agent", "ai", "human"]:
             try:
                 cust_data = supabase.table("customers").select("*").eq("id", chat_data["customer_id"]).single().execute()
@@ -1717,7 +1703,7 @@ async def create_message(
                     message_id=created_message["id"],
                     customer_id=ws_cust_id,
                     customer_name=broadcast_name, 
-                    message_content=created_message.get("content", ""), 
+                    message_content=created_message.get("content", ""),
                     channel=chat_data.get("channel"),
                     handled_by=chat_data.get("handled_by"),
                     sender_type=sender_type,

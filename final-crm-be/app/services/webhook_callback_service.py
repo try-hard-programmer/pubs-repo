@@ -4,7 +4,7 @@ Sends webhook callbacks to external WhatsApp/Telegram/Email services
 """
 import logging
 import os
-import json
+
 import httpx
 import re
 from typing import Dict, Any, Optional
@@ -147,40 +147,33 @@ class WebhookCallbackService:
                 "content": message_content
             }
 
-            # [FIX] GROUP MENTION LOGIC - Use Customer Metadata
+            # [FIX] GROUP MENTION LOGIC
             if "@g.us" in chat_id:
                 try:
-                    # Get customer metadata (has real_number and is_group)
-                    cust_meta_res = supabase.table("customers") \
+                    # Fetch the very last incoming message from the CUSTOMER in this chat
+                    last_msg = supabase.table("messages") \
                         .select("metadata") \
-                        .eq("id", customer_id) \
-                        .single() \
+                        .eq("chat_id", chat["id"]) \
+                        .eq("sender_type", "customer") \
+                        .order("created_at", desc=True) \
+                        .limit(1) \
                         .execute()
-                    
-                    customer_id = chat.get("customer_id")
-                    if not customer_id: raise Exception("Missing customer_id")
 
-                    
-                    if cust_meta_res.data:
-                        cust_meta = cust_meta_res.data.get("metadata", {})
-                        if isinstance(cust_meta, str):
-                            cust_meta = json.loads(cust_meta)
+                    if last_msg.data:
+                        meta = last_msg.data[0].get("metadata", {})
+                        participant = meta.get("group_participant") or meta.get("original_sender_id")
                         
-                        # Only add mention if it's a group
-                        if cust_meta.get("is_group"):
-                            real_number = cust_meta.get("real_number")
+                        if participant:
+                            # [CRITICAL FIX] Prepend "@User" to the text.
+                            # WhatsApp needs the text to contain the tag to highlight it.
+                            user_tag = participant.split('@')[0]
+                            payload["content"] = f"@{user_tag} {message_content}"
                             
-                            if real_number:
-                                # Format: just the number for text, full ID for mentions array
-                                mention_tag = str(real_number).split('@')[0]
-                                mention_id = f"{mention_tag}@lid" if mention_tag.isdigit() and len(mention_tag) > 10 else f"{mention_tag}@c.us"
-                                
-                                payload["content"] = f"@{mention_tag} {message_content}"
-                                payload["options"] = {"mentions": [mention_id]}
-                                logger.info(f"🏷️ Auto-Mentioning: @{mention_tag}")
+                            # Add to payload options
+                            payload["options"] = { "mentions": [participant] }
+                            logger.info(f"🏷️  Auto-Mentioning Participant: {participant}")
                 except Exception as ex:
                     logger.warning(f"⚠️ Failed to resolve mention for group: {ex}")
-
 
             base_url = settings.WHATSAPP_API_URL
             if not base_url: return {"success": False, "reason": "api_url_not_configured"}
@@ -203,7 +196,7 @@ class WebhookCallbackService:
             logger.error(f"❌ WhatsApp message send failed: {e}")
             return {"success": False, "reason": "error", "error": str(e)}
         
-    # [CRITICAL FIX] Added media_url argument
+    # [CRITICAL FIX] Added media_url argument AND Mention Logic
     async def send_telegram_callback(self, chat: Dict[str, Any], message_content: str, supabase, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:
             logger.info(f"✈️ Processing Telegram callback for chat: {chat['id']}")
@@ -222,6 +215,51 @@ class WebhookCallbackService:
             
             if not target_id: raise Exception("No Target ID found")
 
+            # ==============================================================================
+            # [START] GROUP MENTION LOGIC (The Missing Piece)
+            # ==============================================================================
+            if str(target_id).startswith("-"):
+                logger.info(f"🔍 Group Detected ({target_id}). Finding user to mention...")
+                try:
+                    # 1. Find the last message sent by a CUSTOMER in this chat
+                    last_msg_res = supabase.table("messages") \
+                        .select("metadata") \
+                        .eq("chat_id", chat["id"]) \
+                        .eq("sender_type", "customer") \
+                        .order("created_at", desc=True) \
+                        .limit(1) \
+                        .execute()
+
+                    if last_msg_res.data:
+                        meta = last_msg_res.data[0].get("metadata", {})
+                        
+                        # 2. Extract the specific User ID to tag
+                        # We check 'telegram_sender_id' (set by webhook.py) or fallbacks
+                        user_id_to_tag = meta.get("telegram_sender_id") or \
+                                         meta.get("participant") or \
+                                         meta.get("sender_id")
+
+                        if user_id_to_tag:
+                            clean_uid = str(user_id_to_tag).split('@')[0]
+                            display_name = meta.get("sender_display_name") or "User"
+                            
+                            # 3. Format: [Name](tg://user?id=123456)
+                            mention_string = f"[{display_name}](tg://user?id={clean_uid})"
+                            
+                            # 4. Prepend to the message
+                            message_content = f"{mention_string} {message_content}"
+                            logger.info(f"✅ Auto-Mention Applied: {mention_string}")
+                        else:
+                            logger.warning(f"⚠️ Found message but no ID to tag. Meta keys: {meta.keys()}")
+                    else:
+                        logger.warning("⚠️ No customer message found to reply to.")
+
+                except Exception as ex:
+                    logger.error(f"❌ Mention Logic Failed: {ex}", exc_info=True)
+            # ==============================================================================
+            # [END] GROUP MENTION LOGIC
+            # ==============================================================================
+
             sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
             
             # Userbot Logic
@@ -229,13 +267,13 @@ class WebhookCallbackService:
                 agent_id=sender_agent_id, 
                 telegram_id=target_id, 
                 message_content=message_content,
-                media_url=media_url # <--- Passing it to the worker
+                media_url=media_url
             )
 
         except Exception as e:
             logger.error(f"❌ Telegram callback failed: {e}")
             return {"success": False, "error": str(e)}
-    
+        
     # [CRITICAL FIX] Added media_url argument and payload inclusion
     async def send_telegram_userbot_callback(self, agent_id: str, telegram_id: str, message_content: str, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:

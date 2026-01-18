@@ -5,6 +5,7 @@ from src.database import db
 from src.services.webhook_sender import forward_to_main_service
 
 logger = logging.getLogger(__name__)
+
 async def handle_incoming_message(message_data: dict) -> None:
     """
     1. Save to SQLite (Local History)
@@ -31,11 +32,13 @@ async def handle_incoming_message(message_data: dict) -> None:
         
         # --- 2. Prepare Payload (The "Translation" Step) ---
         
-        # [FIX] Determine Author vs Chat
-        # If message_data has a specific 'sender_id', use it as author.
-        # Otherwise, fall back to 'chat_id' (typical for DMs).
         chat_id = str(message_data["chat_id"])
         sender_id = str(message_data.get("sender_id", chat_id))
+        is_group = message_data.get("is_group", False)
+        is_mentioned = message_data.get("mentioned", False) # [FIX] Read the flag
+
+        # LOGGING (Per your rule)
+        logger.info(f"🚀 Forwarding Payload: Group={is_group} | Mentioned={is_mentioned} | From={sender_id}")
 
         payload = {
             "dataType": "message",
@@ -44,12 +47,13 @@ async def handle_incoming_message(message_data: dict) -> None:
                 "message": {
                     "_data": {
                         "body": message_data["text"],
-                        
-                        # [FIX] 'from' is the Chat/Group ID (The "Customer" entity)
-                        "from": chat_id,
-                        
-                        # [FIX] 'author' is the specific User ID (Who said it)
+                        "from": sender_id, # User ID
+                        "to": chat_id,     # Group ID
                         "author": sender_id,
+                        
+                        # [CRITICAL FIX] Pass these flags to Backend
+                        "is_group": is_group,
+                        "mentioned": is_mentioned, 
                         
                         "notifyName": message_data.get("sender_name", "Unknown"),
                         "type": "chat",
@@ -57,7 +61,7 @@ async def handle_incoming_message(message_data: dict) -> None:
                         "id": {
                             "fromMe": False,
                             "id": str(message_data["message_id"]),
-                            "remote": chat_id
+                            "remote": chat_id 
                         },
                         "phone": str(message_data.get("customer_data", {}).get("phone", ""))
                     }
@@ -70,5 +74,3 @@ async def handle_incoming_message(message_data: dict) -> None:
 
     except Exception as e:
         logger.error(f"Error handling incoming message: {e}", exc_info=True)
-
-        

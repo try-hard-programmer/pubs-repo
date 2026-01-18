@@ -30,7 +30,6 @@ from app.services.agent_finder_service import get_agent_finder_service
 from app.services.websocket_service import get_connection_manager
 
 from app.config import settings as app_settings
-from app.models.webhook import WhatsAppUnofficialWebhookMessage, WebhookRouteResponse, WhatsAppEventPayload
 from app.models.ticket import TicketCreate, ActorType, TicketPriority, TicketDecision
 from app.services.ticket_service import get_ticket_service
 from app.api.crm_chats import send_message_via_channel
@@ -1016,7 +1015,8 @@ async def telegram_userbot_webhook(
         raw_to = str(data_content.get("to", ""))
         
         # Check flags passed by listener.py
-        is_group_tele = data_content.get("is_group") or (raw_to != str(agent_id) and raw_to != "")
+        # is_group_tele = data_content.get("is_group") or (raw_to != str(agent_id) and raw_to != "")
+        is_group_tele = data_content.get("is_group", False)
         is_mentioned = data_content.get("mentioned", False)
         
         # 6. Group Filtering Logic
@@ -1026,10 +1026,13 @@ async def telegram_userbot_webhook(
         if is_group_tele:
             # STRICT FILTER: Must be mentioned
             if not is_mentioned:
+                # Log it so we know WHY it was dropped
+                logger.info(f"🚫 Ignoring Group Msg in {raw_to} (No Mention)")
                 return JSONResponse(content={"success": True, "status": "ignored_group_no_mention"})
             
-            # Contact becomes the Group ID
-            contact_target = raw_to 
+            # In Groups, the "Contact" is the Group ID
+            # In DMs, the "Contact" is the User ID (sender_id)
+            contact_target = str(data_content.get("to", "")) 
             participant_id = sender_id
             logger.info(f"🔔 Telegram Group Mention in {contact_target} by {sender_id}")
 
