@@ -7,6 +7,7 @@ import os
 
 import httpx
 import re
+import json
 from typing import Dict, Any, Optional
 from datetime import datetime
 from app.config.settings import settings
@@ -71,20 +72,22 @@ class WebhookCallbackService:
     def _format_whatsapp_chat_id(self, phone: str) -> str:
         """
         Format phone number to WhatsApp chatId format.
+        [FIX] Improved detection: Long numbers (>15 digits) are Groups.
         """
-        # FIX: If the phone number already contains an '@' (like @lid, @g.us, or existing @c.us),
-        # return it as is. Do not append another suffix.
+        # 1. Trust existing suffixes
         if "@" in phone:
             return phone
 
-        # Common country codes pattern (1-3 digits)
+        # 2. [FIX] Heuristic: Group IDs are usually long (18+ digits)
+        if len(phone) > 15:
+            return f"{phone}@g.us"
+
+        # 3. Standard Regex for Country Codes
         country_code_pattern = r'^(1|7|2[0-7]|3[0-9]|4[0-4]|4[6-9]|5[1-8]|6[0-6]|8[1-6]|9[0-8])'
 
         if re.match(country_code_pattern, phone):
-            # Personal chat
             return f"{phone}@c.us"
         else:
-            # Group chat (fallback if no suffix found and doesn't look like international number)
             return f"{phone}@g.us"
         
     async def _ensure_chat_data(self, chat: Dict[str, Any], supabase) -> Dict[str, Any]:
@@ -138,6 +141,17 @@ class WebhookCallbackService:
             normalized_phone = self._normalize_phone_number(raw_phone)
             chat_id = self._format_whatsapp_chat_id(normalized_phone)
 
+            # [FIX] Force @g.us if metadata or name indicates it's a group
+            # This prevents the "Ghost DM" bug if the regex failed.
+            chat_meta = chat.get("metadata", {}) or {}
+            is_known_group = chat_meta.get("is_group") or "group" in str(chat.get("name", "")).lower()
+            
+            if is_known_group:
+                if "@c.us" in chat_id:
+                    chat_id = chat_id.replace("@c.us", "@g.us")
+                elif "@" not in chat_id:
+                    chat_id = f"{normalized_phone}@g.us"
+
             sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
             
             # Base Payload
@@ -150,7 +164,7 @@ class WebhookCallbackService:
             # [FIX] GROUP MENTION LOGIC
             if "@g.us" in chat_id:
                 try:
-                    # Fetch the very last incoming message from the CUSTOMER in this chat
+                    # Fetch the very last incoming message from the CUSTOMER
                     last_msg = supabase.table("messages") \
                         .select("metadata") \
                         .eq("chat_id", chat["id"]) \
@@ -161,11 +175,16 @@ class WebhookCallbackService:
 
                     if last_msg.data:
                         meta = last_msg.data[0].get("metadata", {})
-                        participant = meta.get("group_participant") or meta.get("original_sender_id")
+                        
+                        # [FIX] Prioritize 'original_sender_id' (Full ID) over 'group_participant'
+                        participant = meta.get("original_sender_id") or meta.get("group_participant")
                         
                         if participant:
-                            # [CRITICAL FIX] Prepend "@User" to the text.
-                            # WhatsApp needs the text to contain the tag to highlight it.
+                            # [CRITICAL] Ensure suffix exists. API requires '123@c.us', not just '123'
+                            if "@" not in participant:
+                                participant = f"{participant}@c.us"
+
+                            # Prepend "@User" to the text for highlighting
                             user_tag = participant.split('@')[0]
                             payload["content"] = f"@{user_tag} {message_content}"
                             

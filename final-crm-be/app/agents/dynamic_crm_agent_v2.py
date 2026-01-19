@@ -81,18 +81,16 @@ class DynamicCRMAgentV2:
                 system_prompt += f"MUST FOLLOWING THIS INSTRUCTIONS:\n{custom_instructions}\n\n"
 
             system_prompt += (
-                f"STRICT KNOWLEDGE BOUNDARIES:\n"
-                f"1. You are a CLOSED-DOMAIN agent. NO outside knowledge allowed.\n"
-                f"2. You MUST answer using ONLY the 'CONTEXT' below.\n"
-                f"3. If the CONTEXT is empty or does not contain the answer, say: 'Maaf, saya tidak memiliki informasi mengenai hal tersebut.'\n"
-                f"4. NEVER invent, assume, or guess information not in CONTEXT.\n\n"
-                f"CONTEXT (SOURCE OF TRUTH):\n"
-                f"###\n{rag_context if rag_context else '[NO RELEVANT INFORMATION FOUND]'}\n###\n\n"
-                f"FINAL GUIDELINES:\n"
-                f"- Address customer as '{name_user}'.\n"
-                f"- Always respond to the customer's LAST message only.\n"
-                f"- If the last message is an acknowledgment or thank you, respond briefly and ask if they need anything else.\n"
-                f"- Do NOT repeat previous answers.\n"
+                f"KNOWLEDGE BASE:\n"
+                f"You have access to the following information from the knowledge base:\n\n"
+                f"###\n{rag_context}\n###\n\n"
+                f"GUIDELINES:\n"
+                f"1. Answer questions using the knowledge base above as your primary source.\n"
+                f"2. If the knowledge base contains the answer, provide it clearly and helpfully.\n"
+                f"3. If the knowledge base doesn't contain specific details, politely say you don't have that exact information and offer to help with related topics you DO know about.\n"
+                f"4. For greetings, thank yous, or simple acknowledgments, respond naturally without needing knowledge base info.\n"
+                f"5. Be conversational and helpful - don't sound robotic.\n"
+                f"6. Address the customer as '{name_user}' when appropriate (not every message, just naturally).\n\n"
             )
             
             # 4. BUILD MESSAGE CHAIN (TEXT ONLY - Images go in files array)

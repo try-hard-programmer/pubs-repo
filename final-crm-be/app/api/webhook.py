@@ -520,22 +520,16 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         real_sender_name = real_number
         
     # [FIX] Logic for "Customer Name"
-    # For Groups, the "Customer" is the Group itself. 
     if "@g.us" in chat_id:
-        # 1. Get Group Name
         group_subject = (
             identity_source.get("chat", {}).get("name") or 
             identity_source.get("groupInfo", {}).get("subject") or
             wrapper.get("chat", {}).get("name")
         )
-        
-        # [FIX] Clean "Group g.us" - Use Sender Name if Subject is Bad
         if not group_subject or "@g.us" in str(group_subject):
             group_subject = f"{real_sender_name}"
-            
         final_customer_name = group_subject
     else:
-        # For DMs, "Customer Name" is the Sender
         final_customer_name = real_sender_name
     
     msg_id = identity_source.get("id", {}).get("id") if isinstance(identity_source.get("id"), dict) else None
@@ -567,9 +561,13 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         metadata={
             "session_id": unofficial.sessionId,
             "is_group": "@g.us" in chat_id,
-            "group_participant": sender_clean if "@g.us" in chat_id else None,
-            "real_contact_number": real_number,    # Capture Real Number (Raw LID for now)
-            "real_sender_name": real_sender_name,  # Capture Specific Sender Name
+            
+            # [CRITICAL FIX] Use sender_id (FULL ID) instead of sender_clean
+            # This ensures we store '628123...@c.us' so we can mention them back later.
+            "group_participant": sender_id if "@g.us" in chat_id else None,
+            
+            "real_contact_number": real_number,
+            "real_sender_name": real_sender_name,
             "notifyName": real_sender_name,
             "pushName": real_sender_name,
             "original_sender_id": sender_id,

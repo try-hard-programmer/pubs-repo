@@ -176,12 +176,10 @@ async def send_message_via_channel(
                     )
                 else:
                     # [FIX] Text Sending with Mentions
-                    final_content = msg_meta.get("content_for_api") or message_content
-
                     res = await svc.send_text_message(
                         session_id=sender_id, 
-                        phone_number=final_target,   # ← The phone/group ID
-                        message=final_content,       # ← The message text
+                        phone_number=final_target, 
+                        message=message_content,
                         mentions=mentions_list # <--- Payload Passed Here
                     )
                 
@@ -1591,14 +1589,21 @@ async def create_message(
                             display_name = last_meta.get("real_contact_number")
 
                         if target_id:
-                            # 1. Add ID to metadata (for WhatsApp API)
+                            # 1. Add ID to metadata (CRITICAL for WhatsApp API)
                             msg_metadata["mentions"] = [target_id]
                             
-                            # 2. Build mention text for API only (NOT for DB)
-                            mention_tag = target_id.split('@')[0]
-                            msg_metadata["content_for_api"] = f"@{mention_tag} {content}"
+                            # # 2. Prepend @Name to text (CRITICAL for Visuals)
+                            # safe_label = str(display_name).replace("@", "").strip()
                             
-                            logger.info(f"✅ Auto-mention prepared for API: @{mention_tag}")
+                            # if f"@{safe_label}" not in content:
+                            #     content = f"@{safe_label} {content}"
+                            #     logger.info(f"✅ Auto-mentioned: @{safe_label}")
+
+                            mention_tag = target_id.split('@')[0]
+    
+                            if f"@{mention_tag}" not in content:
+                                content = f"@{mention_tag} {content}"
+                                logger.info(f"✅ Auto-mentioned: @{mention_tag} (Display: {display_name})")
                                 
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to auto-mention in group: {e}")
