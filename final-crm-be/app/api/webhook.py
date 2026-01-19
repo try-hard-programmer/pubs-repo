@@ -520,16 +520,22 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         real_sender_name = real_number
         
     # [FIX] Logic for "Customer Name"
+    # For Groups, the "Customer" is the Group itself. 
     if "@g.us" in chat_id:
+        # 1. Get Group Name
         group_subject = (
             identity_source.get("chat", {}).get("name") or 
             identity_source.get("groupInfo", {}).get("subject") or
             wrapper.get("chat", {}).get("name")
         )
+        
+        # [FIX] Clean "Group g.us" - Use Sender Name if Subject is Bad
         if not group_subject or "@g.us" in str(group_subject):
             group_subject = f"{real_sender_name}"
+            
         final_customer_name = group_subject
     else:
+        # For DMs, "Customer Name" is the Sender
         final_customer_name = real_sender_name
     
     msg_id = identity_source.get("id", {}).get("id") if isinstance(identity_source.get("id"), dict) else None
@@ -561,13 +567,9 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         metadata={
             "session_id": unofficial.sessionId,
             "is_group": "@g.us" in chat_id,
-            
-            # [CRITICAL FIX] Use sender_id (FULL ID) instead of sender_clean
-            # This ensures we store '628123...@c.us' so we can mention them back later.
-            "group_participant": sender_id if "@g.us" in chat_id else None,
-            
-            "real_contact_number": real_number,
-            "real_sender_name": real_sender_name,
+            "group_participant": sender_clean if "@g.us" in chat_id else None,
+            "real_contact_number": real_number,    # Capture Real Number (Raw LID for now)
+            "real_sender_name": real_sender_name,  # Capture Specific Sender Name
             "notifyName": real_sender_name,
             "pushName": real_sender_name,
             "original_sender_id": sender_id,
@@ -777,240 +779,217 @@ async def process_webhook_message_v2(
 # 2. WHATSAPP UNOFFICIAL WEBHOOK (Updated)
 # ============================================
 
-@router.post(
-    "/wa-unofficial",
-    response_model=WebhookRouteResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Receive WhatsApp message (Unofficial API)"
-)
-async def whatsapp_unofficial_webhook(
-    message: WhatsAppUnofficialWebhookMessage,
-    secret: str = Depends(get_webhook_secret)
-):
+@router.post("/wa-unofficial", response_model=WebhookRouteResponse)
+async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage, secret: str = Depends(get_webhook_secret)):
+    # [FIX] Import re at the very top of function to prevent UnboundLocalError
+    import re 
+    
     try:
         supabase = get_supabase_client()
         agent_id = message.sessionId
 
-        # System Events
+        # 1. System Events
         system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
         if message.dataType in system_events:
-            agent_res = supabase.table("agents").select("organization_id").eq("id", agent_id).execute()
-            if agent_res.data and app_settings.WEBSOCKET_ENABLED:
-                org_id = agent_res.data[0]["organization_id"]
-                await get_connection_manager().broadcast_to_organization(
-                    message={"type": "whatsapp_status_update", "data": {"agent_id": agent_id, "status": message.dataType}},
-                    organization_id=org_id
-                )
             return JSONResponse(content={"success": True, "status": "processed_system_event"})
 
-        # Structure Check
+        # 2. Structure & Dedup
         data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
         data_content = data_wrapper.get("_data", {}) or data_wrapper 
-        whatsapp_id = data_content.get("id", {}).get("id")
-        if not whatsapp_id:
-             whatsapp_id = message.data.get("id", {}).get("id")
+        whatsapp_id = data_content.get("id", {}).get("id") or message.data.get("id", {}).get("id")
 
         if not whatsapp_id and message.dataType not in ["ready", "authenticated"]:
              return JSONResponse(content={"status": "ignored", "reason": "malformed_structure"})
-
-        if data_content.get("isStatus") is True or data_content.get("isNotification") is True:
-             return JSONResponse(content={"status": "ignored", "reason": "status_broadcast"})
         
         if data_content.get("id", {}).get("fromMe", False) or data_content.get("fromMe", False):
              return JSONResponse(content={"status": "ignored", "reason": "from_me"})
 
-        # Content Check
-        msg_body = data_content.get("body", "")
-        has_media = message.dataType == "media" or data_content.get("mimetype") or message.data.get("mimetype")
-
-        if not str(msg_body).strip() and not has_media:
-            return JSONResponse(content={"status": "ignored", "reason": "zero_information_payload"})
-
-        # Redis Dedup
         dedup_key = f"{whatsapp_id}_{message.dataType}"
         if await is_duplicate_message(dedup_key):
             return JSONResponse(content={"status": "ignored", "reason": "duplicate_redis_cache"})
 
-        if message.dataType != "media":
-            existing = supabase.table("messages").select("id").eq("metadata->>whatsapp_message_id", whatsapp_id).execute()
-            if existing.data:
-                return JSONResponse(content={"status": "ignored", "reason": "duplicate_db"})
-
-        # Agent Verify
+        # 3. Agent Verify
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data: 
-            return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
+        if not agent_res.data: return JSONResponse(status_code=200, content={"status": "error", "message": "Agent not found"})
         agent = agent_res.data[0]
-
-        integration_res = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel", "whatsapp").execute()
-        if not integration_res.data or integration_res.data[0].get("enabled") is False:
-            return JSONResponse(content={"status": "ignored", "reason": "integration_disabled"})
-
+        
         settings_data = await fetch_agent_settings(supabase, agent_id)
         if settings_data: agent.update(settings_data)
 
-        # -------------------------------------------------------------
-        # 1. STANDARDIZE & GROUP CHECK
-        # -------------------------------------------------------------
+        # 3.5 PRE-FLIGHT CHECK
+        raw_chat_id = data_content.get("id", {}).get("remote") or data_content.get("from", "")
+        is_group_raw = "@g.us" in str(raw_chat_id)
+
+        potential_ids = set()
+        if agent.get("phone"):
+            intl_phone = str(agent.get("phone")).replace("+", "").replace("-", "").strip()
+            potential_ids.add(intl_phone)
+            if intl_phone.startswith("62"):
+                potential_ids.add("0" + intl_phone[2:]) 
+        
+        potential_ids.add(_extract_phone_number(agent_id))
+        raw_me = message.data.get("me", {})
+        if raw_me.get("wid"): potential_ids.add(_extract_phone_number(raw_me["wid"]))
+        if raw_me.get("lid"): potential_ids.add(_extract_phone_number(raw_me["lid"]))
+        if raw_me.get("user"): potential_ids.add(_extract_phone_number(raw_me["user"]))
+        
+        agent_name = agent.get("name")
+        pushname = raw_me.get("pushname")
+
+        if is_group_raw:
+            is_mentioned_raw = False
+            raw_mentions = data_content.get("mentionedJidList", [])
+            for m in raw_mentions:
+                if any(pid in str(m) for pid in potential_ids):
+                    is_mentioned_raw = True
+                    break
+            
+            if not is_mentioned_raw:
+                raw_caption = data_content.get("caption", "")
+                raw_body = data_content.get("body", "")
+                raw_text = raw_caption if raw_caption else (raw_body if len(str(raw_body)) < 1000 else "")
+                
+                for my_id in potential_ids:
+                    if f"@{my_id}" in raw_text: is_mentioned_raw = True; break
+                
+                if not is_mentioned_raw:
+                    if pushname and f"@{pushname}" in raw_text: is_mentioned_raw = True
+                    elif agent_name and f"@{agent_name}" in raw_text: is_mentioned_raw = True
+
+                if not is_mentioned_raw:
+                    number_matches = re.findall(r"@\s?(\d{10,20})", raw_text)
+                    for detected_num in number_matches:
+                        try:
+                            if detected_num in potential_ids: is_mentioned_raw = True; break
+                            suffix = "@lid" if detected_num.startswith("2") else "@c.us"
+                            resolved = await resolve_lid_to_real_number(f"{detected_num}{suffix}", agent_id, "whatsapp", supabase)
+                            clean_resolved = _extract_phone_number(resolved)
+                            if clean_resolved in potential_ids: is_mentioned_raw = True; break
+                        except: pass
+
+            if not is_mentioned_raw:
+                return JSONResponse(content={"status": "ignored", "reason": "group_no_mention_preflight"})
+
+        # 4. Standardize
         standard_message = await _convert_unofficial_to_standard(message)
         meta = standard_message.metadata
         is_group = meta.get("is_group", False)
 
-        # -------------------------------------------------------------
-        # 2. GROUP MENTION FILTER
-        # -------------------------------------------------------------
+        if agent.get("phone"):
+            agent_phone_clean = str(agent.get("phone")).replace("+", "").replace("-", "").strip()
+            sender_num = standard_message.phone_number.split("@")[0]
+            if sender_num == agent_phone_clean or ("0" + sender_num[2:]) == agent_phone_clean:
+                return JSONResponse(content={"status": "ignored", "reason": "loop_protection"})
+
+        # 5. POST-STANDARD CLEANUP
+        final_content = standard_message.message or ""
+        if pushname and f"@{pushname}" in final_content:
+            final_content = final_content.replace(f"@{pushname}", "").strip()
+        if agent_name and f"@{agent_name}" in final_content:
+            final_content = final_content.replace(f"@{agent_name}", "").strip()
         if is_group:
-            potential_ids = set()
-            if agent.get("phone"):
-                potential_ids.add(str(agent.get("phone")).replace("+", "").strip())
-            potential_ids.add(_extract_phone_number(agent_id))
-            
-            raw_me = message.data.get("me", {})
-            if raw_me.get("wid"): potential_ids.add(_extract_phone_number(raw_me["wid"]))
-            if raw_me.get("lid"): potential_ids.add(_extract_phone_number(raw_me["lid"]))
-            pushname = raw_me.get("pushname")
-
-            mentions = meta.get("mentioned_ids", [])
-            is_mentioned = False
-            
             for my_id in potential_ids:
-                if any(my_id in str(m) for m in mentions):
-                    is_mentioned = True
-                    break
-            
-            final_content = standard_message.message or ""
-            if not is_mentioned and final_content:
-                for my_id in potential_ids:
-                    if f"@{my_id}" in final_content:
-                        is_mentioned = True
-                        final_content = final_content.replace(f"@{my_id}", "").strip()
-                        break
-                
-                if not is_mentioned and pushname and f"@{pushname}" in final_content:
-                    is_mentioned = True
-                    final_content = final_content.replace(f"@{pushname}", "").strip()
+                if f"@{my_id}" in final_content: final_content = final_content.replace(f"@{my_id}", "").strip()
 
-                if not is_mentioned:
-                    import re
-                    # Find any LID-like pattern (starts with 2, 10-17 digits)
-                    lid_matches = re.findall(r"@\s?(2\d{10,17})", final_content)
-                    if lid_matches:
-                        detected_lid = lid_matches[0]
-                        
-                        # [FIX] Check if the mentioned LID is actually THIS Agent
-                        if detected_lid in potential_ids:
-                            is_mentioned = True
-                            final_content = re.sub(r"@\s?" + detected_lid, "", final_content).strip()
-                            logger.info(f"🦸‍♂️ Heuristic Match: Found MY LID @{detected_lid}. Stripped & Processing.")
-                        else:
-                            # Mention found, but it wasn't for me. Explicitly ignore.
-                            return JSONResponse(content={"status": "ignored", "reason": "group_mention_not_for_me"})
+        number_matches = re.findall(r"@\s?(\d{10,20})", final_content)
+        for detected_num in number_matches:
+             final_content = re.sub(r"@\s?" + detected_num, "", final_content).strip()
+        
+        standard_message.message = final_content
 
-            if not is_mentioned:
-                return JSONResponse(content={"status": "ignored", "reason": "group_no_mention"})
-            
-            standard_message.message = final_content
-
-        # -------------------------------------------------------------
-        # 3. ZOMBIE CHECK (Ignore old messages)
-        # -------------------------------------------------------------
+        # 6. Zombie Check
         if standard_message.timestamp:
             try:
                 msg_time = datetime.fromisoformat(standard_message.timestamp)
                 if msg_time.tzinfo is None: msg_time = msg_time.replace(tzinfo=timezone.utc)
-                age_seconds = (datetime.now(timezone.utc) - msg_time).total_seconds()
-                if age_seconds > 120:
+                if (datetime.now(timezone.utc) - msg_time).total_seconds() > 300:
                     return JSONResponse(content={"status": "ignored", "reason": "too_old"})
             except Exception: pass
 
-        # -------------------------------------------------------------
-        # 4. RESOLVE IDENTITY & PREPARE CONTEXT
-        # -------------------------------------------------------------
+        # 7. Sender Resolution
         contact_id = standard_message.phone_number
         final_participant_number = meta.get("real_contact_number")
 
-        # [SAFE MODE] Only resolve LID for DM, NOT for Groups (to prevent Node crash)
         if not is_group:
             contact_id = await resolve_lid_to_real_number(standard_message.phone_number, agent_id, "whatsapp", supabase)
             final_participant_number = contact_id
-        
-        sender_name = standard_message.sender_name
-        if sender_name and ("@lid" in sender_name or not sender_name.strip()):
-             sender_name = contact_id
-
-        if "@c.us" in contact_id: 
-            contact_id = contact_id.split("@")[0]
-        
-        # [FIX] Always use the raw message content. 
-        # We do NOT prepend "Sender Name:" anymore to prevent double headers.
-        final_message_content = standard_message.message
-        
-        if is_group:
+        else:
             raw_participant = meta.get("group_participant", "")
-            participant_id = raw_participant.split("@")[0]
-            
-            # [FIXED] Now that Node.js is stable, we resolve the Real Number for Group Participants
-            if raw_participant and "@lid" in raw_participant:
+            is_potential_lid = raw_participant and (str(raw_participant).isdigit() and len(str(raw_participant)) >= 10)
+            if is_potential_lid or "@lid" in str(raw_participant):
                 try:
-                    real_phone = await resolve_lid_to_real_number(raw_participant, agent_id, "whatsapp", supabase)
-                    if real_phone and "@" in real_phone:
-                        # Update the participant ID to the Real Phone Number (e.g. 62812...@c.us)
+                    lid_to_resolve = raw_participant if "@" in str(raw_participant) else f"{raw_participant}@lid"
+                    real_phone = await resolve_lid_to_real_number(lid_to_resolve, agent_id, "whatsapp", supabase)
+                    if real_phone and "@" in real_phone and "lid" not in real_phone:
                         final_participant_number = real_phone.split("@")[0]
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to resolve Group Participant LID: {e}")
+                except Exception: pass
 
-        # -------------------------------------------------------------
-        # 6. EXECUTE PROCESSOR V2
-        # -------------------------------------------------------------
+        if "@c.us" in contact_id: contact_id = contact_id.split("@")[0]
+        sender_name = standard_message.sender_name or contact_id
+
+        # 8. Process Message
+        clean_metadata = standard_message.metadata.copy()
+        if "real_contact_number" in clean_metadata:
+            del clean_metadata["real_contact_number"]
+
+        # [DEBUG] TRACE GROUP STATUS
+        logger.info(f"🕵️ DEBUG: Processing Message for {contact_id}")
+        logger.info(f"🕵️ DEBUG: is_group detection = {is_group}")
+        logger.info(f"🕵️ DEBUG: Participant Number = {final_participant_number}")
+
+        # [FIX] SEGREGATE METADATA
+        # If Group: Customer Metadata = Group Info ONLY. Participant Info goes to Message Metadata.
+        cust_meta_update = {
+             **({"is_group": True} if is_group else {})
+        }
+
+        if not is_group:
+            # ONLY update Customer record with personal details if it's a DM
+            cust_meta_update["whatsapp_name"] = meta.get("real_sender_name")
+            cust_meta_update["real_number"] = final_participant_number
+            logger.info("🕵️ DEBUG: DM detected -> Updating Customer Identity")
+        else:
+            logger.info("🕵️ DEBUG: Group detected -> SKIPPING Customer Identity Update (Safe)")
+
+        logger.info(f"🕵️ DEBUG: Final Customer Meta Payload: {cust_meta_update}")
+        
+        # Message Metadata ALWAYS gets the specific sender info
+        msg_meta_update = {
+            **clean_metadata,
+            "whatsapp_message_id": standard_message.message_id,
+            "message_type": standard_message.message_type,
+            "timestamp": standard_message.timestamp,
+            "is_lid": "@lid" in standard_message.phone_number,
+            "media_url": standard_message.media_url,
+            "is_group": is_group,
+            "participant": meta.get("group_participant"), 
+            "sender_display_name": meta.get("real_sender_name"),
+            "real_contact_number": final_participant_number,
+        }
+
         result = await process_webhook_message_v2(
-            agent=agent,
-            channel="whatsapp",
-            contact=contact_id,
-            message_content=final_message_content, 
-            customer_name=sender_name or contact_id,
-            message_metadata={
-                "whatsapp_message_id": standard_message.message_id,
-                "message_type": standard_message.message_type,
-                "timestamp": standard_message.timestamp,
-                "is_lid": "@lid" in standard_message.phone_number,
-                "media_url": standard_message.media_url,
-                "is_group": is_group,
-                "participant": meta.get("group_participant"), 
-                "sender_display_name": meta.get("real_sender_name"),
-                **standard_message.metadata
-            },
-            customer_metadata={
-                "whatsapp_name": meta.get("real_sender_name"),
-                "real_number": final_participant_number,
-                **({"is_group": True} if is_group else {})
-            },
+            agent=agent, 
+            channel="whatsapp", 
+            contact=contact_id, 
+            message_content=standard_message.message, 
+            customer_name=sender_name,
+            message_metadata=msg_meta_update,
+            customer_metadata=cust_meta_update,
             supabase=supabase
         )
 
-        # [FIX] CRASH PREVENTION
-        # If the message was dropped (inactive/archived), result has no 'chat_id'.
-        # We must return early to prevent KeyError.
-        if result.get("status", "").startswith("dropped_"):
-            return JSONResponse(content={"success": True, "status": result["status"]})
-
-        # Normal Flow (Active/Busy)
         return WebhookRouteResponse(
-            success=True, 
-            chat_id=result["chat_id"], 
-            message_id=result["message_id"],
-            customer_id=result["customer_id"], 
-            is_new_chat=result["is_new_chat"],
-            was_reopened=result.get("was_reopened", False), 
-            handled_by=result["handled_by"],
-            status=result["status"], 
-            channel="whatsapp", 
-            message=_generate_status_message(result)
+            success=True, chat_id=result["chat_id"], message_id=result["message_id"],
+            customer_id=result["customer_id"], is_new_chat=result["is_new_chat"],
+            was_reopened=result.get("was_reopened", False), handled_by=result["handled_by"],
+            status=result["status"], channel="whatsapp", message=_generate_status_message(result)
         )
 
     except Exception as e:
         logger.error(f"❌ Unofficial Webhook Critical Error: {e}")
         return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
-         
+    
+
 # ============================================
 # 3. TELEGRAM USERBOT WEBHOOK (Updated)
 # ============================================
@@ -1059,33 +1038,62 @@ async def telegram_userbot_webhook(
         sender_id = str(data_content.get("from", ""))
         sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
         timestamp_unix = data_content.get("t")
-        
+
         is_group_tele = data_content.get("is_group", False)
         is_mentioned = data_content.get("mentioned", False)
         contact_target = sender_id 
         participant_id = None
-        
+
+        logger.info(f"🔍 TELEGRAM GROUP CHECK - is_group: {is_group_tele}, is_mentioned: {is_mentioned}")
+        logger.info(f"🔍 TELEGRAM GROUP CHECK - sender_id: {sender_id}, sender_name: {sender_display_name}")
+
         if is_group_tele:
+            logger.info(f"📱 TELEGRAM GROUP MESSAGE DETECTED")
+            logger.info(f"   - Group ID (to): {data_content.get('to', '')}")
+            logger.info(f"   - Participant (from): {sender_id}")
+            logger.info(f"   - Mentioned flag: {is_mentioned}")
+            logger.info(f"   - Full data_content keys: {list(data_content.keys())}")
+            
             if not is_mentioned:
+                logger.warning(f"❌ TELEGRAM GROUP IGNORED - No mention flag detected")
+                logger.warning(f"   - Sender: {sender_display_name} ({sender_id})")
+                logger.warning(f"   - Group: {data_content.get('to', '')}")
                 return JSONResponse(content={"success": True, "status": "ignored_group_no_mention"})
+            
+            logger.info(f"✅ TELEGRAM GROUP MENTION CONFIRMED")
             contact_target = str(data_content.get("to", "")) 
             participant_id = sender_id
+            logger.info(f"   - Contact target set to group: {contact_target}")
+            logger.info(f"   - Participant set to sender: {participant_id}")
 
         # 6. Phone Logic
         raw_phone = data_content.get("phone")
         final_phone = sender_id
+        logger.info(f"🔍 TELEGRAM PHONE CHECK - raw_phone: {raw_phone}")
+
         if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
             final_phone = str(raw_phone)
+            logger.info(f"✅ Using real phone number: {final_phone}")
+        else:
+            logger.info(f"⚠️ No valid phone, using sender_id: {final_phone}")
 
         # 7. Content Extraction
         message_text, msg_type, media_url = await _handle_message_content_for_telegram(
             content_source, 
             payload.dataType
         )
+
+        logger.info(f"📝 TELEGRAM MESSAGE CONTENT:")
+        logger.info(f"   - Type: {msg_type}")
+        logger.info(f"   - Text (before cleaning): '{message_text}'")
+        logger.info(f"   - Media URL: {media_url}")
         
         # 1. CLEAN TELEGRAM SPAM: Removes "[Account](tg://user?id=123)"
         if message_text:
+            original_text = message_text
             message_text = re.sub(r"\[.*?\]\(tg://user\?id=\d+\)\s*", "", message_text).strip()
+            if original_text != message_text:
+                logger.info(f"🧹 CLEANED mention spam: '{original_text}' → '{message_text}'")
 
         # 8. Prepare Metadata (URL is still saved here for the FE to render as an attachment)
         msg_meta = {

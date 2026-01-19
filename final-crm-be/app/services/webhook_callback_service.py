@@ -7,7 +7,6 @@ import os
 
 import httpx
 import re
-import json
 from typing import Dict, Any, Optional
 from datetime import datetime
 from app.config.settings import settings
@@ -72,22 +71,20 @@ class WebhookCallbackService:
     def _format_whatsapp_chat_id(self, phone: str) -> str:
         """
         Format phone number to WhatsApp chatId format.
-        [FIX] Improved detection: Long numbers (>15 digits) are Groups.
         """
-        # 1. Trust existing suffixes
+        # FIX: If the phone number already contains an '@' (like @lid, @g.us, or existing @c.us),
+        # return it as is. Do not append another suffix.
         if "@" in phone:
             return phone
 
-        # 2. [FIX] Heuristic: Group IDs are usually long (18+ digits)
-        if len(phone) > 15:
-            return f"{phone}@g.us"
-
-        # 3. Standard Regex for Country Codes
+        # Common country codes pattern (1-3 digits)
         country_code_pattern = r'^(1|7|2[0-7]|3[0-9]|4[0-4]|4[6-9]|5[1-8]|6[0-6]|8[1-6]|9[0-8])'
 
         if re.match(country_code_pattern, phone):
+            # Personal chat
             return f"{phone}@c.us"
         else:
+            # Group chat (fallback if no suffix found and doesn't look like international number)
             return f"{phone}@g.us"
         
     async def _ensure_chat_data(self, chat: Dict[str, Any], supabase) -> Dict[str, Any]:
@@ -141,30 +138,60 @@ class WebhookCallbackService:
             normalized_phone = self._normalize_phone_number(raw_phone)
             chat_id = self._format_whatsapp_chat_id(normalized_phone)
 
-            # [FIX] Force @g.us if metadata or name indicates it's a group
-            # This prevents the "Ghost DM" bug if the regex failed.
+            # Force @g.us if metadata or name indicates it's a group
             chat_meta = chat.get("metadata", {}) or {}
             is_known_group = chat_meta.get("is_group") or "group" in str(chat.get("name", "")).lower()
             
             if is_known_group:
-                if "@c.us" in chat_id:
-                    chat_id = chat_id.replace("@c.us", "@g.us")
-                elif "@" not in chat_id:
-                    chat_id = f"{normalized_phone}@g.us"
+                if "@c.us" in chat_id: chat_id = chat_id.replace("@c.us", "@g.us")
+                elif "@" not in chat_id: chat_id = f"{normalized_phone}@g.us"
 
             sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
             
-            # Base Payload
+            import re
+            lid_matches = re.findall(r"@\s?(2\d{10,17})", message_content)
+            clean_content = message_content
+            was_cleaned = False
+            
+            for detected_lid in lid_matches:
+                clean_content = re.sub(r"@\s?" + detected_lid, "", clean_content).strip()
+                was_cleaned = True
+            
+            if was_cleaned:
+                logger.info(f"🧹 Sanitized outgoing message: '{message_content}' -> '{clean_content}'")
+                try:
+                    # [IMPROVED DB FIX]
+                    # Fetch the latest message in this chat to update it.
+                    # We don't filter by content string to avoid mismatch issues.
+                    latest_msg = supabase.table("messages")\
+                        .select("id")\
+                        .eq("chat_id", chat["id"])\
+                        .order("created_at", desc=True)\
+                        .limit(1)\
+                        .execute()
+                        
+                    if latest_msg.data:
+                        msg_id = latest_msg.data[0]["id"]
+                        supabase.table("messages").update({"content": clean_content})\
+                            .eq("id", msg_id)\
+                            .execute()
+                        logger.info(f"✅ Updated DB Message {msg_id} with clean content")
+                except Exception as db_err:
+                    logger.warning(f"⚠️ Failed to update DB with clean content: {db_err}")
+                
+                # Use clean content for the payload logic below
+                message_content = clean_content
+
             payload = {
                 "chatId": chat_id, 
                 "contentType": "string", 
                 "content": message_content
             }
 
-            # [FIX] GROUP MENTION LOGIC
+            # [FIX] GROUP MENTION LOGIC - Fetch Active Speaker
             if "@g.us" in chat_id:
                 try:
-                    # Fetch the very last incoming message from the CUSTOMER
+                    # 1. Fetch LAST MESSAGE metadata to find who to reply to
                     last_msg = supabase.table("messages") \
                         .select("metadata") \
                         .eq("chat_id", chat["id"]) \
@@ -176,21 +203,48 @@ class WebhookCallbackService:
                     if last_msg.data:
                         meta = last_msg.data[0].get("metadata", {})
                         
-                        # [FIX] Prioritize 'original_sender_id' (Full ID) over 'group_participant'
-                        participant = meta.get("original_sender_id") or meta.get("group_participant")
-                        
-                        if participant:
-                            # [CRITICAL] Ensure suffix exists. API requires '123@c.us', not just '123'
-                            if "@" not in participant:
-                                participant = f"{participant}@c.us"
+                        # Get Candidate ID
+                        real_number = meta.get("real_contact_number") or \
+                                      meta.get("real_number") or \
+                                      meta.get("original_sender_id") or \
+                                      meta.get("group_participant")
 
-                            # Prepend "@User" to the text for highlighting
-                            user_tag = participant.split('@')[0]
-                            payload["content"] = f"@{user_tag} {message_content}"
+                        # [CRITICAL FIX] Just-in-Time Resolution
+                        clean_check = str(real_number).replace("@lid", "").replace("@c.us", "")
+                        is_likely_lid = (clean_check.isdigit() and len(clean_check) >= 10 and (clean_check.startswith("1") or clean_check.startswith("2")))
+                        
+                        if real_number and ("@lid" in str(real_number) or is_likely_lid):
+                            try:
+                                logger.info(f"🔄 JIT Resolution: Resolving potential LID {real_number}...")
+                                from app.services.whatsapp_service import get_whatsapp_service
+                                wa_svc = get_whatsapp_service()
+                                lookup = await wa_svc.get_contact_by_id(sender_agent_id, real_number)
+                                if lookup.get("success") and lookup.get("number"):
+                                    logger.info(f"✅ JIT Success: {real_number} -> {lookup['number']}")
+                                    real_number = lookup['number']
+                            except Exception as resolve_err:
+                                logger.warning(f"⚠️ JIT Resolution failed: {resolve_err}")
+
+                        if real_number:
+                            # 2. Cleanup: Ensure it's a clean number for the tag
+                            clean_number = str(real_number).split("@")[0]
                             
-                            # Add to payload options
-                            payload["options"] = { "mentions": [participant] }
-                            logger.info(f"🏷️  Auto-Mentioning Participant: {participant}")
+                            # 3. Construct the Mention ID (must be @c.us for Blue Tag)
+                            mention_id = f"{clean_number}@c.us"
+                            
+                            # Fallback
+                            if "lid" in str(real_number) or (len(clean_number) >= 15 and clean_number.startswith("2")):
+                                mention_id = real_number if "@" in str(real_number) else f"{real_number}@lid"
+                            else:
+                                mention_id = f"{clean_number}@c.us"
+
+                            # 4. Modify Payload - THE KEY TO BLUE TAGS
+                            # We prepend the tag HERE, for the Payload ONLY. 
+                            # The DB (and Dashboard) keeps the 'message_content' (which we cleaned above).
+                            payload["content"] = f"@{clean_number} {message_content}"
+                            payload["options"] = {"mentions": [mention_id]}
+                            
+                            logger.info(f"🏷️ Auto-Mentioning: {mention_id} (Body: @{clean_number})")
                 except Exception as ex:
                     logger.warning(f"⚠️ Failed to resolve mention for group: {ex}")
 
@@ -214,8 +268,8 @@ class WebhookCallbackService:
         except Exception as e:
             logger.error(f"❌ WhatsApp message send failed: {e}")
             return {"success": False, "reason": "error", "error": str(e)}
-        
-    # [CRITICAL FIX] Added media_url argument AND Mention Logic
+                              
+    # [CRITICAL FIX] Added media_url argument
     async def send_telegram_callback(self, chat: Dict[str, Any], message_content: str, supabase, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:
             logger.info(f"✈️ Processing Telegram callback for chat: {chat['id']}")
@@ -234,14 +288,12 @@ class WebhookCallbackService:
             
             if not target_id: raise Exception("No Target ID found")
 
-            # ==============================================================================
-            # [START] GROUP MENTION LOGIC (The Missing Piece)
-            # ==============================================================================
+            # [FIX] GROUP MENTION LOGIC (Telegram)
+            # Telegram Group IDs start with "-" (e.g. -100123456789)
             if str(target_id).startswith("-"):
-                logger.info(f"🔍 Group Detected ({target_id}). Finding user to mention...")
                 try:
-                    # 1. Find the last message sent by a CUSTOMER in this chat
-                    last_msg_res = supabase.table("messages") \
+                    # 1. Fetch the LAST MESSAGE to know exactly who we are replying to
+                    last_msg = supabase.table("messages") \
                         .select("metadata") \
                         .eq("chat_id", chat["id"]) \
                         .eq("sender_type", "customer") \
@@ -249,35 +301,24 @@ class WebhookCallbackService:
                         .limit(1) \
                         .execute()
 
-                    if last_msg_res.data:
-                        meta = last_msg_res.data[0].get("metadata", {})
+                    if last_msg.data:
+                        meta = last_msg.data[0].get("metadata", {})
                         
-                        # 2. Extract the specific User ID to tag
-                        # We check 'telegram_sender_id' (set by webhook.py) or fallbacks
-                        user_id_to_tag = meta.get("telegram_sender_id") or \
-                                         meta.get("participant") or \
-                                         meta.get("sender_id")
-
-                        if user_id_to_tag:
-                            clean_uid = str(user_id_to_tag).split('@')[0]
-                            display_name = meta.get("sender_display_name") or "User"
+                        # Extract Telegram User Details (Saved by webhook.py)
+                        sender_uid = meta.get("telegram_sender_id") or meta.get("participant")
+                        sender_name = meta.get("sender_display_name") or "User"
+                        
+                        if sender_uid:
+                            # 2. Construct Mention (Markdown Format)
+                            # Telegram requires: [Name](tg://user?id=12345) to make it clickable/blue
+                            mention_link = f"[{sender_name}](tg://user?id={sender_uid})"
                             
-                            # 3. Format: [Name](tg://user?id=123456)
-                            mention_string = f"[{display_name}](tg://user?id={clean_uid})"
+                            # Prepend to message body
+                            message_content = f"{mention_link} {message_content}"
                             
-                            # 4. Prepend to the message
-                            message_content = f"{mention_string} {message_content}"
-                            logger.info(f"✅ Auto-Mention Applied: {mention_string}")
-                        else:
-                            logger.warning(f"⚠️ Found message but no ID to tag. Meta keys: {meta.keys()}")
-                    else:
-                        logger.warning("⚠️ No customer message found to reply to.")
-
+                            logger.info(f"🏷️ Telegram Auto-Mention: {mention_link}")
                 except Exception as ex:
-                    logger.error(f"❌ Mention Logic Failed: {ex}", exc_info=True)
-            # ==============================================================================
-            # [END] GROUP MENTION LOGIC
-            # ==============================================================================
+                    logger.warning(f"⚠️ Failed to resolve mention for Telegram group: {ex}")
 
             sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
             
@@ -292,7 +333,7 @@ class WebhookCallbackService:
         except Exception as e:
             logger.error(f"❌ Telegram callback failed: {e}")
             return {"success": False, "error": str(e)}
-        
+               
     # [CRITICAL FIX] Added media_url argument and payload inclusion
     async def send_telegram_userbot_callback(self, agent_id: str, telegram_id: str, message_content: str, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:

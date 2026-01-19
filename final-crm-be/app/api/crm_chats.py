@@ -1548,8 +1548,11 @@ async def create_message(
             try: msg_metadata = json.loads(metadata)
             except: logger.warning("Invalid metadata JSON")
 
+        # [FIX] Separate DB content from API content
+        content_to_send = content 
+
         # ============================================
-        # [FIX] GROUP MENTION LOGIC (HUMAN REPLY)
+        # GROUP MENTION LOGIC (HUMAN REPLY)
         # ============================================
         if sender_type in ["agent", "human"] and chat_data.get("channel") == "whatsapp":
             
@@ -1575,34 +1578,24 @@ async def create_message(
                         # Get ID for API (Hidden)
                         target_id = last_meta.get("group_participant") or last_meta.get("original_sender_id")
                         
-                        # Get Name for Display (Visible)
-                        # Prioritize real_sender_name > whatsapp_name > real_contact_number
+                        # Get Name for Display (Visible in logs)
                         display_name = (
                             last_meta.get("real_sender_name") or 
                             last_meta.get("whatsapp_name") or 
                             last_meta.get("pushName") or 
-                            last_meta.get("notifyName")
+                            last_meta.get("notifyName") or
+                            last_meta.get("real_contact_number")
                         )
-                        
-                        # Fallback to number if name is missing
-                        if not display_name:
-                            display_name = last_meta.get("real_contact_number")
 
                         if target_id:
                             # 1. Add ID to metadata (CRITICAL for WhatsApp API)
                             msg_metadata["mentions"] = [target_id]
                             
-                            # # 2. Prepend @Name to text (CRITICAL for Visuals)
-                            # safe_label = str(display_name).replace("@", "").strip()
-                            
-                            # if f"@{safe_label}" not in content:
-                            #     content = f"@{safe_label} {content}"
-                            #     logger.info(f"✅ Auto-mentioned: @{safe_label}")
-
                             mention_tag = target_id.split('@')[0]
     
+                            # [FIX] ONLY modify content_to_send, keep DB content clean
                             if f"@{mention_tag}" not in content:
-                                content = f"@{mention_tag} {content}"
+                                content_to_send = f"@{mention_tag} {content}"
                                 logger.info(f"✅ Auto-mentioned: @{mention_tag} (Display: {display_name})")
                                 
                 except Exception as e:
@@ -1647,13 +1640,13 @@ async def create_message(
                 raise HTTPException(500, f"File upload failed: {str(e)}")
 
         # ============================================
-        # 2. DB INSERT
+        # 2. DB INSERT (Use CLEAN content)
         # ============================================
         message_data = {
             "chat_id": chat_id,
             "sender_type": sender_type,
             "sender_id": sender_id,
-            "content": content,
+            "content": content,  # <--- [FIX] Storing clean text in DB
             "ticket_id": ticket_id,
             "metadata": msg_metadata
         }
@@ -1667,6 +1660,9 @@ async def create_message(
         
         logger.info(f"Message created in chat {chat_id}")
 
+        # ============================================
+        # 3. SEND TO CHANNEL (Use TAGGED content)
+        # ============================================
         if sender_type in ["agent", "ai", "human"]:
             try:
                 cust_data = supabase.table("customers").select("*").eq("id", chat_data["customer_id"]).single().execute()
@@ -1674,7 +1670,7 @@ async def create_message(
                     result = await send_message_via_channel(
                         chat_data=chat_data,
                         customer_data=cust_data.data,
-                        message_content=content,
+                        message_content=content_to_send, # <--- [FIX] Sending tagged text to WhatsApp
                         supabase=supabase,
                         message_metadata=msg_metadata 
                     )
@@ -1708,7 +1704,7 @@ async def create_message(
                     message_id=created_message["id"],
                     customer_id=ws_cust_id,
                     customer_name=broadcast_name, 
-                    message_content=created_message.get("content", ""),
+                    message_content=created_message.get("content", ""), # Broadcast clean content
                     channel=chat_data.get("channel"),
                     handled_by=chat_data.get("handled_by"),
                     sender_type=sender_type,
@@ -1726,7 +1722,6 @@ async def create_message(
     except Exception as e:
         logger.error(f"Create message error: {e}")
         raise HTTPException(500, "Failed to create message")
-
 
 # ============================================
 # TICKET ENDPOINTS
