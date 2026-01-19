@@ -122,33 +122,55 @@ class WebhookCallbackService:
             return {"success": False, "reason": "error", "error": str(e)}          
 
     async def send_whatsapp_callback(self, chat: Dict[str, Any], message_content: str, supabase) -> Dict[str, Any]:
-        """Send webhook callback to WhatsApp service with Group Mention Support."""
+        """Send webhook callback to WhatsApp service with Perfect Group Mention Support."""
         try:
             logger.info(f"📱 Sending WhatsApp message for chat: {chat['id']}")
             
             customer_id = chat.get("customer_id")
             if not customer_id: raise Exception("Missing customer_id")
 
-            customer_response = supabase.table("customers").select("phone").eq("id", customer_id).execute()
+            # 1. Standard Customer Phone Lookup
+            customer_response = supabase.table("customers").select("phone, metadata").eq("id", customer_id).execute()
             if not customer_response.data: raise Exception(f"Customer {customer_id} not found")
 
-            raw_phone = customer_response.data[0].get("phone", "")
+            customer_data = customer_response.data[0]
+            raw_phone = customer_data.get("phone", "")
             if not raw_phone: raise Exception(f"Customer {customer_id} has no phone number")
 
             normalized_phone = self._normalize_phone_number(raw_phone)
             chat_id = self._format_whatsapp_chat_id(normalized_phone)
 
-            # Force @g.us if metadata or name indicates it's a group
-            chat_meta = chat.get("metadata", {}) or {}
-            is_known_group = chat_meta.get("is_group") or "group" in str(chat.get("name", "")).lower()
-            
-            if is_known_group:
-                if "@c.us" in chat_id: chat_id = chat_id.replace("@c.us", "@g.us")
-                elif "@" not in chat_id: chat_id = f"{normalized_phone}@g.us"
+            # [ROUTING] RETRIEVE TARGET GROUP ID FROM LATEST MESSAGE
+            target_group_id = None
+            try:
+                last_inbound = supabase.table("messages") \
+                    .select("metadata") \
+                    .eq("chat_id", chat["id"]) \
+                    .eq("sender_type", "customer") \
+                    .order("created_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+                
+                if last_inbound.data:
+                    msg_meta = last_inbound.data[0].get("metadata", {}) or {}
+                    target_group_id = msg_meta.get("target_group_id")
+            except Exception as meta_err:
+                logger.warning(f"⚠️ Failed to check message metadata for routing: {meta_err}")
+
+            if target_group_id:
+                logger.info(f"🎯 Rerouting Private Chat to Group: {target_group_id}")
+                chat_id = target_group_id 
+            else:
+                # Fallback Group Detection
+                chat_meta = chat.get("metadata", {}) or {}
+                is_known_group = chat_meta.get("is_group") or "group" in str(chat.get("name", "")).lower()
+                if is_known_group:
+                    if "@c.us" in chat_id: chat_id = chat_id.replace("@c.us", "@g.us")
+                    elif "@" not in chat_id: chat_id = f"{normalized_phone}@g.us"
 
             sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
             
-            import re
+            # [CLEANING] Remove accidental mentions from AI response
             lid_matches = re.findall(r"@\s?(2\d{10,17})", message_content)
             clean_content = message_content
             was_cleaned = False
@@ -158,28 +180,18 @@ class WebhookCallbackService:
                 was_cleaned = True
             
             if was_cleaned:
-                logger.info(f"🧹 Sanitized outgoing message: '{message_content}' -> '{clean_content}'")
                 try:
-                    # [IMPROVED DB FIX]
-                    # Fetch the latest message in this chat to update it.
-                    # We don't filter by content string to avoid mismatch issues.
+                    # Update DB with clean text
                     latest_msg = supabase.table("messages")\
                         .select("id")\
                         .eq("chat_id", chat["id"])\
                         .order("created_at", desc=True)\
                         .limit(1)\
                         .execute()
-                        
                     if latest_msg.data:
                         msg_id = latest_msg.data[0]["id"]
-                        supabase.table("messages").update({"content": clean_content})\
-                            .eq("id", msg_id)\
-                            .execute()
-                        logger.info(f"✅ Updated DB Message {msg_id} with clean content")
-                except Exception as db_err:
-                    logger.warning(f"⚠️ Failed to update DB with clean content: {db_err}")
-                
-                # Use clean content for the payload logic below
+                        supabase.table("messages").update({"content": clean_content}).eq("id", msg_id).execute()
+                except Exception: pass
                 message_content = clean_content
 
             payload = {
@@ -188,10 +200,10 @@ class WebhookCallbackService:
                 "content": message_content
             }
 
-            # [FIX] GROUP MENTION LOGIC - Fetch Active Speaker
+            # [FIX 3] MENTION LOGIC RESTORED
             if "@g.us" in chat_id:
                 try:
-                    # 1. Fetch LAST MESSAGE metadata to find who to reply to
+                    # Fetch Metadata from Last Message
                     last_msg = supabase.table("messages") \
                         .select("metadata") \
                         .eq("chat_id", chat["id"]) \
@@ -201,50 +213,61 @@ class WebhookCallbackService:
                         .execute()
 
                     if last_msg.data:
-                        meta = last_msg.data[0].get("metadata", {})
+                        meta = last_msg.data[0].get("metadata", {}) or {}
                         
-                        # Get Candidate ID
                         real_number = meta.get("real_contact_number") or \
                                       meta.get("real_number") or \
                                       meta.get("original_sender_id") or \
                                       meta.get("group_participant")
-
-                        # [CRITICAL FIX] Just-in-Time Resolution
-                        clean_check = str(real_number).replace("@lid", "").replace("@c.us", "")
-                        is_likely_lid = (clean_check.isdigit() and len(clean_check) >= 10 and (clean_check.startswith("1") or clean_check.startswith("2")))
                         
-                        if real_number and ("@lid" in str(real_number) or is_likely_lid):
+                        # 1. Clean the ID strictly
+                        clean_check = str(real_number).replace("@lid", "").replace("@c.us", "").replace("+", "").replace(" ", "")
+                        
+                        # 2. Determine if it's a LID
+                        is_likely_lid = (len(clean_check) >= 14) or "lid" in str(real_number)
+                        if customer_data.get("metadata", {}).get("is_lid_user"):
+                            is_likely_lid = True
+
+                        # 3. DB Lookup (Try to upgrade LID -> Real Phone locally first)
+                        if is_likely_lid:
                             try:
-                                logger.info(f"🔄 JIT Resolution: Resolving potential LID {real_number}...")
-                                from app.services.whatsapp_service import get_whatsapp_service
-                                wa_svc = get_whatsapp_service()
-                                lookup = await wa_svc.get_contact_by_id(sender_agent_id, real_number)
-                                if lookup.get("success") and lookup.get("number"):
-                                    logger.info(f"✅ JIT Success: {real_number} -> {lookup['number']}")
-                                    real_number = lookup['number']
-                            except Exception as resolve_err:
-                                logger.warning(f"⚠️ JIT Resolution failed: {resolve_err}")
+                                db_lookup = supabase.table("customers") \
+                                    .select("phone") \
+                                    .or_(f"phone.eq.{clean_check},metadata->>whatsapp_lid.eq.{clean_check}") \
+                                    .limit(1) \
+                                    .execute()
+                                
+                                if db_lookup.data:
+                                    found_phone = db_lookup.data[0].get("phone")
+                                    if found_phone and "g.us" not in found_phone and len(found_phone) < 14: 
+                                        logger.info(f"✅ [TRACE] DB Lookup Success: {real_number} -> {found_phone}")
+                                        real_number = found_phone
+                                        is_likely_lid = False 
+                            except Exception: pass
 
                         if real_number:
-                            # 2. Cleanup: Ensure it's a clean number for the tag
-                            clean_number = str(real_number).split("@")[0]
+                            clean_number = str(real_number).split("@")[0].replace("+", "")
                             
-                            # 3. Construct the Mention ID (must be @c.us for Blue Tag)
-                            mention_id = f"{clean_number}@c.us"
+                            # Construct Mention ID
+                            # If it looks like a LID, keep @lid. Else @c.us
+                            is_lid_format = (len(clean_number) >= 14) or "lid" in str(real_number)
                             
-                            # Fallback
-                            if "lid" in str(real_number) or (len(clean_number) >= 15 and clean_number.startswith("2")):
+                            if is_lid_format:
                                 mention_id = real_number if "@" in str(real_number) else f"{real_number}@lid"
                             else:
                                 mention_id = f"{clean_number}@c.us"
 
-                            # 4. Modify Payload - THE KEY TO BLUE TAGS
-                            # We prepend the tag HERE, for the Payload ONLY. 
-                            # The DB (and Dashboard) keeps the 'message_content' (which we cleaned above).
-                            payload["content"] = f"@{clean_number} {message_content}"
-                            payload["options"] = {"mentions": [mention_id]}
+                            # [FINAL STRATEGY] ALWAYS SEND THE ID
+                            # We stop trying to be smart with Names. We send the ID.
+                            # 1. If it's a Real Number, WA renders Blue Tag.
+                            # 2. If it's a LID, WA renders Blue Tag (if saved) or Raw Number.
+                            # Node.js service can intercept this @ID if it wants to swap it, but Python shouldn't hide it.
                             
-                            logger.info(f"🏷️ Auto-Mentioning: {mention_id} (Body: @{clean_number})")
+                            payload["content"] = f"@{clean_number} {message_content}"
+
+                            payload["options"] = {"mentions": [mention_id]}
+                            logger.info(f"🏷️ Auto-Mention: {mention_id} Body: {payload['content'][:20]}...")
+                            
                 except Exception as ex:
                     logger.warning(f"⚠️ Failed to resolve mention for group: {ex}")
 
@@ -268,7 +291,7 @@ class WebhookCallbackService:
         except Exception as e:
             logger.error(f"❌ WhatsApp message send failed: {e}")
             return {"success": False, "reason": "error", "error": str(e)}
-                              
+                                                 
     # [CRITICAL FIX] Added media_url argument
     async def send_telegram_callback(self, chat: Dict[str, Any], message_content: str, supabase, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:

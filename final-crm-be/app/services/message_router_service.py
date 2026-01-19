@@ -87,9 +87,10 @@ class MessageRouterService:
                 def is_placeholder(value: str) -> bool:
                     if not value: return True
                     clean = value.replace("+", "").replace("-", "").replace(" ", "")
+                    # Treat raw numbers, "WhatsApp...", or "Unknown" as placeholders
                     return clean.isdigit() or "WhatsApp" in value or value == "Unknown"
 
-                # Update name if current is placeholder AND new name is valid
+                # Update name ONLY if current is a placeholder AND new name is a real name
                 should_update = (
                     is_placeholder(current_name) and
                     customer_name and
@@ -114,7 +115,7 @@ class MessageRouterService:
             phone_val = contact if channel == "whatsapp" else (metadata or {}).get("phone")
             email_val = contact if channel == "email" else (metadata or {}).get("email")
             
-            # [REVERTED] Standard Naming Logic (Consistent with other records)
+            # [FIX] Use Sender Name if provided, otherwise fallback to extractor
             final_name = customer_name
             if not final_name or final_name == "Unknown":
                 final_name = self._extract_name_from_contact(contact, channel)
@@ -137,7 +138,7 @@ class MessageRouterService:
                 }
             }
 
-            # Enforce channel metadata
+            # Enforce channel specific metadata
             if channel == "telegram":
                 customer_data["metadata"]["telegram_id"] = contact
             elif channel == "web":
@@ -157,7 +158,7 @@ class MessageRouterService:
         except Exception as e:
             logger.error(f"❌ Customer lookup/creation failed: {e}")
             raise
-        
+
     async def find_active_chat(
         self,
         customer_id: str,
@@ -316,7 +317,7 @@ class MessageRouterService:
             )
     async def _execute_routing_logic(self, agent, channel, contact, message_content, customer_name, message_metadata, customer_metadata):
         """
-        Internal method containing 100% of your original routing logic.
+        Internal method containing routing logic.
         Protected by the Lock in route_incoming_message.
         """
         try:
@@ -331,6 +332,50 @@ class MessageRouterService:
                 f"(is_ai={is_ai_agent}), channel={channel}, contact={contact}"
             )
 
+            # =========================================================
+            # [PROD FIX] UNIFIED IDENTITY HANDLING
+            # =========================================================
+            is_group_msg = (message_metadata or {}).get("is_group", False)
+            group_id = contact if is_group_msg else None
+            
+            # 1. Extract Raw Data
+            raw_participant = (message_metadata or {}).get("real_contact_number") or \
+                              (message_metadata or {}).get("real_number") or \
+                              (message_metadata or {}).get("participant")
+            
+            participant_name = (message_metadata or {}).get("sender_display_name") or \
+                               (message_metadata or {}).get("push_name") or \
+                               (message_metadata or {}).get("notify_name")
+
+            # 2. Strict Normalization Helper
+            def normalize_id(value):
+                if not value: return None
+                # Remove common artifacts
+                clean = str(value).replace("@c.us", "").replace("@lid", "").replace("+", "").replace(" ", "").strip()
+                return clean
+
+            # 3. Handle Group Swap
+            if is_group_msg and raw_participant and channel == "whatsapp":
+                clean_part_id = normalize_id(raw_participant)
+                clean_group_id = normalize_id(group_id)
+                
+                # Validation: Ensure it's a valid ID and distinct from the Group ID
+                if clean_part_id and len(clean_part_id) > 5 and clean_part_id != clean_group_id:
+                    logger.info(f"🔀 [ROUTER] Swapping Customer: Group({group_id}) -> Participant({clean_part_id})")
+                    
+                    contact = clean_part_id
+                    customer_name = participant_name
+                    
+                    if customer_metadata is None: customer_metadata = {}
+                    
+                    # [PROD] Store explicit flags so we don't guess later
+                    customer_metadata["last_seen_in_group"] = group_id
+                    
+                    # Heuristic: If it's very long (>=15) or explicitly marked as LID in raw data
+                    if "lid" in str(raw_participant) or len(clean_part_id) >= 15:
+                        customer_metadata["is_lid_user"] = True
+                        customer_metadata["whatsapp_lid"] = clean_part_id
+
             # Step 1: Find or create customer
             customer = await self.find_or_create_customer(
                 organization_id=organization_id,
@@ -339,7 +384,6 @@ class MessageRouterService:
                 customer_name=customer_name,
                 metadata=customer_metadata
             )
-
             customer_id = customer["id"]
 
             # Step 2: Find active chat
@@ -349,7 +393,6 @@ class MessageRouterService:
                 organization_id=organization_id
             )
 
-            # Initialize result variables
             chat_id = None
             message_id = None
             is_new_chat = False
@@ -358,7 +401,6 @@ class MessageRouterService:
             chat_status = "open"
             is_merged_event = False 
 
-            # Robust Duplicate Check (Your original fix)
             wa_msg_id = (message_metadata or {}).get("whatsapp_message_id")
             existing_message = None
             
@@ -369,37 +411,36 @@ class MessageRouterService:
                         .eq("chat_id", active_chat["id"]) \
                         .contains("metadata", {"whatsapp_message_id": wa_msg_id}) \
                         .execute()
-                    
-                    if check_res.data:
-                        existing_message = check_res.data[0]
-                except Exception as e:
-                    logger.warning(f"⚠️ Metadata lookup warning: {e}")
+                    if check_res.data: existing_message = check_res.data[0]
+                except Exception: pass
 
             if active_chat:
-                # Chat exists
                 chat_id = active_chat["id"]
                 chat_status = active_chat["status"]
                 handled_by = active_chat.get("handled_by", "unassigned")
                 current_assigned_id = active_chat.get("assigned_agent_id")
 
                 # [PROD FIX] Validate Assignment Integrity
-                # If chat claims to be 'assigned' but has no valid Agent ID, recover to AI.
                 if chat_status == "assigned" or handled_by == "human":
                     if not current_assigned_id:
                         logger.warning(f"⚠️ Chat {chat_id} is 'assigned' but has NO Agent ID. Auto-recovering to AI.")
                         chat_status = "open"
                         handled_by = "ai"
-                        # We will apply this status update to DB in the insert block below
 
                 if existing_message:
-                    # MERGE SPLIT EVENTS (Your original logic)
+                    # MERGE SPLIT EVENTS
                     logger.info(f"🔄 Merging split message events for ID: {wa_msg_id}")
                     message_id = existing_message["id"]
                     is_merged_event = True
                     
+                    # Merge metadata
                     current_meta = existing_message.get("metadata") or {}
                     new_meta = message_metadata or {}
                     merged_meta = {**current_meta, **new_meta}
+                    
+                    # [PROD] Ensure target_group_id is preserved
+                    if is_group_msg and group_id:
+                        merged_meta["target_group_id"] = group_id
                     
                     update_data = {"metadata": merged_meta}
                     if message_content and not existing_message.get("content"):
@@ -411,23 +452,16 @@ class MessageRouterService:
                     # INSERT NEW MESSAGE
                     logger.info(f"📥 Adding message to existing chat: {chat_id}")
 
-                    # Prepare Chat Update Payload (Consolidated)
                     chat_update = {
                         "last_message_at": datetime.utcnow().isoformat()
                     }
 
-                    # Handle Reopening logic
                     if chat_status == "resolved":
                         logger.info(f"♻️ Reopening resolved chat: {chat_id}")
-                        if handled_by == "ai": new_status = "open"
-                        elif handled_by == "human": new_status = "assigned"
-                        else: new_status = "open"
-
-                        chat_status = new_status
-                        chat_update["status"] = new_status
+                        chat_status = "open"
+                        chat_update["status"] = "open"
                         was_reopened = True
                     
-                    # [PROD FIX] Apply Auto-Recovery Status if changed above
                     if chat_status != active_chat["status"]:
                         chat_update["status"] = chat_status
                         if chat_status == "open":
@@ -435,20 +469,22 @@ class MessageRouterService:
                             if not current_assigned_id:
                                 chat_update["assigned_agent_id"] = None
                     
-                    # [PROD FIX] Increment Unread Count
                     current_unread = active_chat.get("unread_count", 0) or 0
                     chat_update["unread_count"] = current_unread + 1
 
-                    # Execute Consolidated Chat Update
                     self.supabase.table("chats").update(chat_update).eq("id", chat_id).execute()
 
-                    # Insert Message
+                    # [PROD] Add Target Group ID to Message Metadata
+                    final_msg_meta = message_metadata or {}
+                    if is_group_msg and group_id:
+                        final_msg_meta["target_group_id"] = group_id
+
                     message_data = {
                         "chat_id": chat_id,
                         "sender_type": "customer",
                         "sender_id": customer_id,
                         "content": message_content,
-                        "metadata": message_metadata or {}
+                        "metadata": final_msg_meta
                     }
 
                     message_response = self.supabase.table("messages").insert(message_data).execute()
@@ -483,12 +519,17 @@ class MessageRouterService:
                     is_new_chat = True
                     logger.info(f"✅ New chat created: {chat_id}")
 
+                    # [PROD] Add Target Group ID to Message Metadata
+                    final_msg_meta = message_metadata or {}
+                    if is_group_msg and group_id:
+                        final_msg_meta["target_group_id"] = group_id
+
                     message_data = {
                         "chat_id": chat_id,
                         "sender_type": "customer",
                         "sender_id": customer_id,
                         "content": message_content,
-                        "metadata": message_metadata or {}
+                        "metadata": final_msg_meta
                     }
 
                     message_response = self.supabase.table("messages").insert(message_data).execute()
@@ -496,7 +537,6 @@ class MessageRouterService:
                         message_id = message_response.data[0]["id"]
                         logger.info(f"✅ Initial message created: {message_id}")
 
-            # Step 3: Update customer metadata
             await self.update_customer_metadata(
                 customer_id=customer_id,
                 channel=channel,
@@ -526,7 +566,7 @@ class MessageRouterService:
         except Exception as e:
             logger.error(f"❌ Error routing message: {e}")
             raise
-            
+                            
     def _extract_name_from_contact(self, contact: str, channel: str) -> str:
         """
         Extract a display name from contact information.
