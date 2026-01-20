@@ -509,28 +509,47 @@ class WhatsAppService:
             logger.error(f"Download error: {e}")
             return None
 
-    async def send_media_message(self, session_id: str, phone_number: str, media_url: str, caption: Optional[str] = None, media_type: str = "image") -> Dict[str, Any]:
+    async def send_media_message(
+        self, 
+        session_id: str, 
+        phone_number: str, 
+        media_url: str, 
+        caption: Optional[str] = None, 
+        media_type: str = "image",
+        mentions: List[str] = None # <--- Added Parameter
+    ) -> Dict[str, Any]:
         try:
-            logger.info(f"📤 Sending media to: {phone_number}")
-            chat_id = self._format_chat_id(phone_number)
+            logger.info(f"📤 Sending media to: {phone_number} (Mentions: {mentions})")
             
-            # Resolve LID if present
-            if "@lid" in str(phone_number):
-                res = await self.get_contact_by_id(session_id, phone_number)
-                if res.get("success") and res.get("number"): chat_id = self._format_chat_id(res["number"])
+            # [FIX] Trust the ID if it contains '@' (Group Support)
+            chat_id = str(phone_number).strip()
+            if "@" not in chat_id:
+                chat_id = f"{chat_id}@c.us"
 
             media_data = await self._download_media(media_url) if media_url.startswith("http") else None
             
+            # [FIX] Prepare Options with Mentions
+            options = {"caption": caption}
+            if mentions:
+                options["mentions"] = mentions
+
             if media_data:
                 payload = {
-                    "chatId": chat_id, "contentType": "MessageMedia",
-                    "content": {"mimetype": media_data["mimetype"], "data": media_data["data"], "filename": "media"},
-                    "options": {"caption": caption}
+                    "chatId": chat_id, 
+                    "contentType": "MessageMedia",
+                    "content": {
+                        "mimetype": media_data["mimetype"], 
+                        "data": media_data["data"], 
+                        "filename": "media"
+                    },
+                    "options": options # <--- Updated Options
                 }
             else:
                 payload = {
-                    "chatId": chat_id, "contentType": "MessageMediaFromURL",
-                    "content": media_url, "options": {"caption": caption}
+                    "chatId": chat_id, 
+                    "contentType": "MessageMediaFromURL",
+                    "content": media_url, 
+                    "options": options # <--- Updated Options
                 }
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -541,27 +560,47 @@ class WhatsAppService:
             logger.error(f"Failed to send media: {e}")
             raise Exception(f"Send media failed: {e}")
 
-    async def send_file_message(self, session_id: str, phone_number: str, file_url: str, filename: Optional[str] = None, caption: Optional[str] = None) -> Dict[str, Any]:
+    async def send_file_message(
+        self, 
+        session_id: str, 
+        phone_number: str, 
+        file_url: str, 
+        filename: Optional[str] = None, 
+        caption: Optional[str] = None,
+        mentions: List[str] = None # <--- Added Parameter
+    ) -> Dict[str, Any]:
         try:
-            logger.info(f"📤 Sending file to: {phone_number}")
-            chat_id = self._format_chat_id(phone_number)
+            logger.info(f"📤 Sending file to: {phone_number} (Mentions: {mentions})")
             
-            if "@lid" in str(phone_number):
-                res = await self.get_contact_by_id(session_id, phone_number)
-                if res.get("success") and res.get("number"): chat_id = self._format_chat_id(res["number"])
+            # [FIX] Trust the ID if it contains '@' (Group Support)
+            chat_id = str(phone_number).strip()
+            if "@" not in chat_id:
+                chat_id = f"{chat_id}@c.us"
 
             media_data = await self._download_media(file_url) if file_url.startswith("http") else None
             
+            # [FIX] Prepare Options with Mentions
+            options = {"caption": caption}
+            if mentions:
+                options["mentions"] = mentions
+
             if media_data:
                 payload = {
-                    "chatId": chat_id, "contentType": "MessageMedia",
-                    "content": {"mimetype": media_data["mimetype"], "data": media_data["data"], "filename": filename or "file"},
-                    "options": {"caption": caption}
+                    "chatId": chat_id, 
+                    "contentType": "MessageMedia",
+                    "content": {
+                        "mimetype": media_data["mimetype"], 
+                        "data": media_data["data"], 
+                        "filename": filename or "file"
+                    },
+                    "options": options # <--- Updated Options
                 }
             else:
                 payload = {
-                    "chatId": chat_id, "contentType": "MessageMediaFromURL",
-                    "content": file_url, "options": {"caption": caption}
+                    "chatId": chat_id, 
+                    "contentType": "MessageMediaFromURL",
+                    "content": file_url, 
+                    "options": options # <--- Updated Options
                 }
 
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -571,7 +610,6 @@ class WhatsAppService:
         except Exception as e:
             logger.error(f"Failed to send file: {e}")
             raise Exception(f"Send file failed: {e}")
-
 
 # Singleton instance
 _whatsapp_service: Optional[WhatsAppService] = None

@@ -19,6 +19,9 @@ class Settings:
     REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
     REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")
 
+    # Save Model RAG
+    RERANKER_MODEL_PATH: Optional[str] = os.getenv("RERANKER_MODEL_PATH", "./models/reranker")
+
     # Invitation org link
     INVITATION_URL: str = os.getenv("INVITATION_URL", "https://stgconsole.syntra.id")
 
