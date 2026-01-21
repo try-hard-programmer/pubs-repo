@@ -1,7 +1,7 @@
 // ==========================================
 // FILE: routers/proxy_router_v2.js
 // PURPOSE: Multi-agent LLM proxy with Redis Queue (Dual Connection)
-// VERSION: 2.4 - Production Ready (Full)
+// VERSION: 2.5 - Fixed Gemini Multimodal + No RunPod
 // ==========================================
 
 const express = require("express");
@@ -17,7 +17,6 @@ const redisConfig = {
   host: process.env.REDIS_HOST || "localhost",
   port: process.env.REDIS_PORT || 6379,
   maxRetriesPerRequest: 3,
-  // Note: No password field here. It will connect without auth by default.
 };
 
 // 1. General Client (Non-blocking: RPUSH, GET, SET)
@@ -32,10 +31,8 @@ redisBlocking.on("error", (err) => console.error("Redis (Block) Error:", err));
 redisClient.on("connect", () => console.log("✓ Redis (Main) Connected"));
 redisBlocking.on("connect", () => console.log("✓ Redis (Block) Connected"));
 
-// Worker registry to keep track of active processors
 const userWorkers = {};
 
-// Lua script for atomic cleanup (Prevents race conditions when stopping workers)
 const CLEANUP_SCRIPT = `
   local queueLen = redis.call('LLEN', KEYS[1])
   if queueLen == 0 then
@@ -66,14 +63,6 @@ const API_CONFIGS = {
     maxTokens: 8192,
     supportsVision: true,
   },
-  runpod: {
-    baseUrl: process.env.RUNPOD_BASE_URL || "https://api.runpod.ai/v2",
-    endpointId: process.env.RUNPOD_ENDPOINT_ID,
-    chatModel: "openai-compatible",
-    embeddingModel: "sentence-transformers",
-    maxTokens: 4096,
-    supportsVision: false,
-  },
 };
 
 const CREDIT_COSTS = {
@@ -93,7 +82,6 @@ const getApiKey = (provider) => {
   const keys = {
     openai: process.env.OPENAI_API_KEY,
     gemini: process.env.GEMINI_API_KEY,
-    runpod: process.env.RUNPOD_API_KEY,
   };
   return keys[provider];
 };
@@ -105,14 +93,6 @@ const authenticate = (req, res, next) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
-};
-
-const detectFiles = (files) => {
-  if (!files || !Array.isArray(files) || files.length === 0) return null;
-  const fileTypes = files.map((f) => f.type);
-  if (fileTypes.includes("image")) return "image";
-  if (fileTypes.includes("pdf")) return "pdf";
-  return "unknown";
 };
 
 async function downloadFileAsBase64(url) {
@@ -127,6 +107,7 @@ async function downloadFileAsBase64(url) {
       mimeType: response.headers["content-type"] || "application/octet-stream",
     };
   } catch (error) {
+    console.warn(`[WARN] Failed to download image: ${url}`);
     throw new Error(`Failed to download file from ${url}`);
   }
 }
@@ -143,11 +124,25 @@ function getProvider(requested) {
 
 function detectQueryType(messages, files) {
   const lastMessage = messages[messages.length - 1]?.content || "";
+
+  // Check for inline images in messages (New Python Payload)
+  const hasInlineImage =
+    Array.isArray(lastMessage) &&
+    lastMessage.some((m) => m.type === "image_url");
+
   const hasFiles = files && files.length > 0;
+
   if (hasFiles && files[0]?.type === "image") return "image_analysis";
+  if (hasInlineImage) return "image_analysis";
   if (hasFiles && files[0]?.type === "pdf") return "document_analysis";
-  if (lastMessage.length < 50) return "basic_query";
-  if (lastMessage.length > 200) return "complex_query";
+
+  // Text length check
+  const textLen = Array.isArray(lastMessage)
+    ? lastMessage.find((m) => m.type === "text")?.text?.length || 0
+    : lastMessage.length;
+
+  if (textLen < 50) return "basic_query";
+  if (textLen > 200) return "complex_query";
   return "basic_query";
 }
 
@@ -155,7 +150,6 @@ function calculateTokenCost(provider, input, output) {
   const pricing = {
     openai: { input: 0.15 / 1e6, output: 0.6 / 1e6 },
     gemini: { input: 0.075 / 1e6, output: 0.3 / 1e6 },
-    runpod: { input: 0, output: 0 },
   };
   const rates = pricing[provider] || pricing.gemini;
   return input * rates.input + output * rates.output;
@@ -165,7 +159,6 @@ function calculateEmbeddingCost(provider, tokens) {
   const pricing = {
     openai: 0.02 / 1e6,
     gemini: 0.025 / 1e6,
-    runpod: 0,
   };
   const rate = pricing[provider] || pricing.openai;
   return tokens * rate;
@@ -181,14 +174,14 @@ async function logCreditUsage(
   response,
   provider,
   startTime,
-  priority = null
+  priority = null,
 ) {
   const responseTime = Date.now() - startTime;
   const credits = CREDIT_COSTS[queryType];
   const tokenCost = calculateTokenCost(
     provider,
     response.usage?.prompt_tokens || 0,
-    response.usage?.completion_tokens || 0
+    response.usage?.completion_tokens || 0,
   );
 
   return {
@@ -228,18 +221,36 @@ async function logEmbeddingUsage(orgId, response, provider, startTime) {
 
 async function handleOpenAI(messages, files = [], temperature = 0.7) {
   const config = API_CONFIGS.openai;
+  // Use Vision Model if files present OR inline images detected
+  const hasInlineImages = messages.some(
+    (m) =>
+      Array.isArray(m.content) && m.content.some((p) => p.type === "image_url"),
+  );
   const hasFiles = files && files.length > 0;
-  const model = hasFiles ? config.visionModel : config.chatModel;
+
+  const model =
+    hasFiles || hasInlineImages ? config.visionModel : config.chatModel;
 
   let processedMessages = messages;
+
+  // Handle Legacy "files" array (if used)
   if (hasFiles) {
     const lastUserIndex = messages
       .map((m, i) => ({ role: m.role, index: i }))
       .reverse()
       .find((m) => m.role === "user").index;
+
     processedMessages = [...messages];
     const lastMessage = processedMessages[lastUserIndex];
-    const content = [{ type: "text", text: lastMessage.content || "" }];
+
+    // Normalize content to array
+    let content = [];
+    if (typeof lastMessage.content === "string") {
+      content.push({ type: "text", text: lastMessage.content });
+    } else if (Array.isArray(lastMessage.content)) {
+      content = [...lastMessage.content];
+    }
+
     for (const file of files) {
       if (file.type === "image") {
         content.push({
@@ -262,22 +273,63 @@ async function handleOpenAI(messages, files = [], temperature = 0.7) {
     {
       headers: { Authorization: `Bearer ${getApiKey("openai")}` },
       timeout: 180000,
-    }
+    },
   );
   return response.data;
 }
 
 async function handleGemini(messages, files = [], temperature = 0.7) {
   const config = API_CONFIGS.gemini;
-  const hasFiles = files && files.length > 0;
-  const model = hasFiles ? config.visionModel : config.chatModel;
   const apiKey = getApiKey("gemini");
 
+  // Auto-detect if we need vision based on content
+  const hasInlineImages = messages.some(
+    (m) =>
+      Array.isArray(m.content) && m.content.some((p) => p.type === "image_url"),
+  );
+  const hasFiles = files && files.length > 0;
+
+  // Gemini 2.0 Flash supports everything, but good to be explicit
+  const model =
+    hasFiles || hasInlineImages ? config.visionModel : config.chatModel;
+
   const contents = [];
+
+  // Use for...of loop to handle AWAIT for image downloads
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const parts = [];
-    if (msg.content) parts.push({ text: msg.content });
+
+    // [FIX] HANDLE MULTIMODAL ARRAYS (The cause of your 400 Error)
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === "text") {
+          parts.push({ text: part.text });
+        } else if (part.type === "image_url") {
+          // Gemini NEEDS Base64. It cannot take "url": "..." directly.
+          const imgUrl = part.image_url?.url;
+          if (imgUrl) {
+            try {
+              const { base64, mimeType } = await downloadFileAsBase64(imgUrl);
+              parts.push({
+                inline_data: {
+                  mime_type: mimeType || "image/jpeg",
+                  data: base64,
+                },
+              });
+            } catch (e) {
+              console.error(`Skipping inline image: ${e.message}`);
+            }
+          }
+        }
+      }
+    }
+    // Handle Simple String
+    else if (msg.content) {
+      parts.push({ text: msg.content });
+    }
+
+    // Handle Legacy "files" array
     if (msg.role === "user" && hasFiles && i === messages.length - 1) {
       for (const file of files) {
         if (file.type === "image") {
@@ -286,13 +338,16 @@ async function handleGemini(messages, files = [], temperature = 0.7) {
             const { base64 } = await downloadFileAsBase64(file.url);
             base64Data = base64;
           } else if (file.data) base64Data = file.data;
-          if (base64Data)
+
+          if (base64Data) {
             parts.push({
               inline_data: { mime_type: "image/jpeg", data: base64Data },
             });
+          }
         }
       }
     }
+
     contents.push({
       role: msg.role === "assistant" ? "model" : "user",
       parts: parts,
@@ -306,75 +361,54 @@ async function handleGemini(messages, files = [], temperature = 0.7) {
         contents,
         generationConfig: { temperature, maxOutputTokens: config.maxTokens },
       },
-      { headers: { "Content-Type": "application/json" }, timeout: 180000 }
+      { headers: { "Content-Type": "application/json" }, timeout: 180000 },
     );
 
-    // [FIX] Safety Check to prevent Crash
     const candidate = response.data.candidates?.[0];
     const text =
       candidate?.content?.parts?.[0]?.text ||
       "⚠️ I cannot answer this due to safety filters.";
 
     return {
-      choices: [
-        {
-          message: {
-            role: "assistant",
-            content: text,
-          },
-        },
-      ],
+      choices: [{ message: { role: "assistant", content: text } }],
       usage: { prompt_tokens: 0, completion_tokens: 0 },
     };
   } catch (error) {
-    console.error("Gemini API Error:", error.response?.data || error.message);
-    throw error; // Let the main handler switch to fallback (OpenAI)
+    console.error(
+      "Gemini API Error:",
+      JSON.stringify(error.response?.data || error.message, null, 2),
+    );
+    throw error;
   }
-}
-
-async function handleRunPod(messages, files = [], temperature = 0.7) {
-  const config = API_CONFIGS.runpod;
-  const response = await axios.post(
-    `${config.baseUrl}/${config.endpointId}/runsync`,
-    { input: { messages, temperature, max_tokens: config.maxTokens } },
-    {
-      headers: { Authorization: `Bearer ${getApiKey("runpod")}` },
-      timeout: 180000,
-    }
-  );
-  return response.data.output || response.data;
 }
 
 async function routeWithFallback(
   provider,
   messages,
   files = [],
-  temperature = 0.7
+  temperature = 0.7,
 ) {
   try {
-    if (provider === "openai")
-      return await handleOpenAI(messages, files, temperature);
     if (provider === "gemini")
       return await handleGemini(messages, files, temperature);
-    return await handleRunPod(messages, files, temperature);
+    return await handleOpenAI(messages, files, temperature);
   } catch (error) {
     console.error(`[FALLBACK] ${provider} failed: ${error.message}`);
-    const fallback = ["openai", "gemini", "runpod"].find(
-      (p) => p !== provider && getApiKey(p)
-    );
-    if (fallback) {
+
+    // Simple Toggle Fallback: If Gemini fails, try OpenAI. If OpenAI fails, try Gemini.
+    const fallback = provider === "openai" ? "gemini" : "openai";
+
+    if (getApiKey(fallback)) {
       if (fallback === "openai")
         return await handleOpenAI(messages, files, temperature);
-      if (fallback === "gemini")
-        return await handleGemini(messages, files, temperature);
-      return await handleRunPod(messages, files, temperature);
+      return await handleGemini(messages, files, temperature);
     }
     throw new Error("All providers failed");
   }
 }
 
 // ==========================================
-// 6. EMBEDDING FUNCTIONS (The missing link!)
+// 6. EMBEDDING FUNCTIONS
 // ==========================================
 
 async function getOpenAIEmbeddings(texts) {
@@ -385,7 +419,7 @@ async function getOpenAIEmbeddings(texts) {
     {
       headers: { Authorization: `Bearer ${getApiKey("openai")}` },
       timeout: 60000,
-    }
+    },
   );
   return response.data;
 }
@@ -401,7 +435,7 @@ async function getGeminiEmbeddings(texts) {
     const response = await axios.post(
       `${config.baseUrl}/models/${config.embeddingModel}:embedContent?key=${apiKey}`,
       { content: { parts: [{ text: text }] } },
-      { headers: { "Content-Type": "application/json" }, timeout: 60000 }
+      { headers: { "Content-Type": "application/json" }, timeout: 60000 },
     );
     embeddings.push({
       object: "embedding",
@@ -418,35 +452,14 @@ async function getGeminiEmbeddings(texts) {
   };
 }
 
-async function getRunPodEmbeddings(texts) {
-  const config = API_CONFIGS.runpod;
-  const response = await axios.post(
-    `${config.baseUrl}/${config.endpointId}/runsync`,
-    { input: { texts, model: config.embeddingModel } },
-    {
-      headers: { Authorization: `Bearer ${getApiKey("runpod")}` },
-      timeout: 60000,
-    }
-  );
-  const estimatedTokens = (Array.isArray(texts) ? texts : [texts]).reduce(
-    (sum, t) => sum + Math.ceil(t.length / 4),
-    0
-  );
-  return {
-    ...(response.data.output || response.data),
-    usage: { prompt_tokens: estimatedTokens, total_tokens: estimatedTokens },
-  };
-}
-
 async function routeEmbeddings(texts, provider = null) {
   const p = provider || process.env.EMBEDDING_PROVIDER || "openai";
   if (p === "gemini") return await getGeminiEmbeddings(texts);
-  if (p === "runpod") return await getRunPodEmbeddings(texts);
   return await getOpenAIEmbeddings(texts);
 }
 
 // ==========================================
-// 7. WORKER SYSTEM (Dual Connection)
+// 7. WORKER SYSTEM
 // ==========================================
 
 async function processUserQueue(userId) {
@@ -460,16 +473,14 @@ async function processUserQueue(userId) {
     console.log(`[${userId}] Worker started.`);
 
     while (true) {
-      // 1. BLOCKING POP (Uses Worker Client)
       const jobData = await redisBlocking.blpop(queueKey, 1);
 
       if (!jobData) {
-        // 2. ATOMIC CLEANUP (Uses Main Client)
         const deleted = await redisClient.eval(
           CLEANUP_SCRIPT,
           2,
           queueKey,
-          lockKey
+          lockKey,
         );
         if (deleted === 1) {
           delete userWorkers[userId];
@@ -489,7 +500,7 @@ async function processUserQueue(userId) {
           job.provider,
           job.messages,
           job.files,
-          job.temperature
+          job.temperature,
         );
 
         const queryType = detectQueryType(job.messages, job.files);
@@ -499,7 +510,7 @@ async function processUserQueue(userId) {
           response,
           job.provider,
           job.startTime,
-          job.category
+          job.category,
         );
 
         const finalResponse = {
@@ -521,7 +532,7 @@ async function processUserQueue(userId) {
         await redisClient.setex(
           `result:${job.jobId}`,
           300,
-          JSON.stringify({ success: true, data: finalResponse })
+          JSON.stringify({ success: true, data: finalResponse }),
         );
         console.log(`[${userId}] Job ${job.jobId} completed`);
       } catch (error) {
@@ -529,7 +540,7 @@ async function processUserQueue(userId) {
         await redisClient.setex(
           `result:${job.jobId}`,
           300,
-          JSON.stringify({ success: false, error: error.message })
+          JSON.stringify({ success: false, error: error.message }),
         );
       }
     }
@@ -544,23 +555,12 @@ async function waitForResult(jobId, timeoutMs, req) {
   const startTime = Date.now();
   return new Promise((resolve, reject) => {
     const interval = setInterval(async () => {
-      // 1. Timeout Check (Keep this)
       if (Date.now() - startTime > timeoutMs) {
         clearInterval(interval);
         reject(new Error("Timeout"));
         return;
       }
 
-      // [FIX] REMOVED "req.destroyed" CHECK
-      // It was causing false positives (Ghost Disconnects) in 0.1s.
-      /* if (req.destroyed) {
-        clearInterval(interval);
-        reject(new Error("Client disconnected"));
-        return;
-      }
-      */
-
-      // 3. Poll Redis (Keep this)
       const result = await redisClient.get(`result:${jobId}`);
       if (result) {
         clearInterval(interval);
@@ -602,9 +602,7 @@ router.post("/chat", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Missing messages array" });
 
     const userId = organization_id || "default_org";
-    const jobId = `${userId}-${Date.now()}-${Math.random()
-      .toString(36)
-      .substr(2, 9)}`;
+    const jobId = `${userId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const provider = getProvider(reqProvider);
 
     const job = {
@@ -620,9 +618,7 @@ router.post("/chat", authenticate, async (req, res) => {
       startTime,
     };
 
-    // Push to Redis (Main Client)
     await redisClient.rpush(`queue:${userId}`, JSON.stringify(job));
-    console.log(`[${userId}] Job ${jobId} Queued`);
 
     if (!userWorkers[userId]) {
       userWorkers[userId] = processUserQueue(userId);
@@ -663,7 +659,7 @@ router.post("/embeddings", authenticate, async (req, res) => {
       organization_id,
       response,
       embeddingProvider,
-      startTime
+      startTime,
     );
 
     const finalResponse = {
@@ -688,7 +684,6 @@ router.post("/embeddings", authenticate, async (req, res) => {
   }
 });
 
-// Graceful shutdown
 process.on("SIGTERM", async () => {
   console.log("Shutting down...");
   await redisClient.quit();
@@ -697,5 +692,4 @@ process.on("SIGTERM", async () => {
 });
 
 module.exports = router;
-
-console.log(`🚀 Proxy Router v2 loaded [Production Mode] + Dual Redis Queue`);
+console.log(`🚀 Proxy Router v2 loaded [Production Mode]`);

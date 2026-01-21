@@ -65,19 +65,27 @@ class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
 # ==========================================
 class CRMChromaServiceV2:
     def __init__(self):
-        self.client = chromadb.HttpClient(
-            host=settings.CHROMADB_HOST, 
-            port=settings.CHROMADB_PORT,
-            settings=Settings(allow_reset=True, anonymized_telemetry=False)
-        )
-        
+        # [FIX] Wrap connection in try-except to prevent app crash on startup
+        try:
+            self.client = chromadb.HttpClient(
+                host=settings.CHROMADB_HOST, 
+                port=settings.CHROMADB_PORT,
+                settings=Settings(allow_reset=True, anonymized_telemetry=False)
+            )
+            # Test connection immediately to catch errors early
+            self.client.heartbeat()
+            logger.info(f"✅ Connected to ChromaDB at {settings.CHROMADB_HOST}:{settings.CHROMADB_PORT}")
+        except Exception as e:
+            logger.error(f"⚠️ ChromaDB Connection Failed: {e}")
+            self.client = None  # Set to None so we can check later
+
         default_proxy_url = f"{settings.PROXY_BASE_URL}/embeddings" if hasattr(settings, "PROXY_BASE_URL") else "http://localhost:6657/v2/embeddings"
         proxy_url = getattr(settings, "CRM_EMBEDDING_API_URL", None) or default_proxy_url
         
         self.embedding_fn = LocalProxyEmbeddingFunction(base_url=proxy_url)
         self.credit_service = get_credit_service()
         
-        # [NEW] Lazy load reranker (only loads on first use)
+        # Lazy load reranker
         self._reranker_model = None
         self._reranker_tokenizer = None
         self._reranker_loaded = False
@@ -133,6 +141,10 @@ class CRMChromaServiceV2:
         return self._reranker_model, self._reranker_tokenizer
        
     def get_or_create_collection(self, agent_id: str):
+        if not self.client:
+            logger.error("❌ ChromaDB client is not connected.")
+            raise ConnectionError("ChromaDB is unavailable")
+            
         return self.client.get_or_create_collection(
             name=agent_id, 
             embedding_function=self.embedding_fn
@@ -198,6 +210,24 @@ class CRMChromaServiceV2:
         Latency: 400-600ms (first query: 3-5s for model download)
         """
         try:
+
+            # If text is too short or meaningless, DON'T waste credits embedding it.
+            clean_query = query.strip()
+            if len(clean_query) < 5: 
+                logger.info(f"⏩ RAG Skipped: Query '{clean_query}' is too short (Small Talk).")
+                return ""
+            
+            # If it's just "test" or "hallo", skip it
+            skip_words = ["test", "halo", "hi", "ping", "p","hello"]
+            if clean_query.lower() in skip_words:
+                logger.info(f"⏩ RAG Skipped: Query '{clean_query}' is in skip list.")
+                return ""
+
+            import re
+            def extract_codes(text: str) -> list:
+                pattern = r'\b([A-Za-z]{0,10}[-_\s]?\d+[A-Za-z0-9]*)\b'
+                raw_codes = re.findall(pattern, text)
+                return [re.sub(r'[-_\s]', '', c).upper() for c in raw_codes]
             import re
             
             def extract_codes(text: str) -> list:

@@ -95,211 +95,165 @@ class DynamicAIServiceV2:
 
     async def process_and_respond(self, chat_id: str, msg_id: str, priority: str = "medium") -> Dict[str, Any]:
         """
-        Orchestrate the AI response:
-        1. Contextualize (DB + RAG + VISION INTERCEPTOR)
-        2. Generate (LLM Proxy V2)
-        3. Deliver (DB + WebSocket + Webhook)
-        
-        [NEW] Vision-First Architecture enabled.
+        Orchestrate the AI response (Respects Configs: History Limit + Ticket Categories)
         """
-        
-        # 1. LOCK THE CHAT
-        # This lock key ensures only one AI process runs for this chat at a time.
         lock_key = f"ai_v2_lock:{chat_id}"
         
         async with acquire_lock(lock_key, expire=30) as acquired:
             if not acquired:
-                logger.warning(f"🔒 AI V2 Locked for {chat_id}. Skipping parallel execution.")
+                logger.warning(f"🔒 AI V2 Locked for {chat_id}. Skipping.")
                 return {"success": False, "reason": "locked_rate_limited"}
 
-            # --- CRITICAL SECTION STARTS (Safe execution) ---
             chat = None
             agent_id = None
             agent_name = "AI Assistant"
 
             try:
-                logger.info(f"🤖 Manager V2: Processing Chat {chat_id} (Msg {msg_id})")
-
-                # 1. Fetch Chat & Customer Data
-                chat_res = await asyncio.to_thread(
-                    lambda: self.supabase.table("chats").select("*").eq("id", chat_id).execute()
-                )
-                if not chat_res.data:
-                    return {"success": False, "reason": "chat_not_found"}
+                # 1. Fetch Chat Data
+                chat_res = await asyncio.to_thread(lambda: self.supabase.table("chats").select("*").eq("id", chat_id).execute())
+                if not chat_res.data: return {"success": False, "reason": "chat_not_found"}
                 chat = chat_res.data[0]
 
-                # Resolve Real Customer Name
+                # Resolve Customer Name
                 real_customer_name = "Customer"
                 if chat.get("customer_id"):
                     try:
-                        cust_res = await asyncio.to_thread(
-                            lambda: self.supabase.table("customers")
-                            .select("name")
-                            .eq("id", chat.get("customer_id"))
-                            .single()
-                            .execute()
-                        )
-                        if cust_res.data and cust_res.data.get("name"):
-                            real_customer_name = cust_res.data.get("name")
-                    except Exception:
-                        pass # Non-critical failure
+                        cust_res = await asyncio.to_thread(lambda: self.supabase.table("customers").select("name").eq("id", chat.get("customer_id")).single().execute())
+                        if cust_res.data: real_customer_name = cust_res.data.get("name", "Customer")
+                    except: pass
 
-                # 2. Fetch Agent Settings & Name
+                # 2. Fetch Agent Settings (Source of Truth)
                 agent_id = chat.get("sender_agent_id") 
                 if not agent_id:
-                    # Fallback lookup by Organization
-                    agent_res = await asyncio.to_thread(
-                        lambda: self.supabase.table("agents").select("id").eq("organization_id", chat["organization_id"]).limit(1).execute()
-                    )
-                    if agent_res.data:
-                        agent_id = agent_res.data[0]["id"]
+                    agent_res = await asyncio.to_thread(lambda: self.supabase.table("agents").select("id").eq("organization_id", chat["organization_id"]).limit(1).execute())
+                    if agent_res.data: agent_id = agent_res.data[0]["id"]
                 
                 agent_settings = {}
                 if agent_id:
-                    settings_res = await asyncio.to_thread(
-                        lambda: self.supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute()
-                    )
-                    if settings_res.data:
-                        agent_settings = settings_res.data[0]
+                    settings_res = await asyncio.to_thread(lambda: self.supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute())
+                    if settings_res.data: agent_settings = settings_res.data[0]
                 
-                agent_name = self._extract_agent_name(agent_settings)
+                # --- [NEW] FULL CONFIG PARSING ---
+                def parse_cfg(key):
+                    val = agent_settings.get(key, {})
+                    if isinstance(val, str):
+                        try: return json.loads(val)
+                        except: return {}
+                    return val if isinstance(val, dict) else {}
 
-                # 3. Get User Message & Metadata
-                prompt_res = await asyncio.to_thread(
-                    lambda: self.supabase.table("messages").select("content, metadata").eq("id", msg_id).execute()
-                )
+                persona_config = parse_cfg("persona_config")
+                advanced_config = parse_cfg("advanced_config") # contains historyLimit
+                ticketing_config = parse_cfg("ticketing_config") # contains categories
                 
-                user_prompt = ""
-                msg_metadata = {}
-                
-                if prompt_res.data:
-                    user_prompt = prompt_res.data[0].get("content", "") or ""
-                    msg_metadata = prompt_res.data[0].get("metadata", {}) or {}
+                agent_name = persona_config.get("name", "AI Assistant")
 
-                # 4. Get History (✅ OPTIMIZED: Exclude current, deduplicate)
-                history_limit = 5
-                if isinstance(agent_settings.get("advanced_config"), dict):
-                    history_limit = int(agent_settings["advanced_config"].get("historyLimit", 5))
+                # =========================================================================
+                # 3. DYNAMIC SNAPSHOT (Respects 'historyLimit' from advanced_config)
+                # =========================================================================
+                history_limit = int(advanced_config.get("historyLimit", 5)) # DEFAULT 5
                 
+                
+                # Buffer fetch to find boundary
+                fetch_buffer = history_limit * 2 
                 msgs_res = await asyncio.to_thread(
                     lambda: self.supabase.table("messages")
                     .select("*")
                     .eq("chat_id", chat_id)
-                    .neq("id", msg_id)
                     .order("created_at", desc=True)
-                    .limit(history_limit * 2)
+                    .limit(fetch_buffer) 
                     .execute()
                 )
+                raw_snapshot = msgs_res.data
+
+                # =========================================================================
+                # 4. LAST ASSISTANT FILTER (The "Test 3" Cleaner)
+                # =========================================================================
+                pending_user_messages = []
+                last_assistant_message = None
                 
-                raw_history = msgs_res.data[::-1] # Chronological order
-                history = []
-                last_content = None
-                
-                for msg in raw_history:
-                    content = msg.get("content", "").strip()
-                    if not content or content == last_content:
-                        continue
-                    history.append(msg)
-                    last_content = content
-                    if len(history) >= history_limit:
+                for msg in raw_snapshot:
+                    sender = msg.get("sender_type")
+                    if sender == "ai":
+                        last_assistant_message = msg
                         break
+                    else:
+                        pending_user_messages.append(msg)
 
-                # ==================================================================================
-                # [NEW CONCEPT] 1. MULTI-IMAGE COLLECTOR (Handle "Batch" Images)
-                # ==================================================================================
+                if not last_assistant_message and not pending_user_messages:
+                     pending_user_messages = raw_snapshot
+
+                pending_user_messages = pending_user_messages[::-1] 
+
+                if not pending_user_messages:
+                    return {"success": False, "reason": "no_pending_messages"}
+
+                full_user_prompt_text = "\n".join(
+                    [m.get("content", "") for m in pending_user_messages if m.get("content")]
+                )
+                
+                clean_history = []
+                if last_assistant_message:
+                    clean_history.append(last_assistant_message)
+                
+                # =========================================================================
+                # 5. VISION & RAG
+                # =========================================================================
                 valid_image_urls = []
-                
-                # A. Check Current Message
-                if msg_metadata.get("media_url"):
-                    url = msg_metadata["media_url"]
-                    if "image" in str(msg_metadata.get("media_type", "")).lower() or any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                for pm in pending_user_messages:
+                    meta = pm.get("metadata") or {}
+                    url = meta.get("media_url")
+                    if url and ("image" in str(meta.get("media_type", "")).lower() or any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp'])):
                         valid_image_urls.append(url)
-
-                # B. Check Recent History (Sticky "Batch" logic)
-                # If user sent images in the last few seconds/messages (last 2), include them.
-                for hist_msg in history[-2:]:
-                    meta = hist_msg.get("metadata") or {}
-                    h_url = meta.get("media_url")
-                    if hist_msg.get("sender_type") == "user" and h_url:
-                        if "image" in str(meta.get("media_type", "")).lower() or any(ext in h_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
-                            valid_image_urls.append(h_url)
                 
-                valid_image_urls = list(set(valid_image_urls)) # Deduplicate
-                if valid_image_urls:
-                    logger.info(f"📸 Image Collector: Found {len(valid_image_urls)} images.")
-
-                # ==================================================================================
-                # [NEW CONCEPT] 2. VISION INTERCEPTOR (The "Bridge" for Knowledge Base)
-                # ==================================================================================
                 vision_context = ""
-                
                 if valid_image_urls:
-                    # We use the AI to "READ" the image before RAG searches.
-                    # This allows "RC 12" pixels to match "RC 12" text in your DOCX.
                     target_img = valid_image_urls[0] 
-                    logger.info(f"👁️ Vision Interceptor: analyzing {target_img}")
-                    
-                    vision_prompt = (
-                        "Analyze this error screen. "
-                        "1. Extract EXACT Error Codes (e.g., 'RC 12', 'Error 505'). "
-                        "2. Extract the main error message text. "
-                        "3. Ignore irrelevant UI elements."
-                    )
+                    custom_vision = advanced_config.get("vision_prompt")
+                    vision_prompt = custom_vision if custom_vision else "Analyze this image. Extract ALL text/codes. Describe context."
                     
                     try:
-                        # Call the Agent's Helper Method
                         vision_desc = await self.speaker.analyze_image(
                             image_url=target_img, 
                             prompt=vision_prompt,
                             organization_id=chat.get("organization_id", "")
                         )
-                        logger.info(f"📝 Vision Output: {vision_desc}")
                         vision_context = f"\nSystem Analysis of User Image: {vision_desc}"
-                    except Exception as e:
-                        logger.warning(f"⚠️ Vision Interceptor Failed: {e}")
+                    except: pass
 
-                # ==================================================================================
-                # [NEW CONCEPT] 3. ENRICHED RAG (No Skipping)
-                # ==================================================================================
-                # Search ChromaDB with: User Text + Vision Description
-                rag_query = f"{user_prompt} {vision_context}".strip()
+                rag_query = f"{full_user_prompt_text} {vision_context}".strip()
                 context = ""
-                
-                # [FIX] REMOVED "len > 2" check. We ALWAYS RAG if there is any content/image.
                 if rag_query and self.reader:
                     try:
                         context = await self.reader.query_context(query=rag_query, agent_id=agent_id)
-                        if context:
-                            logger.info(f"📖 Reader V2 found context ({len(context)} chars)")
-                    except Exception as rag_err:
-                        logger.warning(f"⚠️ RAG Skipped (Service Error): {rag_err}")
-                
-                # ==================================================================================
-                # 4. CALL SPEAKER V2 (With List of Images)
-                # ==================================================================================
+                    except: pass
+
+                # 6. CALL SPEAKER V2 (With TICKET CATEGORIES)
+                ticket_categories = ticketing_config.get("categories", [])
+                logger.info(f"🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀 How much ? \n{clean_history}")
                 response_data = await self.speaker.process_message(
                     chat_id=chat_id,
-                    customer_message=user_prompt,
-                    chat_history=history,
+                    customer_message=full_user_prompt_text, 
+                    chat_history=clean_history,             
                     agent_settings=agent_settings,
                     organization_id=chat.get("organization_id", ""), 
                     rag_context=context,
                     category=priority, 
                     name_user=real_customer_name,
-                    image_urls=valid_image_urls # [FIX] Passing LIST now
+                    image_urls=valid_image_urls,
+                    ticket_categories=ticket_categories 
                 )
                 
                 reply_text = response_data.get("content", "Maaf, saya tidak dapat menjawab saat ini.")
+                # AI might return a category like "elektronik"
+                detected_category = response_data.get("category", priority) 
                 usage = response_data.get("usage", {})
                 metadata = response_data.get("metadata", {})
                 
-                # [STABLE RATE LIMIT CHECK]
                 if metadata.get("is_error", False):
                     if not self._check_and_update_alert_cooldown(chat_id):
-                        logger.warning(f"🛑 Suppression: System Alert rate limit active for {chat_id}")
                         return {"success": False, "reason": "alert_rate_limit"}
 
-                # 8. Save Response
+                # 8. Save Response (Include Category in Metadata for Webhook/Ticketing Service)
                 ai_msg = {
                     "chat_id": chat_id,
                     "sender_type": "ai",
@@ -309,79 +263,37 @@ class DynamicAIServiceV2:
                         "is_internal": False,
                         "model": "v2_proxy_local",
                         "rag_enabled": bool(context),
-                        "guard_priority": priority,
+                        "guard_priority": detected_category, # AI's classification
                         "token_usage": usage,
                         "is_error": metadata.get("is_error", False)
                     }
                 }
 
-                res = await asyncio.to_thread(
-                    lambda: self.supabase.table("messages").insert(ai_msg).execute()
-                )
-                
+                res = await asyncio.to_thread(lambda: self.supabase.table("messages").insert(ai_msg).execute())
                 full_db_record = res.data[0]
-                ai_message_id = full_db_record["id"]
-
-                # 9. Broadcast (Using Standard Method)
                 await self._broadcast_response(chat, full_db_record, agent_name)
 
-                # 10. TRACK CREDITS (Billing)
-                is_system_error = metadata.get("is_error", False)
-                if usage and chat.get("organization_id") and not is_system_error:
+                # Billing
+                if usage and chat.get("organization_id") and not metadata.get("is_error", False):
                     try:
                         total_tokens = usage.get("total_tokens", 0)
-                        # Example Cost: $0.000002 per token
                         cost = total_tokens * 0.000002
-                        
                         if cost > 0:
                             await self.credit_service.add_transaction(CreditTransactionCreate(
                                 organization_id=chat["organization_id"],
                                 amount=-cost, 
                                 description=f"AI Response (Tokens: {total_tokens})",
                                 transaction_type=TransactionType.USAGE,
-                                metadata={"chat_id": chat_id, "message_id": ai_message_id}
+                                metadata={"chat_id": chat_id, "message_id": full_db_record["id"]}
                             ))
-                    except Exception as e:
-                        logger.error(f"⚠️ Credit tracking failed: {e}")
-                elif is_system_error:
-                    logger.info("💳 Credit deduction skipped (System Error Response)")
+                    except: pass
 
-                return {"success": True, "ai_message_id": ai_message_id}
+                return {"success": True, "ai_message_id": full_db_record["id"]}
 
             except Exception as e:
-                logger.error(f"❌ Manager V2 Critical Failure: {e}")
-                
-                # FALLBACK MECHANISM
-                if chat:
-                    try:
-                        # [FALLBACK RATE LIMIT]
-                        if not self._check_and_update_alert_cooldown(chat_id):
-                            logger.warning("🛑 Fallback Suppression: Rate limit active.")
-                            return {"success": False, "error": str(e), "suppressed": True}
-
-                        fallback_agent_id = agent_id if agent_id else "ai_agent_v2"
-                        error_msg = "Maaf, sistem sedang mengalami gangguan teknis. Mohon coba lagi nanti."
-                        
-                        fallback_payload = {
-                            "chat_id": chat_id,
-                            "sender_type": "ai",
-                            "sender_id": fallback_agent_id, 
-                            "content": error_msg,
-                            "metadata": {"error": str(e), "fallback": True}
-                        }
-                        
-                        res = await asyncio.to_thread(
-                            lambda: self.supabase.table("messages").insert(fallback_payload).execute()
-                        )
-                        
-                        # Broadcast Fallback
-                        await self._broadcast_response(chat, res.data[0], agent_name or "System AI")
-                        
-                    except Exception as final_err:
-                        logger.error(f"💀 Final Fallback Failed: {final_err}")
-
+                logger.error(f"❌ Manager V2 Critical Failure: {e}", exc_info=True)
                 return {"success": False, "error": str(e)}
-                         
+                                                 
 def process_dynamic_ai_response_v2(chat_id: str, msg_id: str, supabase: Any, priority: str = "medium"):
     service = DynamicAIServiceV2(supabase)
     return service.process_and_respond(chat_id, msg_id, priority)
