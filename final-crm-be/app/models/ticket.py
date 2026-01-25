@@ -111,3 +111,13 @@ class Ticket(BaseModel):
 class TicketListResponse(BaseModel):
     tickets: List[Ticket]
     total: int
+
+
+class AITicketUpdatePayload(BaseModel):
+    """Payload for AI Ticket modifications"""
+    ticket_id: str = Field(..., description="UUID of the ticket to update")  # <-- ADD THIS
+    title: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    priority: Optional[TicketPriority] = None
+    reason: str = Field(..., description="Why is the AI changing this?")

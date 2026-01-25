@@ -292,60 +292,48 @@ class WebhookCallbackService:
             logger.error(f"❌ WhatsApp message send failed: {e}")
             return {"success": False, "reason": "error", "error": str(e)}
                                                  
-    # [CRITICAL FIX] Added media_url argument
+    # [CRITICAL FIX] Telegram Routing Logic - STRICT CONTEXT
     async def send_telegram_callback(self, chat: Dict[str, Any], message_content: str, supabase, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:
             logger.info(f"✈️ Processing Telegram callback for chat: {chat['id']}")
             
             customer_id = chat.get("customer_id")
-            cust_res = supabase.table("customers").select("metadata, phone").eq("id", customer_id).execute()
+            cust_res = supabase.table("customers").select("metadata, phone, name").eq("id", customer_id).execute()
             if not cust_res.data: raise Exception("Customer not found")
 
             customer_data = cust_res.data[0]
-            telegram_id = customer_data.get("metadata", {}).get("telegram_id")
-            raw_phone = customer_data.get("phone")
             
-            target_id = telegram_id
-            if not target_id and raw_phone:
-                target_id = f"+{self._normalize_phone_number(raw_phone)}"
+            # 1. Default: Private DM to User ID (Phone)
+            target_id = customer_data.get("metadata", {}).get("telegram_id")
+            if not target_id: target_id = customer_data.get("phone")
             
-            if not target_id: raise Exception("No Target ID found")
-
-            # [FIX] GROUP MENTION LOGIC (Telegram)
-            # Telegram Group IDs start with "-" (e.g. -100123456789)
-            if str(target_id).startswith("-"):
-                try:
-                    # 1. Fetch the LAST MESSAGE to know exactly who we are replying to
-                    last_msg = supabase.table("messages") \
-                        .select("metadata") \
-                        .eq("chat_id", chat["id"]) \
-                        .eq("sender_type", "customer") \
-                        .order("created_at", desc=True) \
-                        .limit(1) \
-                        .execute()
-
-                    if last_msg.data:
-                        meta = last_msg.data[0].get("metadata", {})
+            # 2. Check for Group Context
+            try:
+                last_msg = supabase.table("messages").select("metadata").eq("chat_id", chat["id"]).eq("sender_type", "customer").order("created_at", desc=True).limit(1).execute()
+                
+                if last_msg.data:
+                    meta = last_msg.data[0].get("metadata", {}) or {}
+                    # STRICT: Only if the message came from a group
+                    group_id = meta.get("target_group_id") or meta.get("last_seen_in_group")
+                    
+                    if group_id:
+                        logger.info(f"🎯 Group Context: {group_id}")
+                        target_id = group_id # Override
                         
-                        # Extract Telegram User Details (Saved by webhook.py)
-                        sender_uid = meta.get("telegram_sender_id") or meta.get("participant")
-                        sender_name = meta.get("sender_display_name") or "User"
+                        # Add Mention
+                        user_id = meta.get("telegram_sender_id") or meta.get("participant") or customer_data.get("metadata", {}).get("telegram_user_id")
+                        user_name = meta.get("sender_display_name") or customer_data.get("name") or "User"
                         
-                        if sender_uid:
-                            # 2. Construct Mention (Markdown Format)
-                            # Telegram requires: [Name](tg://user?id=12345) to make it clickable/blue
-                            mention_link = f"[{sender_name}](tg://user?id={sender_uid})"
-                            
-                            # Prepend to message body
-                            message_content = f"{mention_link} {message_content}"
-                            
-                            logger.info(f"🏷️ Telegram Auto-Mention: {mention_link}")
-                except Exception as ex:
-                    logger.warning(f"⚠️ Failed to resolve mention for Telegram group: {ex}")
+                        if user_id:
+                            mention = f"[{user_name}](tg://user?id={user_id})"
+                            if mention not in message_content:
+                                message_content = f"{mention} {message_content}"
+            except Exception as e:
+                logger.warning(f"⚠️ Context check failed: {e}")
+
+            if not target_id: raise Exception("No Target ID resolved")
 
             sender_agent_id = chat.get("sender_agent_id") or chat.get("ai_agent_id")
-            
-            # Userbot Logic
             return await self.send_telegram_userbot_callback(
                 agent_id=sender_agent_id, 
                 telegram_id=target_id, 
@@ -354,9 +342,10 @@ class WebhookCallbackService:
             )
 
         except Exception as e:
-            logger.error(f"❌ Telegram callback failed: {e}")
+            logger.error(f"❌ Telegram Send Failed: {e}")
             return {"success": False, "error": str(e)}
-               
+            
+                                                                             
     # [CRITICAL FIX] Added media_url argument and payload inclusion
     async def send_telegram_userbot_callback(self, agent_id: str, telegram_id: str, message_content: str, media_url: Optional[str] = None) -> Dict[str, Any]:
         try:

@@ -31,7 +31,7 @@ from app.services.agent_finder_service import get_agent_finder_service
 from app.services.websocket_service import get_connection_manager
 
 from app.config import settings as app_settings
-from app.models.ticket import TicketCreate, ActorType, TicketPriority, TicketDecision
+from app.models.ticket import TicketCreate, ActorType, TicketPriority, AITicketUpdatePayload, TicketUpdate
 from app.services.ticket_service import get_ticket_service
 from app.api.crm_chats import send_message_via_channel
 from app.utils.schedule_validator import get_agent_schedule_config, is_within_schedule
@@ -577,41 +577,6 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
         }
     )
 
-async def _handle_message_content_for_telegram(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
-    """Safe Content Handler for Telegram"""
-    content = ""
-    msg_type = "text"
-    media_url = None
-    
-    if data_type == "media":
-        # [FIX] Unwrap messageMedia if present (Tele-service nests it)
-        media_obj = message_data.get("messageMedia", {}) or message_data
-        
-        base64_data = media_obj.get("data") or media_obj.get("body")
-        if not base64_data: raise ValueError("Media data missing")
-
-        mime = media_obj.get("mimetype", "application/octet-stream")
-        content = media_obj.get("caption", "")
-
-        if "image" in mime: msg_type = "image"
-        elif "video" in mime: msg_type = "video"
-        elif "audio" in mime: msg_type = "audio"
-        elif "pdf" in mime: msg_type = "document"
-        else: msg_type = "file"
-
-        ext = "bin"
-        if "/" in mime: ext = mime.split("/")[-1].replace("jpeg", "jpg")
-        
-        media_url = await _upload_media_to_supabase(base64_data, mime, ext)
-    else:
-        # Text
-        data_wrapper = message_data.get("message", {}) or {}
-        data_content = data_wrapper.get("_data", {}) or data_wrapper
-        content = data_content.get("body", "")
-        msg_type = "text"
-
-    return content, msg_type, media_url
-
 async def process_webhook_message_v2(
     agent: Dict, channel: str, contact: str, message_content: str,
     customer_name: Optional[str], message_metadata: Dict, customer_metadata: Dict, supabase
@@ -723,10 +688,11 @@ async def process_webhook_message_v2(
     # 7. TICKET & AI TRIGGER
     queue_svc = get_llm_queue()
     ticket_svc = get_ticket_service()
-    ai_priority = "medium"
     
-    # [FIX] Gating Flag: Only run AI if this becomes True
+    # Defaults Ticket 
+    ai_priority = "low"
     ticket_ready = False
+    target_ticket_id = None  
 
     # Note: We keep the lock here to prevent two parallel webhooks from creating 
     # two duplicates tickets for the same chat.
@@ -743,8 +709,9 @@ async def process_webhook_message_v2(
                     if active_ticket.get("assigned_agent_id"): 
                         return {**res, "handled_by": "human_ticket"}
                     
-                    ai_priority = str(active_ticket.get("priority", "medium")).lower()
-                    ticket_ready = True # ✅ Safe to run AI
+                    ai_priority = str(active_ticket.get("priority")).lower() # its not only medium so lets data decide
+                    target_ticket_id = active_ticket.get("id")
+                    ticket_ready = True
                 else:
                     # Case B: Create New Ticket
                     ticket_config = parse_agent_config(agent.get("ticketing_config"))
@@ -754,22 +721,26 @@ async def process_webhook_message_v2(
                         description=f"First Message: {message_content}\n\n[Auto-created: Low Priority Default]",
                         priority=TicketPriority.LOW, category="General"
                     )
-                    # This call is now SYNCHRONOUS safe if you applied the TicketService fix
-                    await ticket_svc.create_ticket(new_ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
+                    # Create ticket returns the full Ticket object
+                    new_ticket = await ticket_svc.create_ticket(new_ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
                     
+                    target_ticket_id = new_ticket.id 
                     ai_priority = "low"
-                    ticket_ready = True # ✅ Safe to run AI
+                    ticket_ready = True
             except Exception as e:
                 logger.error(f"❌ Ticket Creation Flow Error: {e}")
-                # ticket_ready remains False, AI will NOT run
         else:
             logger.warning(f"⏳ Could not acquire ticket lock for {chat_id}. Skipping ticket creation check.")
-            # ticket_ready remains False. 
-            # Better to skip AI than to run it without a ticket context.
 
     # [FIX] Only enqueue if we are SURE the ticket exists
-    if ticket_ready:
-        await queue_svc.enqueue(chat_id=chat_id, message_id=msg_id, supabase_client=supabase, priority=ai_priority)
+    if ticket_ready and target_ticket_id:
+        await queue_svc.enqueue(
+            chat_id=chat_id, 
+            message_id=msg_id, 
+            supabase_client=supabase, 
+            priority=ai_priority,
+            ticket_id=target_ticket_id 
+        )
         return {**res, "handled_by": "ai_v2_queued"}
     else:
         logger.error(f"🛑 Skipping AI for chat {chat_id}: Ticket context missing or lock failed.")
@@ -1011,6 +982,58 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
 # 3. TELEGRAM USERBOT WEBHOOK (Updated)
 # ============================================
 
+# [REPLACE THIS FUNCTION IN app/api/webhook.py]
+async def _handle_message_content_for_telegram(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
+    """Safe Content Handler for Telegram (Fixed for Userbot Media)"""
+    content = ""
+    msg_type = "text"
+    media_url = None
+    
+    if data_type == "media":
+        # 1. Unwrap messageMedia
+        media_obj = message_data.get("messageMedia", {}) or message_data
+        
+        # 2. Get Base64: Check 'data', 'body', AND '_data.body' (The Fix)
+        base64_data = media_obj.get("data") or media_obj.get("body")
+        if not base64_data:
+            base64_data = media_obj.get("_data", {}).get("body") # <--- Found it here
+
+        if not base64_data: 
+            # Check for thumbnail as last resort
+            base64_data = media_obj.get("thumbnail") or media_obj.get("_data", {}).get("thumbnail")
+
+        if not base64_data: 
+            return "[Image/Media - Download Failed]", "text", None
+
+        # [FIX] Sanitize Bad Base64 (The "Incorrect Padding" Fix)
+        if "," in base64_data: base64_data = base64_data.split(",")[1]
+        base64_data = base64_data.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+
+        # 3. Metadata
+        mime = media_obj.get("mimetype", "application/octet-stream")
+        content = media_obj.get("caption", "")
+
+        if "image" in mime: msg_type = "image"
+        elif "video" in mime: msg_type = "video"
+        elif "audio" in mime: msg_type = "audio"
+        elif "pdf" in mime: msg_type = "document"
+        else: msg_type = "file"
+
+        ext = "bin"
+        if "/" in mime: ext = mime.split("/")[-1].replace("jpeg", "jpg")
+        
+        # 4. Upload using YOUR helper (No new imports)
+        media_url = await _upload_media_to_supabase(base64_data, mime, ext)
+    else:
+        # Text
+        data_wrapper = message_data.get("message", {}) or {}
+        data_content = data_wrapper.get("_data", {}) or data_wrapper
+        content = data_content.get("body", "")
+        msg_type = "text"
+
+    return content, msg_type, media_url
+
+# [REPLACE THIS FUNCTION IN app/api/webhook.py]
 @router.post("/telegram-userbot", response_model=WebhookRouteResponse)
 async def telegram_userbot_webhook(
     payload: WhatsAppUnofficialWebhookMessage, 
@@ -1018,148 +1041,220 @@ async def telegram_userbot_webhook(
 ):
     try:
         agent_id = payload.sessionId
-        raw_data = payload.data
         
-        # 1. Adapt Content Source
-        if payload.dataType == "media":
-            content_source = raw_data
-            data_wrapper = raw_data.get("message", {}) or {}
-            data_content = data_wrapper.get("_data", {}) or data_wrapper
-        else:
-            data_wrapper = raw_data.get("message", {}) or {}
-            data_content = data_wrapper.get("_data", {}) or data_wrapper
-            content_source = raw_data
+        # [DEBUG LOG] See exactly who is calling
+        logger.info(f"⚡ Telegram Webhook Triggered. Session ID: {agent_id}")
 
-        # 2. Basic Validation
-        if not data_content and payload.dataType != "media": 
-            raise HTTPException(status_code=400, detail="Invalid JSON structure")
-        
-        # 3. Redis Idempotency Check
-        msg_id = data_content.get("id", {}).get("id")
-        if msg_id:
-            dedup_key = f"tg_{msg_id}"
-            if await is_duplicate_message(dedup_key):
-                return JSONResponse(content={"success": True, "status": "ignored_duplicate"})
-
-        # 4. Agent Verification
+        # 1. Agent Verification (The source of your 404)
         supabase = get_supabase_client()
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
-        if not agent_res.data: 
-            raise HTTPException(404, "Agent not found")
+        
+        if not agent_res.data:
+            error_msg = f"❌ Agent ID '{agent_id}' not found in DB. Please register it."
+            logger.error(error_msg)
+            # Return 404 but with a helpful message
+            raise HTTPException(status_code=404, detail=error_msg)
+            
         agent = agent_res.data[0]
         
+        # Load settings
         settings_data = await fetch_agent_settings(supabase, agent_id)
         if settings_data: agent.update(settings_data)
 
-        # 5. Identity & Group Extraction
+        # 2. Content Extraction
+        raw_data = payload.data
+        data_content = {}
+        search_candidates = [
+            raw_data, raw_data.get("message", {}), raw_data.get("_data", {}), raw_data.get("message", {}).get("_data", {})
+        ]
+        for candidate in search_candidates:
+            if isinstance(candidate, dict) and (candidate.get("from") or candidate.get("to")):
+                data_content = candidate
+                break
+        if not data_content: data_content = raw_data
+
+        # 3. Identity & Group Logic
         sender_id = str(data_content.get("from", ""))
-        sender_display_name = data_content.get("notifyName") or f"User {sender_id}"
-        timestamp_unix = data_content.get("t")
-
+        sender_name = data_content.get("notifyName") or f"User {sender_id}"
+        
         is_group_tele = data_content.get("is_group", False)
-        is_mentioned = data_content.get("mentioned", False)
         contact_target = sender_id 
-        participant_id = None
-
-        logger.info(f"🔍 TELEGRAM GROUP CHECK - is_group: {is_group_tele}, is_mentioned: {is_mentioned}")
-        logger.info(f"🔍 TELEGRAM GROUP CHECK - sender_id: {sender_id}, sender_name: {sender_display_name}")
-
+        
         if is_group_tele:
-            logger.info(f"📱 TELEGRAM GROUP MESSAGE DETECTED")
-            logger.info(f"   - Group ID (to): {data_content.get('to', '')}")
-            logger.info(f"   - Participant (from): {sender_id}")
-            logger.info(f"   - Mentioned flag: {is_mentioned}")
-            logger.info(f"   - Full data_content keys: {list(data_content.keys())}")
+            # Strict Mention Check
+            if not data_content.get("mentioned", False):
+                return JSONResponse(content={"status": "ignored_no_mention"})
             
-            if not is_mentioned:
-                logger.warning(f"❌ TELEGRAM GROUP IGNORED - No mention flag detected")
-                logger.warning(f"   - Sender: {sender_display_name} ({sender_id})")
-                logger.warning(f"   - Group: {data_content.get('to', '')}")
-                return JSONResponse(content={"success": True, "status": "ignored_group_no_mention"})
-            
-            logger.info(f"✅ TELEGRAM GROUP MENTION CONFIRMED")
             contact_target = str(data_content.get("to", "")) 
-            participant_id = sender_id
-            logger.info(f"   - Contact target set to group: {contact_target}")
-            logger.info(f"   - Participant set to sender: {participant_id}")
+            logger.info(f"✅ Group Mention: {contact_target} from {sender_id}")
 
-        # 6. Phone Logic
-        raw_phone = data_content.get("phone")
-        final_phone = sender_id
-        logger.info(f"🔍 TELEGRAM PHONE CHECK - raw_phone: {raw_phone}")
+        if not contact_target or contact_target == "None":
+            contact_target = data_content.get("id", {}).get("remote")
+            if not contact_target:
+                return JSONResponse(content={"status": "ignored_missing_id"})
 
-        if raw_phone and str(raw_phone).lower() not in ["none", "null", ""]:
-            final_phone = str(raw_phone)
-            logger.info(f"✅ Using real phone number: {final_phone}")
-        else:
-            logger.info(f"⚠️ No valid phone, using sender_id: {final_phone}")
-
-        # 7. Content Extraction
-        message_text, msg_type, media_url = await _handle_message_content_for_telegram(
-            content_source, 
+        # 4. Payload Prep & Media Extraction
+        msg_id = data_content.get("id", {}).get("id") or str(uuid.uuid4())
+        timestamp_unix = data_content.get("t")
+        
+        # Use the ROBUST handler
+        text, type_str, url = await _handle_message_content_for_telegram(
+            raw_data, 
             payload.dataType
         )
-
-        logger.info(f"📝 TELEGRAM MESSAGE CONTENT:")
-        logger.info(f"   - Type: {msg_type}")
-        logger.info(f"   - Text (before cleaning): '{message_text}'")
-        logger.info(f"   - Media URL: {media_url}")
         
-        # 1. CLEAN TELEGRAM SPAM: Removes "[Account](tg://user?id=123)"
-        if message_text:
-            original_text = message_text
-            message_text = re.sub(r"\[.*?\]\(tg://user\?id=\d+\)\s*", "", message_text).strip()
-            if original_text != message_text:
-                logger.info(f"🧹 CLEANED mention spam: '{original_text}' → '{message_text}'")
+        if text: text = re.sub(r"\[.*?\]\(tg://user\?id=\d+\)\s*", "", text).strip()
 
-        # 8. Prepare Metadata (URL is still saved here for the FE to render as an attachment)
         msg_meta = {
-            "source_format": "wa_unofficial_json", 
-            "telegram_message_id": msg_id, 
-            "telegram_sender_id": sender_id, 
-            "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None,
-            "media_url": media_url, # <--- FE reads this to show the image
-            "message_type": msg_type,
+            "telegram_message_id": msg_id,
+            "telegram_sender_id": sender_id,
             "is_group": is_group_tele,
-            "participant": participant_id,
-            "sender_display_name": sender_display_name
+            "media_url": url,
+            "message_type": type_str,
+            "sender_display_name": sender_name,
+            "timestamp": datetime.fromtimestamp(timestamp_unix).isoformat() if timestamp_unix else None
         }
-        
+
         cust_meta = { 
-            "telegram_id": contact_target, 
-            "phone": final_phone if not is_group_tele else None,
+            "phone": sender_id, 
             "source": "telegram_userbot",
             "is_group": is_group_tele
         }
 
-        # 9. Process
+        # 5. Route
         result = await process_webhook_message_v2(
-            agent=agent, 
-            channel="telegram", 
-            contact=contact_target, 
-            message_content=message_text, 
-            customer_name=sender_display_name, 
-            message_metadata=msg_meta, 
-            customer_metadata=cust_meta, 
+            agent=agent,
+            channel="telegram",
+            contact=contact_target,
+            message_content=text,
+            customer_name=sender_name,
+            message_metadata=msg_meta,
+            customer_metadata=cust_meta,
             supabase=supabase
         )
-        
+
         return WebhookRouteResponse(
-            success=True, 
-            chat_id=result.get("chat_id"), 
-            message_id=result.get("message_id"), 
-            customer_id=result.get("customer_id"), 
+            success=True,
+            chat_id=result.get("chat_id"),
+            message_id=result.get("message_id"),
+            customer_id=result.get("customer_id"),
             is_new_chat=result.get("is_new_chat", False),
-            was_reopened=result.get("was_reopened", False), 
-            handled_by=result.get("handled_by", "ai_v2"), 
-            status=result.get("status", "open"), 
-            channel="telegram", 
+            was_reopened=result.get("was_reopened", False),
+            handled_by=result.get("handled_by", "manual_only"),
+            status=result.get("status", "open"),
+            channel="telegram",
             message=_generate_status_message(result)
         )
-        
-    except HTTPException:
-        raise
+
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        logger.error(f"❌ Telegram Userbot Critical: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        logger.error(f"❌ Telegram Webhook Error: {e}", exc_info=True)
+        return JSONResponse(content={"success": False, "error": str(e)})
+                
+# ============================================
+# 4. WEBHOOK AI Ticket Update(Updated)
+# ============================================
+
+@router.put(
+    "/ai/ticket/update",  # <--- FIXED: Removed {ticket_id} from path
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+    summary="AI Ticket Update Action",
+    description="Allow AI to modify ticket details. STRICTLY GUARDED: Only works if current priority is LOW."
+)
+async def ai_update_ticket_webhook(
+    payload: AITicketUpdatePayload, # <--- FIXED: Removed ticket_id arg
+    secret: str = Depends(get_webhook_secret) 
+):
+    """
+    Webhook for the AI Agent to autonomously update a ticket.
+    """
+    try:
+        supabase = get_supabase_client()
+        ticket_service = get_ticket_service()
+
+        logger.info(f"🤖 AI Action: Attempting to update Ticket {payload.ticket_id}")
+
+        existing = supabase.table("tickets")\
+            .select("*")\
+            .eq("id", payload.ticket_id)\
+            .single()\
+            .execute()
+
+        if not existing.data:
+            raise HTTPException(404, "Ticket not found")
+
+        ticket = existing.data
+        # Robustly handle missing priority key
+        current_prio = str(ticket.get("priority") or "low").lower()
+
+        # 2. 🛡️ GUARD: Low Priority Check
+        # AI can ONLY touch 'low' priority tickets.
+        if current_prio != "low":
+            logger.warning(f"⛔ AI Guard Triggered: Attempted to modify {current_prio} ticket {payload.ticket_id}")
+            return JSONResponse(
+                status_code=403, 
+                content={
+                    "success": False,
+                    "error": "AI_GUARD_VIOLATION",
+                    "message": f"AI permission denied. Ticket priority is '{current_prio}', but AI can only modify 'low' priority tickets."
+                }
+            )
+
+        # 3. Prepare Update Data
+        update_data = TicketUpdate()
+        changes_made = []
+
+        if payload.title and payload.title != ticket.get("title"):
+            update_data.title = payload.title
+            changes_made.append(f"Title: {payload.title}")
+        
+        if payload.category and payload.category != ticket.get("category"):
+            update_data.category = payload.category
+            changes_made.append(f"Category: {payload.category}")
+
+        if payload.description and payload.description != ticket.get("description"):
+            update_data.description = payload.description
+            changes_made.append("Description updated")
+            
+        if payload.priority and payload.priority.value != current_prio:
+            update_data.priority = payload.priority
+            changes_made.append(f"Priority: {payload.priority.value}")
+
+        if not changes_made:
+            return {"success": True, "message": "No changes detected", "ticket": ticket}
+
+        # 4. Execute Update via Service
+        # We explicitly log the actor as 'AI' (using None as ID, ActorType.AI)
+        updated_ticket = await ticket_service.update_ticket(
+            ticket_id=payload.ticket_id,
+            update_data=update_data,
+            actor_id=None, 
+            actor_type=ActorType.AI 
+        )
+
+        # 5. Log the Reason specifically
+        await ticket_service.log_activity(
+            ticket_id=payload.ticket_id,
+            action="ai_update",
+            description=f"AI updated: {', '.join(changes_made)}. Reason: {payload.reason}",
+            actor_id=None,
+            actor_type=ActorType.AI
+        )
+
+        logger.info(f"✅ AI Updated Ticket {payload.ticket_id}: {payload.reason}")
+
+        return {
+            "success": True,
+            "message": "Ticket updated successfully",
+            "changes": changes_made,
+            "ticket": updated_ticket
+        }
+
+    except Exception as e:
+        logger.error(f"❌ AI Ticket Update Error: {e}")
+        return JSONResponse(
+            status_code=500, 
+            content={"success": False, "error": str(e)}
+        )

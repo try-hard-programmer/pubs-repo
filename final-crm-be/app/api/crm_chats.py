@@ -1532,7 +1532,6 @@ async def create_message(
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
-        wa_service = get_whatsapp_service() # Init early for JIT lookup
         
         # 1. Aggressive Sanitization
         if content is None or str(content).lower() in ["null", "undefined"]:
@@ -1542,6 +1541,10 @@ async def create_message(
         chat_full_res = supabase.table("chats").select("*").eq("id", chat_id).single().execute()
         if not chat_full_res.data: raise HTTPException(404, f"Chat {chat_id} not found")
         chat_data = chat_full_res.data
+        current_channel = chat_data.get("channel")
+
+        # [LOG] START TRACE
+        logger.info(f"📨 [DEBUG_SEND] Init Chat {chat_id} | Channel: {current_channel} | Sender: {sender_type}")
 
         # 3. Parse Metadata
         msg_metadata = {}
@@ -1549,97 +1552,85 @@ async def create_message(
             try: msg_metadata = json.loads(metadata)
             except: logger.warning("Invalid metadata JSON")
 
-        # [VAR] content_to_send will hold the text/caption with the @Phone tag
+        # 4. [CRITICAL FIX] Channel-Specific Preparation
+        # We separate variables to avoid cross-contamination between WA/Tele logic
+        destination_phone = None
+        mentions_list = []
         content_to_send = content 
 
-        # 4. [CRITICAL FIX] Group Routing & Tagging Logic
-        
-        cust_res = supabase.table("customers").select("phone").eq("id", chat_data["customer_id"]).single().execute()
-        if not cust_res.data: raise HTTPException(404, "Customer not found")
-        
-        # Default Destination: The customer's phone (might be a LID)
-        destination_phone = cust_res.data.get("phone")
-        mentions_list = []
-        
-        # Logic: If this is a WhatsApp reply, check if we need to route to a GROUP
-        if sender_type in ["agent", "human"] and chat_data.get("channel") == "whatsapp":
-            try:
-                # Fetch LAST Message to find context
-                last_msg = supabase.table("messages") \
-                    .select("metadata") \
-                    .eq("chat_id", chat_id) \
-                    .eq("sender_type", "customer") \
-                    .order("created_at", desc=True) \
-                    .limit(1) \
-                    .execute()
+        # --- A. WHATSAPP SPECIFIC LOGIC ---
+        if current_channel == "whatsapp":
+            wa_service = get_whatsapp_service() # Init JIT
+            
+            cust_res = supabase.table("customers").select("phone").eq("id", chat_data["customer_id"]).single().execute()
+            if cust_res.data:
+                destination_phone = cust_res.data.get("phone")
 
-                if last_msg.data:
-                    last_meta = last_msg.data[0].get("metadata", {}) or {}
-                    
-                    # A. ROUTING: Check if we are in a group (target_group_id)
-                    # If found, we MUST send to this Group ID, not the private LID
-                    target_group_id = last_meta.get("target_group_id") or last_meta.get("last_seen_in_group")
-                    
-                    # B. TAGGING: Find the specific user (LID or Phone)
-                    original_sender = last_meta.get("group_participant") or last_meta.get("original_sender_id") or destination_phone
+            # Logic: If this is a WhatsApp reply, check if we need to route to a GROUP
+            if sender_type in ["agent", "human"]:
+                try:
+                    # Fetch LAST Message to find context
+                    last_msg = supabase.table("messages") \
+                        .select("metadata") \
+                        .eq("chat_id", chat_id) \
+                        .eq("sender_type", "customer") \
+                        .order("created_at", desc=True) \
+                        .limit(1) \
+                        .execute()
 
-                    if target_group_id:
-                        # Override destination to Group ID (Prevents 500 Error on LID DMs)
-                        destination_phone = target_group_id
-                        logger.info(f"🎯 [MANUAL] Routing to Group: {target_group_id}")
+                    if last_msg.data:
+                        last_meta = last_msg.data[0].get("metadata", {}) or {}
+                        
+                        # Routing: Check if we are in a group
+                        target_group_id = last_meta.get("target_group_id") or last_meta.get("last_seen_in_group")
+                        
+                        # Tagging: Find the specific user
+                        original_sender = last_meta.get("group_participant") or last_meta.get("original_sender_id") or destination_phone
 
-                    if original_sender and target_group_id:
-                        # Clean the ID
-                        raw_id = str(original_sender).split('@')[0]
-                        mention_tag = raw_id # Default tag is the raw ID
+                        if target_group_id:
+                            destination_phone = target_group_id
+                            logger.info(f"🎯 [DEBUG_SEND] WA Group Target Found: {target_group_id}")
 
-                        # [BLUE TAG FIX] If it's a LID (long ID), we MUST find the Real Phone
-                        # WhatsApp only renders Blue Tags for Real Numbers (e.g. 628...), not LIDs.
-                        if "@lid" in str(original_sender) or len(raw_id) >= 15:
-                            real_number_found = False
-                            
-                            # 1. Try DB Lookup first
-                            try:
-                                lid_res = supabase.table("customers") \
-                                    .select("phone") \
-                                    .eq("metadata->>whatsapp_lid", raw_id) \
-                                    .limit(1) \
-                                    .execute()
-                                
-                                if lid_res.data:
-                                    db_phone = lid_res.data[0].get("phone")
-                                    # Ensure DB didn't just give us back the LID
-                                    if db_phone and len(db_phone) < 15 and "g.us" not in db_phone:
-                                        mention_tag = db_phone.split('@')[0]
-                                        real_number_found = True
-                                        logger.info(f"✅ DB Swapped LID {raw_id} -> Phone {mention_tag}")
-                            except Exception: pass
+                        if original_sender and target_group_id:
+                            raw_id = str(original_sender).split('@')[0]
+                            mention_tag = raw_id 
 
-                            # 2. Try JIT API Lookup (Fallback if DB failed)
-                            if not real_number_found:
+                            # [BLUE TAG FIX] LID -> Real Phone
+                            if "@lid" in str(original_sender) or len(raw_id) >= 15:
+                                real_number_found = False
+                                # 1. DB Lookup
                                 try:
-                                    logger.info(f"🔄 Performing JIT API Lookup for {raw_id}...")
-                                    api_res = await wa_service.get_contact_by_id(
-                                        session_id=chat_data.get("sender_agent_id"),
-                                        chat_id=str(original_sender)
-                                    )
-                                    # Extract number from API response
-                                    if api_res.get("success") and api_res.get("number"):
-                                        mention_tag = api_res["number"]
-                                        logger.info(f"✅ API Swapped LID {raw_id} -> Phone {mention_tag}")
-                                except Exception as e:
-                                    logger.warning(f"⚠️ API Lookup failed: {e}")
+                                    lid_res = supabase.table("customers").select("phone").eq("metadata->>whatsapp_lid", raw_id).limit(1).execute()
+                                    if lid_res.data:
+                                        db_phone = lid_res.data[0].get("phone")
+                                        if db_phone and len(db_phone) < 15 and "g.us" not in db_phone:
+                                            mention_tag = db_phone.split('@')[0]
+                                            real_number_found = True
+                                            logger.info(f"✅ [DEBUG_SEND] DB Resolved LID {raw_id} -> {mention_tag}")
+                                except Exception: pass
 
-                        # 1. Add RAW ID to metadata (so WA knows who to notify)
-                        mentions_list = [str(original_sender)]
-                        msg_metadata["mentions"] = mentions_list
+                                # 2. API Lookup
+                                if not real_number_found:
+                                    try:
+                                        logger.info(f"🔄 [DEBUG_SEND] API Resolving LID {raw_id}...")
+                                        api_res = await wa_service.get_contact_by_id(
+                                            session_id=chat_data.get("sender_agent_id"),
+                                            chat_id=str(original_sender)
+                                        )
+                                        if api_res.get("success") and api_res.get("number"):
+                                            mention_tag = api_res["number"]
+                                            logger.info(f"✅ [DEBUG_SEND] API Resolved LID {raw_id} -> {mention_tag}")
+                                    except Exception as e:
+                                        logger.warning(f"⚠️ [DEBUG_SEND] API Lookup failed: {e}")
 
-                        # 2. Add REAL PHONE to Body/Caption (so WA renders Blue Tag)
-                        if f"@{mention_tag}" not in content:
-                            content_to_send = f"@{mention_tag} {content}"
+                            mentions_list = [str(original_sender)]
+                            
+                            # Add @Tag to content if missing
+                            if f"@{mention_tag}" not in content:
+                                content_to_send = f"@{mention_tag} {content}"
 
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to resolve group routing: {e}")
+                except Exception as e:
+                    logger.warning(f"⚠️ [DEBUG_SEND] WA Routing Logic Error: {e}")
 
         # ============================================
         # 5. HANDLE FILE UPLOAD
@@ -1673,10 +1664,10 @@ async def create_message(
                 msg_metadata["media_type"] = file.content_type
                 msg_metadata["is_document"] = not file.content_type.startswith("image/") and not file.content_type.startswith("video/")
                 
-                logger.info(f"✅ File uploaded: {public_url}")
+                logger.info(f"✅ [DEBUG_SEND] File uploaded: {public_url}")
 
             except Exception as e:
-                logger.error(f"❌ File upload failed: {e}")
+                logger.error(f"❌ [DEBUG_SEND] File upload failed: {e}")
                 raise HTTPException(500, f"File upload failed: {str(e)}")
 
         # ============================================
@@ -1686,7 +1677,7 @@ async def create_message(
             "chat_id": chat_id,
             "sender_type": sender_type,
             "sender_id": sender_id,
-            "content": content, # Store CLEAN content in DB (no auto-tag in history)
+            "content": content, # Store CLEAN content in DB
             "ticket_id": ticket_id,
             "metadata": msg_metadata
         }
@@ -1698,41 +1689,75 @@ async def create_message(
         supabase.table("chats").update({"last_message_at": datetime.utcnow().isoformat()}).eq("id", chat_id).execute()
 
         # ============================================
-        # 7. SEND TO CHANNEL (WhatsApp)
+        # 7. SEND TO EXTERNAL CHANNEL (FIXED)
         # ============================================
         if sender_type in ["agent", "ai", "human"]:
-            try:
-                # Use content_to_send (Has Tags) and destination_phone (Has Group ID)
-                if not file:
-                    await wa_service.send_text_message(
-                        session_id=chat_data.get("sender_agent_id"),
-                        phone_number=destination_phone, 
-                        message=content_to_send, 
-                        mentions=mentions_list
+            
+            # --- TELEGRAM LOGIC ---
+            if current_channel == "telegram":
+                logger.info(f"🚀 [MANUAL SEND] Routing to TELEGRAM...")
+                try:
+                    svc = get_webhook_callback_service()
+                    
+                    final_media_url = msg_metadata.get("media_url")
+                    
+                    # Call specific Telegram handler to ensure logic is applied
+                    res = await svc.send_telegram_callback(
+                        chat=chat_data,
+                        message_content=content,
+                        supabase=supabase,
+                        media_url=final_media_url
                     )
-                else:
-                    # Handle Media Sending - PASS MENTIONS HERE
-                    if msg_metadata.get("is_document"):
-                         await wa_service.send_file_message(
-                            session_id=chat_data.get("sender_agent_id"),
-                            phone_number=destination_phone,
-                            file_url=msg_metadata["media_url"],
-                            filename=msg_metadata["filename"],
-                            caption=content_to_send, # <--- Correct Caption with Tag
-                            mentions=mentions_list   # <--- Correct Mentions Array
-                        )
+                    
+                    if res.get("success"):
+                        logger.info(f"✅ Telegram Sent.")
                     else:
-                        await wa_service.send_media_message(
-                            session_id=chat_data.get("sender_agent_id"),
-                            phone_number=destination_phone,
-                            media_url=msg_metadata["media_url"],
-                            caption=content_to_send, # <--- Correct Caption with Tag
-                            mentions=mentions_list   # <--- Correct Mentions Array
-                        )
+                        logger.error(f"❌ Telegram Failed: {res.get('error')}")
 
-            except Exception as e:
-                logger.error(f"❌ External Send Error: {e}")
-                # We log error but don't crash, so the message remains saved in DB
+                except Exception as e:
+                    logger.error(f"❌ Telegram Critical Error: {e}", exc_info=True)
+
+            # --- CHANNEL: WHATSAPP ---
+            elif current_channel == "whatsapp":
+                logger.info(f"🚀 [DEBUG_SEND] Routing to WHATSAPP Service...")
+                try:
+                    wa_service = get_whatsapp_service()
+                    
+                    if not destination_phone:
+                        logger.error("❌ [DEBUG_SEND] No destination phone found for WhatsApp chat!")
+                    else:
+                        if not file:
+                            await wa_service.send_text_message(
+                                session_id=chat_data.get("sender_agent_id"),
+                                phone_number=destination_phone, 
+                                message=content_to_send, 
+                                mentions=mentions_list
+                            )
+                        else:
+                            if msg_metadata.get("is_document"):
+                                 await wa_service.send_file_message(
+                                    session_id=chat_data.get("sender_agent_id"),
+                                    phone_number=destination_phone,
+                                    file_url=msg_metadata["media_url"],
+                                    filename=msg_metadata["filename"],
+                                    caption=content_to_send, 
+                                    mentions=mentions_list   
+                                )
+                            else:
+                                await wa_service.send_media_message(
+                                    session_id=chat_data.get("sender_agent_id"),
+                                    phone_number=destination_phone,
+                                    media_url=msg_metadata["media_url"],
+                                    caption=content_to_send, 
+                                    mentions=mentions_list   
+                                )
+                        logger.info(f"✅ [DEBUG_SEND] WhatsApp Sent to {destination_phone}")
+
+                except Exception as e:
+                    logger.error(f"❌ [DEBUG_SEND] WhatsApp Send Error: {e}", exc_info=True)
+            
+            else:
+                logger.warning(f"⚠️ [DEBUG_SEND] Unknown Channel '{current_channel}'. Skipping external send.")
 
         # ============================================
         # 8. BROADCAST (Websocket)
@@ -1772,9 +1797,9 @@ async def create_message(
 
     except HTTPException: raise
     except Exception as e:
-        logger.error(f"Create message error: {e}")
+        logger.error(f"Create message error: {e}", exc_info=True)
         raise HTTPException(500, f"Failed to create message: {str(e)}")
-        
+                
 # ============================================
 # TICKET ENDPOINTS
 # ============================================

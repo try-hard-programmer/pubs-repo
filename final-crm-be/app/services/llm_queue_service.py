@@ -68,17 +68,11 @@ class LLMQueueService:
                 logger.info("🛑 LLM Queue Supervisor Stopping...")
                 break
 
-    async def enqueue(self, chat_id: str, message_id: str, supabase_client: Any, priority: str = "medium"):
+    async def enqueue(self, chat_id: str, message_id: str, supabase_client: Any, priority: str = "low", ticket_id: str = None):
         """
         Add a request to the Redis queue.
         1. Updates the 'Target Execution Time' for this chat in Redis.
         2. Spawns a dedicated background worker if one isn't already running.
-        
-        Args:
-            chat_id: The chat session UUID.
-            message_id: The latest message UUID (so AI replies to the newest context).
-            supabase_client: Ignored here (we create a fresh one in the worker).
-            priority: Task priority.
         """
         # Calculate when the AI should trigger (Now + 10s)
         target_time = time.time() + self.debounce_window
@@ -89,7 +83,8 @@ class LLMQueueService:
         data = {
             "run_at": target_time,
             "msg_id": message_id,
-            "priority": priority
+            "priority": priority,
+            "ticket_id": ticket_id or "" 
         }
         await self.redis.hset(f"queue:ctx:{chat_id}", mapping=data)
         
@@ -174,7 +169,8 @@ class LLMQueueService:
                 chat_id=chat_id,
                 msg_id=ctx["msg_id"],
                 supabase=supabase,
-                priority=ctx["priority"]
+                priority=ctx["priority"],
+                ticket_id=ctx.get("ticket_id")
             )
         except Exception as e:
             logger.error(f"❌ AI Execution Failed [{chat_id}]: {e}")

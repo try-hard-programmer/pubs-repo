@@ -233,7 +233,8 @@ class DynamicCRMAgentV2:
         category: str = "general",
         name_user: str = "Customer",
         image_urls: List[str] = None,
-        ticket_categories: List[str] = None
+        ticket_categories: List[str] = None,
+        ticket_id: str = ""
     ) -> Dict[str, Any]:
         """
         Generate AI response with robust error handling (The 3 Safety Blocks)
@@ -243,9 +244,8 @@ class DynamicCRMAgentV2:
             persona = self._parse_json(agent_settings.get("persona_config", {}))
             advanced = self._parse_json(agent_settings.get("advanced_config", {}))
             
-            temp_setting = advanced.get("temperature", "balanced")
-            temp_map = {"precise": 0.1, "balanced": 0.5, "creative": 0.8}
-            temperature = temp_map.get(temp_setting, 0.5)
+            temp_map = {"consistent": 0.3, "balanced": 0.7, "creative": 1}
+            temperature = temp_map.get(advanced.get("temperature", "balanced").lower(), 0.7)
 
             # === 2. BUILD SYSTEM PROMPT ===
             # [CRITICAL FIX] Removed 'ticket_categories' from this call
@@ -273,12 +273,10 @@ class DynamicCRMAgentV2:
                 "nameUser": name_user,
                 "temperature": temperature,
                 "organization_id": organization_id,
-                # Ticket Categories still sent in payload (just not in prompt)
-                "ticket_categories": ticket_categories or [] 
+                "ticket_categories": ticket_categories or [],
+                "ticket_id":ticket_id
             }
-
-            logger.info(f"🚀 PAYLOAD DEBUG:\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
-            
+            # logger.info(f"{json.dumps(payload, indent=4)} <<<<<<<<<<")
             # === 5. CALL PROXY (WITH 3 ERROR BLOCKS) ===
             timeout = aiohttp.ClientTimeout(total=300)
 

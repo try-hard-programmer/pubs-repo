@@ -93,7 +93,7 @@ class DynamicAIServiceV2:
         except:
             return "AI Assistant"
 
-    async def process_and_respond(self, chat_id: str, msg_id: str, priority: str = "medium") -> Dict[str, Any]:
+    async def process_and_respond(self, chat_id: str, msg_id: str, priority: str = "low", ticket_id: str = None) -> Dict[str, Any]:
         """
         Orchestrate the AI response (Respects Configs: History Limit + Ticket Categories)
         """
@@ -133,7 +133,6 @@ class DynamicAIServiceV2:
                     settings_res = await asyncio.to_thread(lambda: self.supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute())
                     if settings_res.data: agent_settings = settings_res.data[0]
                 
-                # --- [NEW] FULL CONFIG PARSING ---
                 def parse_cfg(key):
                     val = agent_settings.get(key, {})
                     if isinstance(val, str):
@@ -147,12 +146,9 @@ class DynamicAIServiceV2:
                 
                 agent_name = persona_config.get("name", "AI Assistant")
 
-                # =========================================================================
                 # 3. DYNAMIC SNAPSHOT (Respects 'historyLimit' from advanced_config)
-                # =========================================================================
-                history_limit = int(advanced_config.get("historyLimit", 5)) # DEFAULT 5
-                
-                
+                history_limit = int(advanced_config.get("historyLimit", 10))
+                                
                 # Buffer fetch to find boundary
                 fetch_buffer = history_limit * 2 
                 msgs_res = await asyncio.to_thread(
@@ -165,9 +161,7 @@ class DynamicAIServiceV2:
                 )
                 raw_snapshot = msgs_res.data
 
-                # =========================================================================
-                # 4. LAST ASSISTANT FILTER (The "Test 3" Cleaner)
-                # =========================================================================
+                # 4. LAST ASSISTANT FILTER (The "Test 3" Cleaner) *Option will adjust later dont erase it
                 pending_user_messages = []
                 last_assistant_message = None
                 
@@ -195,9 +189,7 @@ class DynamicAIServiceV2:
                 if last_assistant_message:
                     clean_history.append(last_assistant_message)
                 
-                # =========================================================================
                 # 5. VISION & RAG
-                # =========================================================================
                 valid_image_urls = []
                 for pm in pending_user_messages:
                     meta = pm.get("metadata") or {}
@@ -229,7 +221,6 @@ class DynamicAIServiceV2:
 
                 # 6. CALL SPEAKER V2 (With TICKET CATEGORIES)
                 ticket_categories = ticketing_config.get("categories", [])
-                logger.info(f"🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀 How much ? \n{clean_history}")
                 response_data = await self.speaker.process_message(
                     chat_id=chat_id,
                     customer_message=full_user_prompt_text, 
@@ -240,7 +231,8 @@ class DynamicAIServiceV2:
                     category=priority, 
                     name_user=real_customer_name,
                     image_urls=valid_image_urls,
-                    ticket_categories=ticket_categories 
+                    ticket_categories=ticket_categories,
+                    ticket_id=ticket_id
                 )
                 
                 reply_text = response_data.get("content", "Maaf, saya tidak dapat menjawab saat ini.")
@@ -294,6 +286,6 @@ class DynamicAIServiceV2:
                 logger.error(f"❌ Manager V2 Critical Failure: {e}", exc_info=True)
                 return {"success": False, "error": str(e)}
                                                  
-def process_dynamic_ai_response_v2(chat_id: str, msg_id: str, supabase: Any, priority: str = "medium"):
+def process_dynamic_ai_response_v2(chat_id: str, msg_id: str, supabase: Any, priority: str = "medium", ticket_id: str = None):
     service = DynamicAIServiceV2(supabase)
-    return service.process_and_respond(chat_id, msg_id, priority)
+    return service.process_and_respond(chat_id, msg_id, priority, ticket_id)
