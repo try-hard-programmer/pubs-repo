@@ -58,14 +58,8 @@ def split_into_chunks(
     
     docs = splitter.create_documents([text])
     
-    # [NEW] Post-processing: Remove chunks that are too small (< 50 tokens)
-    MIN_CHUNK_SIZE = 50
-    filtered_chunks = [
-        d.page_content for d in docs 
-        if len(d.page_content.split()) >= MIN_CHUNK_SIZE
-    ]
-    
-    return filtered_chunks if filtered_chunks else [d.page_content for d in docs]
+    # [NEW] Post-processing: Remove chunks that are too small (< 50 tokens)    
+    return [d.page_content for d in docs]
 
 
 def split_into_chunks_advanced(

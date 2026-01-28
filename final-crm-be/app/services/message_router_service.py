@@ -87,9 +87,9 @@ class MessageRouterService:
             
             final_name = customer_name or self._extract_name_from_contact(contact, channel)
             
-            # [TELEGRAM ONLY] Suffix
-            if channel == "telegram" and (metadata or {}).get("is_group"):
-                final_name += " (Group)"
+            # # [TELEGRAM ONLY] Suffix
+            # if channel in ["telegram", "whatsapp"] and (metadata or {}).get("is_group"):
+            #     final_name += " (Group)"
 
             customer_data = {
                 "organization_id": organization_id,

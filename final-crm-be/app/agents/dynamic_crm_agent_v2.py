@@ -95,7 +95,7 @@ class DynamicCRMAgentV2:
                 if keywords:
                     kw_str = " / ".join([f'"{k}"' for k in keywords])
                     triggers += f" OR types {kw_str}"
-                prompt += f"""HANDOFF RULE: If user {triggers} → empathize + say 'HUMAN_HANDOFF'"""
+                prompt += f"""HANDOFF RULE: If user {triggers} → empathize + say 'SWITCH TO HUMAN'"""
 
             if rag_context and rag_context.strip():
                 prompt += f"""## KNOWLEDGE BASE
@@ -120,31 +120,29 @@ class DynamicCRMAgentV2:
             """
             else:
                 prompt += f"""INSTRUCTIONS:
-            1. **TONE & VOICE (ANTI-ROBOT MODE):**
-               - **BANNED PHRASES (DO NOT USE):** * "Saya mengerti"
-                 * "Tentu"
-                 * "Mohon maaf atas ketidaknyamanan"
-                 * "Kami memahami"
-               - **REQUIRED:** You MUST start with a natural reaction word.
-                 (Examples: "Wah, RC 68 ya?", "Oh, error itu...", "Hmm, sepertinya...", "Oke, mari kita cek...", "Siap, untuk masalah ini...")
-               - **Style:** Talk like a Senior Engineer on WhatsApp. Direct, helpful, and slightly casual.
+    1. **GENERIC KNOWLEDGE MODE (DEFAULT)**
+       - Do NOT assume the Knowledge Base is about error codes.
+       - Do NOT assume any specific structure (codes, steps, titles, numbering).
+       - Treat the Knowledge Base as plain reference text.
 
-            2. **STRICT VISUAL STRUCTURE:**
-               * **The Hook:** A short, casual reaction (using the examples above).
-               * **The Explanation:** ONE sentence explaining the cause simply.
-               * **The Solution:**
-                   - Step 1 (Bullet Point)
-                   - Step 2
-                   - Step 3
-               * **The Closing:** A short, friendly closing (e.g., "Kabari ya kalau masih gagal!").
+    2. **ANSWER DECISION RULE**
+       - If the user's question can be answered CLEARLY and DIRECTLY using the provided Knowledge Base:
+         - Answer using ONLY the relevant part.
+       - If the answer is ambiguous, partial, or missing:
+         - Do NOT guess.
+         - Do NOT substitute with similar topics or codes.
+         - Ask ONE short clarification question OR list up to 3 related items found in the Knowledge Base.
 
-            3. **FORMATTING:**
-               - **BOLD** all Error Codes and Button Names.
-               - Keep paragraphs short.
+    3. **STRICT INTEGRITY**
+       - Never invent codes, explanations, or steps.
+       - Never merge information from multiple unrelated sections.
+       - Only explain what is explicitly written.
 
-            4. **REWRITE RULE:**
-               - Do not copy-paste. Explain it like you are talking to a friend.
-            """
+    4. **RESPONSE STYLE**
+       - Natural, concise, human.
+       - No forced templates.
+       - No assumptions.
+    """
             return prompt
     
     def _build_messages(
@@ -159,9 +157,15 @@ class DynamicCRMAgentV2:
         """
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add history (TEXT ONLY)
+        # Add history
         for msg in chat_history:
-            role = "assistant" if msg.get("sender_type") == "ai" else "user"
+            # FIX: Trust the 'role' if it exists. Only check 'sender_type' as a fallback.
+            if "role" in msg:
+                role = msg["role"]
+            else:
+                # Fallback for legacy objects
+                role = "assistant" if msg.get("sender_type") == "ai" else "user"
+            
             content_text = msg.get("content") or msg.get("message_content", "") or ""
             
             if content_text.strip():
@@ -265,6 +269,11 @@ class DynamicCRMAgentV2:
                 image_urls=image_urls
             )
 
+#             logger.info(
+#     "LLM messages:\n%s",
+#     json.dumps(messages, indent=2, ensure_ascii=False)
+# )
+            
             # === 4. BUILD PAYLOAD ===
             payload = {
                 "messages": messages,
@@ -276,7 +285,7 @@ class DynamicCRMAgentV2:
                 "ticket_categories": ticket_categories or [],
                 "ticket_id":ticket_id
             }
-            # logger.info(f"{json.dumps(payload, indent=4)} <<<<<<<<<<")
+
             # === 5. CALL PROXY (WITH 3 ERROR BLOCKS) ===
             timeout = aiohttp.ClientTimeout(total=300)
 

@@ -3,6 +3,7 @@ Document Processor Service
 Handles document parsing and preprocessing for various file formats using local Unstructured library
 """
 import io
+import os
 import tempfile
 import logging
 import requests
@@ -72,8 +73,8 @@ class DocumentProcessor:
             return self._process_audio(content, filename, folder_path, organization_id, file_id)
 
         # Handle image files separately (uses OCR API)
-        # if ext in ("jpg", "jpeg", "png", "webp", "tiff", "bmp", "gif"):
-        #     return self._process_image(content, filename, folder_path, organization_id, file_id)
+        if ext in ("jpg", "jpeg", "png", "webp", "tiff", "bmp", "gif"):
+            return self._process_image(content, filename, folder_path, organization_id, file_id)
 
         # Process document locally
         elements = self._partition_by_type(content, filename, ext)
@@ -124,7 +125,18 @@ class DocumentProcessor:
             elif ext == "pptx":
                 return partition_pptx(file=fobj)
             elif ext == "ppt":
-                return partition_ppt(file=fobj)
+            # PPT requires file on disk for LibreOffice conversion
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".ppt") as tmp:
+                        tmp.write(content)
+                        tmp.flush()
+                        os.fsync(tmp.fileno())
+                        tmp_path = tmp.name
+                    return partition_ppt(filename=tmp_path)
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
             else:
                 # Auto-detect for unknown file types
                 with tempfile.NamedTemporaryFile(delete=True, suffix=f".{ext}") as tmp:
@@ -172,7 +184,7 @@ class DocumentProcessor:
             )
 
             # Call transcription API
-            api_url = "https://proxy.aigent.id/v1/audio"
+            api_url = f"{settings.PROXY_BASE_URL}/audio" # "https://proxy.aigent.id/v1/audio"
             headers = {
                 "Authorization": "Bearer " + settings.OPENAI_API_KEY,
                 "Content-Type": "application/json"
@@ -240,7 +252,7 @@ class DocumentProcessor:
             image_url = f"data:{mime};base64,{b64}"
 
             # Call transcription API
-            api_url = "https://proxy.aigent.id/v1/image/ocr"
+            api_url = f"{settings.PROXY_BASE_URL}/image/ocr"  #"https://proxy.aigent.id/v1/image/ocr"
             headers = {
                 "Authorization": "Bearer " + settings.OPENAI_API_KEY,
                 "Content-Type": "application/json"

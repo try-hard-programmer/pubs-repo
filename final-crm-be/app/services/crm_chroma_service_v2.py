@@ -196,62 +196,40 @@ class CRMChromaServiceV2:
             logger.error(f"❌ Failed to add documents: {e}")
             return False
 
-    async def query_context(self, query: str, agent_id: str, n_results: int = 20) -> str:
+    async def query_context(self, query: str, agent_id: str, n_results: int = 50) -> str:
         """
-        [OPTIMIZED V2] High-Accuracy RAG with Transformers Reranking
-        
-        Flow:
-        1. Semantic search (get 20 candidates) → Your proxy embeddings
-        2. Code matching filter (if codes detected)
-        3. Neural reranking (cross-encoder) → Local model, NO API call
-        4. Return top 5 best matches
-        
-        Accuracy: ~92% (vs 75% baseline)
-        Latency: 400-600ms (first query: 3-5s for model download)
+        [OPTIMIZED V4] High-Accuracy RAG with "Unlimited Space" Regex
         """
         try:
-
-            # If text is too short or meaningless, DON'T waste credits embedding it.
             clean_query = query.strip()
-            if len(clean_query) < 5: 
-                logger.info(f"⏩ RAG Skipped: Query '{clean_query}' is too short (Small Talk).")
-                return ""
-            
-            # If it's just "test" or "hallo", skip it
-            skip_words = ["test", "halo", "hi", "ping", "p","hello"]
-            if clean_query.lower() in skip_words:
-                logger.info(f"⏩ RAG Skipped: Query '{clean_query}' is in skip list.")
+            # 1. Skip meaningless queries
+            if len(clean_query) < 5 or clean_query.lower() in ["test", "halo", "hi", "ping", "p", "hello"]:
                 return ""
 
             import re
             def extract_codes(text: str) -> list:
-                pattern = r'\b([A-Za-z]{0,10}[-_\s]?\d+[A-Za-z0-9]*)\b'
+                # [FIX] Allow unlimited spaces/hyphens between letters and numbers
+                # Matches: "RC58", "RC 58", "RC   58", "RC-58", "RC - 58"
+                pattern = r'\b([A-Za-z]+[\s\-_]*\d+[A-Za-z0-9]*)\b'
                 raw_codes = re.findall(pattern, text)
-                return [re.sub(r'[-_\s]', '', c).upper() for c in raw_codes]
-            import re
-            
-            def extract_codes(text: str) -> list:
-                """Extract alphanumeric codes like RC503, ERR_404"""
-                pattern = r'\b([A-Za-z]{0,10}[-_\s]?\d+[A-Za-z0-9]*)\b'
-                raw_codes = re.findall(pattern, text)
-                return [re.sub(r'[-_\s]', '', c).upper() for c in raw_codes]
-            
-            # Detect codes in query
+                # Clean up: "RC - 58" -> "RC58"
+                return [re.sub(r'[\s\-_]+', '', c).upper() for c in raw_codes]
+
+            # 2. Detect codes
             query_codes = extract_codes(query)
             if query_codes:
                 logger.info(f"🔢 Detected codes: {query_codes}")
             
             collection = self.get_or_create_collection(agent_id)
             
-            # Step 1: Over-fetch candidates (semantic search via your proxy)
+            # 3. Semantic Search (Fetch 50 to ensure target is in the pool)
             results = collection.query(
                 query_texts=[query],
-                n_results=n_results,  # Get 20 candidates
+                n_results=n_results,
                 include=['documents', 'distances', 'metadatas']
             )
 
             if not results["documents"] or not results["documents"][0]:
-                logger.warning("⚠️ No documents found in ChromaDB")
                 return ""
 
             candidates = results['documents'][0]
@@ -259,74 +237,57 @@ class CRMChromaServiceV2:
             
             logger.info(f"🔎 RAG Query: '{query}' → Retrieved {len(candidates)} candidates")
 
-            # Step 2: Code matching filter (if codes detected)
+            # 4. Code Filter (Strict Logic)
             if query_codes:
                 filtered_candidates = []
                 for doc, dist in zip(candidates, distances):
                     doc_codes = extract_codes(doc)
+                    # Check if ANY query code exists in the document
                     if any(qc in doc_codes for qc in query_codes):
                         filtered_candidates.append((doc, dist))
-                    else:
-                        logger.debug(f"   🗑️ DROP (No code match): Doc codes={doc_codes[:3]}")
                 
+                # Update BOTH candidates AND distances
                 if filtered_candidates:
                     candidates = [doc for doc, _ in filtered_candidates]
+                    distances = [dist for _, dist in filtered_candidates]
                     logger.info(f"✂️ Code filter: {len(results['documents'][0])} → {len(candidates)} docs")
                 else:
-                    logger.warning("⚠️ No docs matched code filter, using all candidates")
+                    logger.warning("⚠️ No docs matched code filter, reverting to semantic matches.")
 
-            # Step 3: Neural Reranking (HIGH ACCURACY)
+            # 5. Reranking (Try Neural, Fallback to Distance)
+            final_docs = []
+            
+            # Try to load reranker
             model, tokenizer = self._get_reranker()
             
-            if model is None or tokenizer is None:
-                # Fallback: Use distance-based filtering
-                logger.warning("⚠️ Reranker not available, using distance threshold")
-                THRESHOLD = 1.3
-                final_docs = [doc for doc, dist in zip(candidates, distances) if dist < THRESHOLD][:5]
-                return "\n\n###\n\n".join(final_docs)
-            
-            # Prepare query-document pairs
-            pairs = [[query, doc] for doc in candidates]
-            
-            # Run cross-encoder (NO API call - local model)
-            with torch.no_grad():
-                inputs = tokenizer(
-                    pairs,
-                    padding=True,
-                    truncation=True,
-                    return_tensors='pt',
-                    max_length=512
-                )
-                
-                # Move to GPU if model is on GPU
-                if next(model.parameters()).is_cuda:
-                    inputs = {k: v.cuda() for k, v in inputs.items()}
-                
-                scores = model(**inputs).logits.squeeze(-1)
-                
-                # Move back to CPU for processing
-                if scores.is_cuda:
-                    scores = scores.cpu()
-                
-                scores = scores.tolist()
-            
-            # Step 4: Sort by rerank score (higher = better)
-            scored_docs = list(zip(candidates, scores))
-            scored_docs.sort(key=lambda x: x[1], reverse=True)
-            
-            # Take top 5
-            top_5 = scored_docs[:5]
-            
-            # Log results
-            logger.info(f"🎯 Reranking complete:")
-            for i, (doc, score) in enumerate(top_5):
-                preview = doc[:60].replace('\n', ' ')
-                logger.info(f"   #{i+1} Score: {score:.4f} | {preview}...")
-            
-            final_docs = [doc for doc, score in top_5]
-            
+            if model and tokenizer and candidates:
+                try:
+                    # Prepare pairs for Cross-Encoder
+                    pairs = [[query, doc] for doc in candidates]
+                    
+                    with torch.no_grad():
+                        inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+                        
+                        if next(model.parameters()).is_cuda:
+                            inputs = {k: v.cuda() for k, v in inputs.items()}
+                        
+                        scores = model(**inputs).logits.squeeze(-1)
+                        if scores.is_cuda: scores = scores.cpu()
+                        scores = scores.tolist()
+
+                    # Sort by Score (High is better)
+                    scored_docs = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+                    final_docs = [doc for doc, score in scored_docs[:5]]
+                    
+                    logger.info(f"🎯 Reranked Top Match: Score {scored_docs[0][1]:.4f}")
+
+                except Exception as rerank_error:
+                    logger.error(f"⚠️ Reranking failed, using distance: {rerank_error}")
+                    final_docs = [doc for doc, dist in zip(candidates, distances) if dist < 1.4][:5]
+            else:
+                final_docs = [doc for doc, dist in zip(candidates, distances) if dist < 1.4][:5]
+
             if not final_docs:
-                logger.warning("⚠️ No relevant documents after reranking")
                 return ""
             
             return "\n\n###\n\n".join(final_docs)

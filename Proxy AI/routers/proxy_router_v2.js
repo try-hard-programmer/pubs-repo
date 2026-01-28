@@ -596,6 +596,8 @@ router.post("/chat", authenticate, async (req, res) => {
       organization_id,
       category,
       nameUser,
+      ticket_id,
+      ticket_categories = [],
     } = req.body;
 
     if (!messages || !Array.isArray(messages))
@@ -628,6 +630,12 @@ router.post("/chat", authenticate, async (req, res) => {
 
     if (result.success) {
       res.json(result.data);
+
+      // Fire and forget - update ticket after response sent
+      if (category?.toLowerCase() === "low" && ticket_id) {
+        const aiResponse = result.data.choices[0].message.content;
+        updateTicket(ticket_id, category, ticket_categories, aiResponse);
+      }
     } else {
       res.status(500).json({ error: result.error });
     }
@@ -689,6 +697,309 @@ process.on("SIGTERM", async () => {
   await redisClient.quit();
   await redisBlocking.quit();
   process.exit(0);
+});
+
+// ==========================================
+// 9. TICKET UPDATE WEBHOOK
+// ==========================================
+
+async function updateTicket(ticketId, category, listCategory, resultFromAI) {
+  // Guard: Only process if category and ticketId exist
+  if (!ticketId || !category) {
+    return null;
+  }
+
+  // Guard: Only process LOW priority tickets
+  if (category.toLowerCase() !== "low") {
+    return null;
+  }
+
+  try {
+    const systemPrompt = `You are an expert ticket classification system for customer support. Analyze the AI's response to the customer and determine the most appropriate ticket metadata.
+
+Available categories: ${listCategory.join(", ")}
+
+Your task:
+1. Create a concise, professional title (max 60 chars) that captures the core issue
+2. Select the BEST matching category from the available list
+3. Assess urgency and assign priority: low, medium, high, or urgent
+4. Provide a brief, clear reason for your classification
+
+Classification Guidelines:
+- Title: Focus on the problem/topic, not the solution (e.g., "RC68 Transaction Timeout Issue" not "User asked about error")
+- Category: Match based on technical domain (hardware, software, billing, account, etc.)
+- Priority:
+  * low: Greetings, introductions, general chitchat, no actual issue or question
+  * medium: Standard issues, routine problems, how-to questions
+  * high: System errors, repeated issues, multiple users affected
+  * urgent: Service down, critical errors, security concerns, revenue impact
+- Reason: State what issue was identified and why it needs this classification
+
+If no category matches well, use "general".
+If the message is just a greeting or introduction with no real issue, set priority to "low".
+
+Respond ONLY with valid JSON (no markdown, no explanation):
+{
+  "title": "Short descriptive title",
+  "category": "chosen_category",
+  "priority": "low|medium|high|urgent",
+  "reason": "Brief explanation of classification"
+}`;
+
+    const userPrompt = `Customer Support Interaction:
+${resultFromAI}
+
+Current ticket category: ${category}
+Available categories: ${listCategory.join(", ")}
+
+Analyze the interaction and classify this ticket appropriately.`;
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ];
+
+    const provider = getProvider(null);
+
+    // Call OpenAI with JSON mode
+    if (provider === "openai") {
+      const config = API_CONFIGS.openai;
+
+      const response = await axios.post(
+        `${config.baseUrl}/chat/completions`,
+        {
+          model: config.chatModel,
+          messages: messages,
+          temperature: 0.3,
+          max_tokens: 500,
+          response_format: { type: "json_object" },
+        },
+        {
+          headers: { Authorization: `Bearer ${getApiKey("openai")}` },
+          timeout: 30000,
+        },
+      );
+
+      const classification = JSON.parse(
+        response.data.choices[0].message.content,
+      );
+
+      // Validate category
+      if (!listCategory.includes(classification.category)) {
+        classification.category = "general";
+        classification.reason = `Original category not in list. Using general.`;
+      }
+
+      // Prepare webhook payload
+      const payload = {
+        ticket_id: ticketId,
+        title: classification.title,
+        category: classification.category,
+        priority: classification.priority,
+        reason: classification.reason,
+      };
+
+      // Update ticket via webhook
+      const webhookResponse = await axios.put(
+        `${process.env.WEBHOOK_BASE_URL}/webhook/ai/ticket/update`,
+        payload,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": process.env.WEBHOOK_SECRET,
+          },
+          timeout: 10000,
+        },
+      );
+
+      return webhookResponse.data;
+    } else if (provider === "gemini") {
+      const config = API_CONFIGS.gemini;
+      const apiKey = getApiKey("gemini");
+
+      const contents = messages.map((msg) => ({
+        role: msg.role === "assistant" ? "model" : "user",
+        parts: [{ text: msg.content }],
+      }));
+
+      const response = await axios.post(
+        `${config.baseUrl}/models/${config.chatModel}:generateContent?key=${apiKey}`,
+        {
+          contents,
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 500,
+            responseMimeType: "application/json",
+          },
+        },
+        {
+          headers: { "Content-Type": "application/json" },
+          timeout: 30000,
+        },
+      );
+
+      const text =
+        response.data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+      const classification = JSON.parse(text);
+
+      // Validate category
+      if (!listCategory.includes(classification.category)) {
+        classification.category = "general";
+        classification.reason = `Original category not in list. Using general.`;
+      }
+
+      // Prepare webhook payload
+      const payload = {
+        ticket_id: ticketId,
+        title: classification.title,
+        category: classification.category,
+        priority: classification.priority,
+        reason: classification.reason,
+      };
+
+      // Update ticket via webhook
+      const webhookResponse = await axios.put(
+        `${process.env.WEBHOOK_BASE_URL}/webhook/ai/ticket/update`,
+        payload,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": process.env.WEBHOOK_SECRET,
+          },
+          timeout: 10000,
+        },
+      );
+      console.log(
+        `[TICKET] ✅ ${ticketId} updated: "${classification.title}" - ${classification.category} (${classification.priority})`,
+      );
+      return webhookResponse.data;
+    }
+  } catch (error) {
+    console.error(`[TICKET] ❌ Failed to update ticket ${ticketId}`);
+    console.error(`[TICKET] Error Message:`, error.message);
+    console.error(`[TICKET] Error Response Status:`, error.response?.status);
+    console.error(
+      `[TICKET] Error Response Data:`,
+      JSON.stringify(error.response?.data, null, 2),
+    );
+    console.error(`[TICKET] Full Error:`, error);
+
+    if (error.response?.status === 404) {
+      console.error(`[TICKET] Ticket ${ticketId} not found`);
+      return null;
+    }
+
+    if (error.response?.status === 500) {
+      console.error(`[TICKET] Server error on webhook side`);
+    }
+
+    return null;
+  }
+}
+
+// ==========================================
+// 10. AUDIO TRANSCRIPTION (Whisper)
+// ==========================================
+
+router.post("/audio", authenticate, async (req, res) => {
+  const { url, model } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: "Missing audio url" });
+  }
+
+  try {
+    console.log(`🎵 Processing audio transcription`);
+
+    // Download audio file
+    const audioResponse = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 60000,
+    });
+
+    const audioBuffer = Buffer.from(audioResponse.data);
+    const FormData = require("form-data");
+    const form = new FormData();
+
+    form.append("file", audioBuffer, {
+      filename: "audio.mp3",
+      contentType: audioResponse.headers["content-type"] || "audio/mpeg",
+    });
+    form.append("model", "whisper-1");
+
+    const response = await axios.post(
+      "https://api.openai.com/v1/audio/transcriptions",
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${getApiKey("openai")}`,
+          ...form.getHeaders(),
+        },
+        timeout: 120000,
+      },
+    );
+
+    res.json({
+      output: {
+        result: response.data.text,
+      },
+    });
+  } catch (error) {
+    console.error("Audio transcription error:", error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// 11. IMAGE OCR (GPT-4o Vision)
+// ==========================================
+
+router.post("/image/ocr", authenticate, async (req, res) => {
+  const { image_url } = req.body;
+
+  if (!image_url) {
+    return res.status(400).json({ error: "Missing image_url" });
+  }
+
+  try {
+    console.log(`🖼️ Processing image OCR`);
+
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Extract only the text found in the image. Output text only, no extras.",
+              },
+              {
+                type: "image_url",
+                image_url: { url: image_url },
+              },
+            ],
+          },
+        ],
+        max_tokens: 1000,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${getApiKey("openai")}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 60000,
+      },
+    );
+
+    const content = response.data?.choices?.[0]?.message?.content || "";
+    res.json({ content });
+  } catch (error) {
+    console.error("Image OCR error:", error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 module.exports = router;

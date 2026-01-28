@@ -153,7 +153,7 @@ class DynamicAIServiceV2:
                 fetch_buffer = history_limit * 2 
                 msgs_res = await asyncio.to_thread(
                     lambda: self.supabase.table("messages")
-                    .select("*")
+                    .select("content, sender_type, metadata") # <--- ONLY WHAT YOU NEED
                     .eq("chat_id", chat_id)
                     .order("created_at", desc=True)
                     .limit(fetch_buffer) 
@@ -161,34 +161,64 @@ class DynamicAIServiceV2:
                 )
                 raw_snapshot = msgs_res.data
 
-                # 4. LAST ASSISTANT FILTER (The "Test 3" Cleaner) *Option will adjust later dont erase it
+                # 4. MEMORY RECOVERY (Robust Version + Vision Fix)
                 pending_user_messages = []
-                last_assistant_message = None
+                history_messages = []
+                found_last_ai = False 
                 
+                # Initialize variables to prevent "UndefinedVariable" errors
+                clean_history = []
+                full_user_prompt_text = ""
+
+                # raw_snapshot is [Newest, ..., Oldest]
                 for msg in raw_snapshot:
-                    sender = msg.get("sender_type")
-                    if sender == "ai":
-                        last_assistant_message = msg
-                        break
+                    # ROBUST SENDER CHECK: Handle NULLs, Whitespace, and Casing
+                    raw_sender = str(msg.get("sender_type", "") or "").strip().lower()
+                    
+                    # [FIX] Keep 'metadata' so Vision/RAG can find the images!
+                    clean_msg = {
+                        "role": "assistant" if raw_sender in ["ai", "agent", "system"] else "user",
+                        "content": msg.get("content", "") or "",
+                        "metadata": msg.get("metadata") or {} 
+                    }
+
+                    if not found_last_ai:
+                        # MODE 1: Pending User Input (The User's latest rant)
+                        if raw_sender in ["ai", "agent", "system"]:
+                            # We hit the boundary! Switch to History Mode.
+                            found_last_ai = True
+                            history_messages.append(clean_msg) 
+                        else:
+                            # Keep adding to the "Prompt"
+                            pending_user_messages.append(clean_msg)
                     else:
-                        pending_user_messages.append(msg)
+                        # MODE 2: History Context (The "Memory")
+                        history_messages.append(clean_msg)
 
-                if not last_assistant_message and not pending_user_messages:
-                     pending_user_messages = raw_snapshot
+                # Fallback: If we never found an AI message, everything is pending input
+                if not found_last_ai and not pending_user_messages:
+                     pending_user_messages = [
+                         {
+                             "role": "user", 
+                             "content": m.get("content", "") or "",
+                             "metadata": m.get("metadata") or {} # [FIX] Also here
+                         } 
+                         for m in raw_snapshot
+                     ]
 
+                # Restore Chronological Order [Oldest -> Newest]
                 pending_user_messages = pending_user_messages[::-1] 
+                clean_history = history_messages[::-1] 
 
+                # Guard: If user hasn't typed anything new, don't trigger AI
                 if not pending_user_messages:
                     return {"success": False, "reason": "no_pending_messages"}
 
+                # Final Prompt Construction
                 full_user_prompt_text = "\n".join(
-                    [m.get("content", "") for m in pending_user_messages if m.get("content")]
+                    [m["content"] for m in pending_user_messages if m["content"]]
                 )
-                
-                clean_history = []
-                if last_assistant_message:
-                    clean_history.append(last_assistant_message)
-                
+
                 # 5. VISION & RAG
                 valid_image_urls = []
                 for pm in pending_user_messages:
@@ -218,7 +248,7 @@ class DynamicAIServiceV2:
                     try:
                         context = await self.reader.query_context(query=rag_query, agent_id=agent_id)
                     except: pass
-
+                
                 # 6. CALL SPEAKER V2 (With TICKET CATEGORIES)
                 ticket_categories = ticketing_config.get("categories", [])
                 response_data = await self.speaker.process_message(

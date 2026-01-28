@@ -982,7 +982,6 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
 # 3. TELEGRAM USERBOT WEBHOOK (Updated)
 # ============================================
 
-# [REPLACE THIS FUNCTION IN app/api/webhook.py]
 async def _handle_message_content_for_telegram(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
     """Safe Content Handler for Telegram (Fixed for Userbot Media)"""
     content = ""
@@ -1033,7 +1032,6 @@ async def _handle_message_content_for_telegram(message_data: dict, data_type: st
 
     return content, msg_type, media_url
 
-# [REPLACE THIS FUNCTION IN app/api/webhook.py]
 @router.post("/telegram-userbot", response_model=WebhookRouteResponse)
 async def telegram_userbot_webhook(
     payload: WhatsAppUnofficialWebhookMessage, 
