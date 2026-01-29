@@ -240,34 +240,6 @@ class DocumentProcessorV2:
             self.logger.error(f"❌ Local processing failed for {filename}: {e}")
             raise
 
-    def _process_audio(self, content: bytes, filename: str, folder_path: str, organization_id: str, file_id: str) -> Tuple[str, List[dict]]:
-        if not self.storage_service:
-            raise RuntimeError("Storage service is required for audio file processing")
-
-        try:
-            self.logger.info(f"📈 Processing audio file via V2: {filename}")
-            audio_url = self.storage_service.get_public_url(organization_id, file_id, folder_path)
-
-            api_url = f"{self.proxy_base_url}/audio"
-            headers = {"Content-Type": "application/json"}
-            data = {"url": audio_url}
-
-            resp = requests.post(api_url, headers=headers, json=data, timeout=60)
-            resp.raise_for_status()
-            
-            result = resp.json()
-            text = result.get("output", {}).get("result", "") or result.get("text", "")
-            
-            # [IMPROVED] Normalize transcription text
-            text = self._normalize_text(text)
-            
-            element = Text(text=text)
-            return text, self._elements_to_json([element])
-
-        except Exception as e:
-            self.logger.error(f"❌ Audio transcription failed: {e}")
-            return "", []
-
     def _process_image(self, content: bytes, filename: str, folder_path: str, organization_id: str, file_id: str) -> Tuple[str, List[dict]]:
         try:
             self.logger.info(f"🌆 Processing image file via V2: {filename}")

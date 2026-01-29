@@ -194,7 +194,7 @@ class DocumentProcessor:
                 "model": "v3-large"
             }
 
-            resp = requests.post(api_url, headers=headers, json=data, timeout=60)
+            resp = requests.post(api_url, headers=headers, json=data, timeout=300)
             resp.raise_for_status()
             result = resp.json()
             text = result.get("output", {}).get("result", "")

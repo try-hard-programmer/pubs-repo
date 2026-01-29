@@ -273,43 +273,37 @@ class ChromaDBService:
         if not organization_id:
             raise ValueError("organization_id is required for querying documents")
 
-        # Get or create organization-specific collection (findOrCreate)
         collection = self.get_or_create_organization_collection(organization_id)
 
-        # Prepare filter metadata
-        # Filter by organization AND is_trashed=False (exclude trashed files from agent results)
-        where = {
-            "$and": [
-                {"organization_id": {"$eq": organization_id}},
-                {"is_trashed": {"$eq": False}}  # ⭐ Only active (non-trashed) documents
-            ]
-        }
+        filters_list = [
+            {"organization_id": {"$eq": organization_id}},
+            {"is_trashed": {"$eq": False}}
+        ]
 
-        logger.info(f"🔎 Query filter: {where}, organization_id: {organization_id}")
+        if where:
+            filters_list.append(where)
 
-        # Determine fields to include
+        final_where = { "$and": filters_list }
+
+        logger.info(f"🔎 Final Query filter: {final_where}, organization_id: {organization_id}")
+
         include = ["metadatas", "documents"]
         if include_distances:
             include.append("distances")
         if include_embeddings:
             include.append("embeddings")
 
-        # Generate query embeddings
         q_emb = self.embedding_function([query])
 
-        # Query ChromaDB
         results = collection.query(
             query_embeddings=q_emb,
             n_results=top_k,
-            where=where,
+            where=final_where, 
             include=include,
         )
 
         num_results = len(results.get('documents', [[]])[0])
         logger.info(f"✅ Queried org_{organization_id}: found {num_results} results")
-
-        if num_results == 0:
-            logger.warning(f"⚠️  No results found! Query: '{query}', Filter: {where}")
 
         return results
 

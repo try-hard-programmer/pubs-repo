@@ -211,48 +211,112 @@ async def query_documents(
     Raises:
         400: If user has no organization
     """
-    # Get user's organization
     org_service = get_organization_service()
-    user_org = await org_service.get_user_organization(current_user.user_id)
-
-    if not user_org:
-        raise HTTPException(
-            status_code=400,
-            detail="User must belong to an organization"
-        )
-
-    organization_id = user_org.id
-
-    # ⭐ Query organization-specific ChromaDB collection
-    chromadb_service = ChromaDBService()
-    results = chromadb_service.query_documents(
-        query=item.query,
-        organization_id=organization_id,  # Organization-specific collection
-        email=current_user.email,
-        top_k=item.top_k or 5,
-        where=item.where,
-        include_distances=item.include_distances,
-        include_embeddings=item.include_embeddings
-    )
-
-    metadatas = results.get("metadatas", [[]])[0] or []
-
-    if not metadatas:
-        return {"file_id": [], "organization_id": organization_id}
-
-    # Extract unique file IDs
-    file_ids = chromadb_service.extract_unique_file_ids(metadatas)
-    logger.info(f"Found {len(file_ids)} unique files in org_{organization_id}")
-
     fm_service = get_file_manager_service()
-    result = fm_service._search_file(item.query, organization_id)
+    chromadb_service = ChromaDBService() 
+
+    user_org = await org_service.get_user_organization(current_user.user_id)
+    if not user_org:
+        raise HTTPException(status_code=400, detail="User must belong to an organization")
     
-    file_ids_from_search = [file['id'] for file in result.data]
-    file_ids.update(file_ids_from_search)
+    my_org_id = user_org.id
+    
+    found_file_ids = set()
+    all_shared_files_data = []
+
+    # VECTOR SEARCH (Semantic)
+    try:
+        my_results = chromadb_service.query_documents(
+            query=item.query,
+            organization_id=my_org_id,
+            email=current_user.email,
+            top_k=item.top_k or 5,
+            where=item.where,
+            include_distances=True 
+        )
+        
+        if my_results and "metadatas" in my_results and "distances" in my_results:
+            metas = my_results.get("metadatas", [[]])[0]
+            dists = my_results.get("distances", [[]])[0]
+            
+            if metas and dists:
+                for i, dist in enumerate(dists):
+                    if dist < 0.6: 
+                        found_file_ids.add(metas[i]['file_id'])
+                        logger.info(f"   ✅ Match (My Org): {metas[i]['file_id']} (Score: {dist:.4f})")
+                    else:
+                        logger.info(f"   🗑️ Garbage (My Org): {metas[i]['file_id']} (Score: {dist:.4f})")
+
+        shares_response = fm_service.client.table("file_shares")\
+            .select("*, files!inner(id, name, organization_id)")\
+            .eq("shared_with_email", current_user.email)\
+            .execute()
+        
+        all_shared_files_data = shares_response.data or []
+        
+        shared_org_map = {}
+        for share in all_shared_files_data:
+            file_obj = share.get('files')
+            if not file_obj: continue
+            
+            owner_org = file_obj.get('organization_id')
+            file_id = file_obj.get('id')
+            
+            if owner_org == my_org_id: continue 
+            
+            if owner_org and file_id:
+                if owner_org not in shared_org_map: shared_org_map[owner_org] = []
+                shared_org_map[owner_org].append(file_id)
+
+        for owner_org_id, file_ids in shared_org_map.items():
+            try:
+                shared_results = chromadb_service.query_documents(
+                    query=item.query,
+                    organization_id=owner_org_id,
+                    email=current_user.email,
+                    top_k=item.top_k or 5,
+                    where={"file_id": {"$in": file_ids}},
+                    include_distances=True
+                )
+                
+                if shared_results and "metadatas" in shared_results and "distances" in shared_results:
+                    metas = shared_results.get("metadatas", [[]])[0]
+                    dists = shared_results.get("distances", [[]])[0]
+                    
+                    if metas and dists:
+                        for i, dist in enumerate(dists):
+                            if dist < 0.6: 
+                                found_file_ids.add(metas[i]['file_id'])
+                                logger.info(f"   ✅ Match (Shared): {metas[i]['file_id']} (Score: {dist:.4f})")
+                            else:
+                                logger.info(f"   🗑️ Garbage (Shared): {metas[i]['file_id']} (Score: {dist:.4f})")
+
+            except Exception as e:
+                logger.warning(f"⚠️ Vector search issue for shared org {owner_org_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error in Vector Search logic: {e}")
+
+    # FALLBACK SEARCH (Filenames - The Safety Net)    
+    query_lower = item.query.lower()
+
+    if all_shared_files_data:
+        for share in all_shared_files_data:
+            f = share.get('files')
+            if f and f.get('name') and query_lower in f['name'].lower():
+                found_file_ids.add(f['id'])
+
+    try:
+        sql_result = fm_service._search_file(item.query, my_org_id)
+        if sql_result.data:
+            for f in sql_result.data:
+                found_file_ids.add(f['id'])
+    except Exception as e:
+        logger.warning(f"SQL fallback search failed: {e}")
 
     return {
-        "file_id": list(file_ids),
-        "organization_id": organization_id
+        "file_id": list(found_file_ids),
+        "organization_id": my_org_id
     }
 
 
