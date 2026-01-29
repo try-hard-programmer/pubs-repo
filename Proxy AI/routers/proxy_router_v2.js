@@ -935,18 +935,40 @@ router.post("/audio", authenticate, async (req, res) => {
           Authorization: `Bearer ${getApiKey("openai")}`,
           ...form.getHeaders(),
         },
-        timeout: 120000,
+        timeout: 300000,
       },
     );
 
+    // 1. Get the text result
+    let transcription = response.data.text || "";
+
+    // 2. 🛡️ SAFETY NET: Handle Instrumental/Silent Audio
+    // If Whisper returns empty text (common for music), provide a placeholder.
+    // This tricks the Python backend into thinking it found text, so it SAVES the file.
+    if (!transcription || transcription.trim().length === 0) {
+      console.log(
+        "⚠️ Audio has no spoken words (Instrumental/Silence). Using placeholder.",
+      );
+      transcription =
+        "[Audio processed. No spoken words detected (Music/Instrumental).]";
+    }
+
     res.json({
       output: {
-        result: response.data.text,
+        result: transcription,
       },
     });
   } catch (error) {
     console.error("Audio transcription error:", error.message);
-    res.status(500).json({ error: error.message });
+
+    // 3. ERROR SAFETY: Instead of sending 500 (which triggers rollback),
+    // send the error message as the "transcription".
+    // This ensures the file is SAVED so you can debug it later.
+    res.json({
+      output: {
+        result: `[Error processing audio: ${error.message}]`,
+      },
+    });
   }
 });
 
@@ -974,7 +996,7 @@ router.post("/image/ocr", authenticate, async (req, res) => {
             content: [
               {
                 type: "text",
-                text: "Extract only the text found in the image. Output text only, no extras.",
+                text: "Extract all text found in this image. If the image contains no readable text (like a photo, icon, or drawing), return exactly: '[NO_TEXT_DETECTED]'. Do not add any other explanation.",
               },
               {
                 type: "image_url",
@@ -983,7 +1005,7 @@ router.post("/image/ocr", authenticate, async (req, res) => {
             ],
           },
         ],
-        max_tokens: 1000,
+        max_tokens: 300,
       },
       {
         headers: {
@@ -994,11 +1016,24 @@ router.post("/image/ocr", authenticate, async (req, res) => {
       },
     );
 
-    const content = response.data?.choices?.[0]?.message?.content || "";
+    let content = response.data?.choices?.[0]?.message?.content || "";
+
+    // 2. SAFETY NET: If AI returns empty string or the specific tag, give Python something safe
+    if (
+      !content ||
+      content.trim() === "" ||
+      content.includes("[NO_TEXT_DETECTED]")
+    ) {
+      console.log("⚠️ Image has no text. Using placeholder to save file.");
+      content = "Visual content only. No text detected in this image.";
+    }
+
+    // 3. RETURN CONTENT (Python backend will now save the file instead of deleting it)
     res.json({ content });
   } catch (error) {
     console.error("Image OCR error:", error.message);
-    res.status(500).json({ error: error.message });
+    // 4. ERROR HANDLER: Return error as text so the file is saved for debugging
+    res.json({ content: `Error processing image: ${error.message}` });
   }
 });
 
