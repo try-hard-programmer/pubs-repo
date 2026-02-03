@@ -790,12 +790,12 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
         if settings_data: agent.update(settings_data)
 
         # =========================================================================
-        # 3.5 PRE-FLIGHT CHECK (FIXED)
+        # 3.5 PRE-FLIGHT CHECK (FIXED: LID RESOLUTION IN HISTORY)
         # =========================================================================
         raw_chat_id = data_content.get("id", {}).get("remote") or data_content.get("from", "")
         is_group_raw = "@g.us" in str(raw_chat_id)
 
-        # Prepare identities
+        # Prepare identities (Me/Agent)
         potential_ids = set()
         if agent.get("phone"):
             intl_phone = str(agent.get("phone")).replace("+", "").replace("-", "").strip()
@@ -816,14 +816,102 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
         if is_group_raw:
             is_mentioned_raw = False
             
-            # A. Metadata Check
+            # --- A. Explicit Mentions (Metadata) ---
             raw_mentions = data_content.get("mentionedJidList", [])
             for m in raw_mentions:
                 if any(pid in str(m) for pid in potential_ids):
                     is_mentioned_raw = True
                     break
             
-            # B. Text Check
+            # --- B. Reply Context Check ---
+            quoted_participant = data_content.get("quotedParticipant") or \
+                                 data_content.get("_data", {}).get("quotedParticipant")
+            
+            if not is_mentioned_raw and quoted_participant:
+                q_clean = _extract_phone_number(quoted_participant)
+                
+                # Case 1: Direct Reply to Bot
+                # A. Check if ID matches directly
+                if any(pid in str(q_clean) for pid in potential_ids):
+                    is_mentioned_raw = True
+                    logger.info(f"✅ Pre-Flight: User replied to Agent ({q_clean})")
+                
+                # B. [FIX] Check if it's the Bot's LID (Resolve -> Match Phone)
+                elif "@lid" in quoted_participant or len(q_clean) > 15:
+                    try:
+                        # If I reply to the bot, q_participant is the Bot's LID.
+                        # We resolve it to see if the Real Number is ME.
+                        candidate_lid = quoted_participant if "@" in quoted_participant else f"{quoted_participant}@lid"
+                        resolved_bot = await resolve_lid_to_real_number(candidate_lid, agent_id, "whatsapp", supabase)
+                        clean_bot = _extract_phone_number(resolved_bot)
+                        
+                        if any(pid in str(clean_bot) for pid in potential_ids):
+                            is_mentioned_raw = True
+                            logger.info(f"✅ Pre-Flight: Resolved Bot LID {q_clean} -> Me ({clean_bot})")
+                    except Exception as e:
+                        pass
+
+                # Case 2: Reply to Self (Thread Continuity)
+                elif not is_mentioned_raw:
+                    sender_clean = _extract_phone_number(data_content.get("author") or data_content.get("participant") or "")
+                    q_clean = _extract_phone_number(quoted_participant)
+
+                    # [FIX] Resolve Sender LID if needed (to match Quoted Phone)
+                    sender_real = sender_clean
+                    if "@lid" in (data_content.get("author") or "") or len(sender_clean) > 15:
+                        try:
+                            # If sender is LID, resolve to Real Number (e.g. 628...)
+                            sender_lid = sender_clean if "@" in sender_clean else f"{sender_clean}@lid"
+                            resolved_sender = await resolve_lid_to_real_number(sender_lid, agent_id, "whatsapp", supabase)
+                            sender_real = _extract_phone_number(resolved_sender)
+                        except Exception: pass
+                    
+                    # [FIX] Resolve Quoted LID if needed
+                    q_real = q_clean
+                    if "@lid" in quoted_participant or len(q_clean) > 15:
+                        try:
+                            q_lid = quoted_participant if "@" in quoted_participant else f"{quoted_participant}@lid"
+                            resolved_q = await resolve_lid_to_real_number(q_lid, agent_id, "whatsapp", supabase)
+                            q_real = _extract_phone_number(resolved_q)
+                        except Exception: pass
+
+                    # Check if Sender matches Quoted (Reply to Self) - Compare REAL numbers
+                    is_reply_to_self = sender_real and (sender_real in q_real or q_real in sender_real)
+                    
+                    if is_reply_to_self:
+                        quoted_msg = data_content.get("quotedMsg") or data_content.get("_data", {}).get("quotedMsg", {})
+                        quoted_body = quoted_msg.get("body", "") or quoted_msg.get("caption", "")
+                        
+                        if quoted_body:
+                            # a. Check Name/Pushname
+                            if (pushname and f"@{pushname}" in quoted_body) or (agent_name and f"@{agent_name}" in quoted_body):
+                                is_mentioned_raw = True
+                                logger.info("✅ Pre-Flight: 'Reply to Self' detected with Bot Name in history.")
+                            
+                            # b. Check IDs (Direct)
+                            if not is_mentioned_raw:
+                                for my_id in potential_ids:
+                                    if f"@{my_id}" in quoted_body:
+                                        is_mentioned_raw = True
+                                        logger.info(f"✅ Pre-Flight: 'Reply to Self' detected with Bot ID ({my_id}) in history.")
+                                        break
+                            
+                            # c. Check IDs (Deep Resolution for LIDs in History)
+                            if not is_mentioned_raw:
+                                history_mentions = re.findall(r"@(\d+)", quoted_body)
+                                for hist_id in history_mentions:
+                                    try:
+                                        candidate_lid = f"{hist_id}@lid"
+                                        resolved_hist = await resolve_lid_to_real_number(candidate_lid, agent_id, "whatsapp", supabase)
+                                        clean_hist = _extract_phone_number(resolved_hist)
+                                        
+                                        if clean_hist in potential_ids:
+                                            is_mentioned_raw = True
+                                            logger.info(f"✅ Pre-Flight: 'Reply to Self' history mention @{hist_id} resolved to Me ({clean_hist})")
+                                            break
+                                    except: pass
+
+            # --- C. Text Body Check (Fallback) ---
             if not is_mentioned_raw:
                 raw_caption = data_content.get("caption", "")
                 raw_body = data_content.get("body", "")
@@ -842,7 +930,7 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
                     if pushname and f"@{pushname}" in raw_text: is_mentioned_raw = True
                     elif agent_name and f"@{agent_name}" in raw_text: is_mentioned_raw = True
 
-                # Check LIDs
+                # Check LIDs (Regex)
                 if not is_mentioned_raw:
                     number_matches = re.findall(r"@\s?(\d{10,20})", raw_text)
                     for detected_num in number_matches:
