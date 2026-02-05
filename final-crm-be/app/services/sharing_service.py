@@ -2,6 +2,7 @@
 Sharing Service
 Handles file/folder sharing with users, groups, and public links
 """
+import asyncio
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -10,6 +11,7 @@ import logging
 from supabase import Client
 
 from app.config import settings
+from app.services.email_service import EmailService
 from app.services.permission_service import get_permission_service
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,26 @@ class SharingService:
         )
         
         self.permission_service = get_permission_service(self.client)
+    
+     # Helper method (tambahkan di class)
+    async def _send_share_email(self, share_record: Dict, file_data: Dict, shared_by_email: str, note: Optional[str] = None):
+        """Send notification email after successful share"""
+        email_service = EmailService()
+                
+        # Generate share URL
+        share_id = share_record["id"]
+        file_name = file_data.get("name", "Unnamed file")
+        org_slug = file_data.get("organization_slug", "app")
+                            
+        await email_service.send_share_notification(
+                to_email=share_record["shared_with_email"],
+                shared_by_email=shared_by_email,
+                file_name=file_name,
+                permission=share_record["access_level"],
+                note=note,
+                shared_by_name=file_data.get("shared_by_name")  # Optional
+            )
+
 
 
     # =====================================================
@@ -90,6 +112,9 @@ class SharingService:
                 raise Exception("File not found")
 
             file_data = file_response.data[0]
+            get_user_by_id = self.client.rpc("get_auth_user_by_id", {"p_user_id": file_data.get("user_id")}).execute()
+            users = getattr(get_user_by_id, "data", None) or []
+
             if file_data["is_starred"]:
                 file_response = self.client.table("files")\
                 .update({"is_starred": False})\
@@ -101,6 +126,8 @@ class SharingService:
             rows = getattr(resp, "data", None) or []
             target_user_id = rows[0]["id"] if rows else None
 
+            if target_user_id == file_data["user_id"]:
+                raise Exception("Cannot share file with self")
 
             # 5. Check if share already exists
             existing_share = self.client.table("file_shares")\
@@ -146,6 +173,16 @@ class SharingService:
 
             if not response.data:
                 raise Exception("Failed to create share")
+
+            # 7. SEND NOTIFICATION EMAIL
+            try:
+                asyncio.create_task(
+                    self._send_share_email(response.data[0], file_data, users[0].get("email"), metadata.get("note"))
+                )
+                logger.info(f"✅ Email sent to {target_email}")
+            except Exception as email_error:
+                logger.warning(f"Failed to send email to {target_email}: {email_error}")
+                # DON'T FAIL THE SHARE OPERATION!
 
             logger.info(f"✅ Shared file {file_id} with {target_email}")
 

@@ -63,31 +63,7 @@ class DynamicCRMAgentV2:
             handoff = advanced.get("handoffTriggers", {})
             lang_instruction = f"Reply ONLY in {language}."
 
-            prompt = f"""You are {name}. Tone: {tone}. User: {name_user}. LANGUAGE RULE: {lang_instruction}
-            ## CORE BEHAVIOR
-            - ONLY answer based on the KNOWLEDGE BASE provided below.
-            - If answer NOT in knowledge base, refuse politely.
-            - NEVER make up facts.
-            - Ignore previous history unless necessary.
-            # NAME POLICY
-            - User: "{name_user}".
-            - **General Rule:** Do NOT use the name in normal technical explanations. It sounds robotic.
-            - **Exceptions (Allowed):** 1. If the user is **Angry** (to calm them down).
-              2. If the user says **"Thanks/Makasih/Arigatou"** (e.g., "Sama-sama, {name_user}!" is okay).
-            ## UNIVERSAL FALLBACK PROTOCOL (STRICT & SMART)
-            If the exact answer to the user's question is not available in the Knowledge Base:
-            1. **NO GUESSING:** Never assume or infer information that isn’t clearly available.  
-            (Example: If the user asks about "Plan A" but only "Plan B" is listed, do not explain Plan B as if it were the answer.)
-            2. **HONEST RESPONSE:** Use a natural, human-friendly explanation, such as:  
-            "Sorry, I don’t have the exact details for that right now.
-            3. **HELPFUL DIRECTION (MANDATORY):**
-            - Review the available information in the **Knowledge Base**.
-            - Share any related **titles**, **topics**, or **error codes** that are available.
-            - Present them as options the user can choose from.  
-            - *Example:*  
-                "What I can help with right now are these related topics: [list of available titles/codes]."
-            4. **NEXT STEP:** If none of the listed items match the user’s issue, gently suggest reaching out to the support team for further assistance.
-            """
+            prompt = f"""You are {name}. Tone: {tone}. User: {name_user}. LANGUAGE RULE: {lang_instruction}"""
             
             if handoff.get("enabled"):
                 keywords = handoff.get("keywords", [])
@@ -115,34 +91,52 @@ class DynamicCRMAgentV2:
             """
 
             if len(custom_instructions) > 10:
-                prompt += f"""INSTRUCTIONS:
+                prompt += f"""
             {custom_instructions}
             """
             else:
-                prompt += f"""INSTRUCTIONS:
-    1. **GENERIC KNOWLEDGE MODE (DEFAULT)**
-       - Do NOT assume the Knowledge Base is about error codes.
-       - Do NOT assume any specific structure (codes, steps, titles, numbering).
-       - Treat the Knowledge Base as plain reference text.
-
-    2. **ANSWER DECISION RULE**
-       - If the user's question can be answered CLEARLY and DIRECTLY using the provided Knowledge Base:
-         - Answer using ONLY the relevant part.
-       - If the answer is ambiguous, partial, or missing:
-         - Do NOT guess.
-         - Do NOT substitute with similar topics or codes.
-         - Ask ONE short clarification question OR list up to 3 related items found in the Knowledge Base.
-
-    3. **STRICT INTEGRITY**
-       - Never invent codes, explanations, or steps.
-       - Never merge information from multiple unrelated sections.
-       - Only explain what is explicitly written.
-
-    4. **RESPONSE STYLE**
-       - Natural, concise, human.
-       - No forced templates.
-       - No assumptions.
-    """
+                prompt += f"""
+        ## CORE BEHAVIOR
+        - ONLY answer based on the KNOWLEDGE BASE provided below.
+        - If answer NOT in knowledge base, refuse politely.
+        - NEVER make up facts.
+        - Ignore previous history unless necessary.
+        # NAME POLICY
+        - User: "{name_user}".
+        - **General Rule:** Do NOT use the name in normal technical explanations. It sounds robotic.
+        - **Exceptions (Allowed):** 1. If the user is **Angry** (to calm them down). 2. If the user says **"Thanks/Makasih/Arigatou"** (e.g., "Sama-sama, {name_user}!" is okay).
+        ## UNIVERSAL FALLBACK PROTOCOL (STRICT & SMART)
+        If the exact answer to the user's question is not available in the Knowledge Base:
+            1. **NO GUESSING:** Never assume or infer information that isn’t clearly available.(Example: If the user asks about "Plan A" but only "Plan B" is listed, do not explain Plan B as if it were the answer.)
+            2. **HONEST RESPONSE:** Use a natural, human-friendly explanation, such as: "Sorry, I don’t have the exact details for that right now.
+            3. **HELPFUL DIRECTION (MANDATORY):**
+                - Review the available information in the **Knowledge Base**.
+                - Share any related **titles**, **topics**, or **error codes** that are available.
+                - Present them as options the user can choose from.  
+                - *Example:*  
+                    "What I can help with right now are these related topics: [list of available titles/codes]."
+            4. **NEXT STEP:** If none of the listed items match the user’s issue, gently suggest reaching out to the support team for further assistance.
+        ## INSTRUCTIONS:
+        1. **GENERIC KNOWLEDGE MODE (DEFAULT)**
+        - Do NOT assume the Knowledge Base is about error codes.
+        - Do NOT assume any specific structure (codes, steps, titles, numbering).
+        - Treat the Knowledge Base as plain reference text.
+        2. **ANSWER DECISION RULE**
+        - If the user's question can be answered CLEARLY and DIRECTLY using the provided Knowledge Base:
+            - Answer using ONLY the relevant part.
+        - If the answer is ambiguous, partial, or missing:
+            - Do NOT guess.
+            - Do NOT substitute with similar topics or codes.
+            - Ask ONE short clarification question OR list up to 3 related items found in the Knowledge Base.
+        3. **STRICT INTEGRITY**
+        - Never invent codes, explanations, or steps.
+        - Never merge information from multiple unrelated sections.
+        - Only explain what is explicitly written.
+        4. **RESPONSE STYLE**
+        - Natural, concise, human.
+        - No forced templates.
+        - No assumptions.
+        """
             return prompt
     
     def _build_messages(

@@ -42,18 +42,30 @@ class MessageRouterService:
             if not contact or str(contact).strip() == "" or str(contact).lower() == "none":
                 raise ValueError(f"Cannot create customer with empty contact for {channel}")
 
-            # ==========================
-            # 1. WHATSAPP (RESTORED CLASSIC LOGIC)
-            # ==========================
             if channel == "whatsapp":
-                # STRICT: Only check Phone column.
+                # A. Primary Check: Direct Phone Match
                 query = self.supabase.table("customers").select("*") \
                     .eq("organization_id", organization_id) \
                     .eq("phone", contact)
+                
+                response = query.execute()
+                if response.data:
+                    return self._update_customer_name_if_needed(response.data[0], customer_name)
 
-            # ==========================
-            # 2. TELEGRAM (NEW LOGIC)
-            # ==========================
+                # B. [NEW] Secondary Check: LID Lookup in Metadata
+                if str(contact).isdigit() and len(str(contact)) >= 14:
+                    logger.info(f"🔍 Contact {contact} looks like an LID. Checking metadata...")
+                    lid_query = self.supabase.table("customers").select("*") \
+                        .eq("organization_id", organization_id) \
+                        .eq("metadata->>whatsapp_lid", contact) \
+                        .execute()
+                    
+                    if lid_query.data:
+                        real_customer = lid_query.data[0]
+                        logger.info(f"👻 Ghost Prevented! Mapped LID {contact} -> Real User {real_customer.get('phone')}")
+                        return self._update_customer_name_if_needed(real_customer, customer_name)
+
+            # 2. TELEGRAM 
             elif channel == "telegram":
                 # STRICT: Check telegram_id AND is_group flag
                 is_group_context = (metadata or {}).get("is_group", False)
@@ -62,9 +74,7 @@ class MessageRouterService:
                     .eq("metadata->>telegram_id", contact) \
                     .contains("metadata", {"is_group": is_group_context})
 
-            # ==========================
             # 3. OTHERS
-            # ==========================
             elif channel == "email":
                 query = self.supabase.table("customers").select("*").eq("organization_id", organization_id).eq("email", contact)
             elif channel == "web":
@@ -86,10 +96,6 @@ class MessageRouterService:
             logger.info(f"📝 Creating NEW customer for '{contact}' (Channel: {channel})")
             
             final_name = customer_name or self._extract_name_from_contact(contact, channel)
-            
-            # # [TELEGRAM ONLY] Suffix
-            # if channel in ["telegram", "whatsapp"] and (metadata or {}).get("is_group"):
-            #     final_name += " (Group)"
 
             customer_data = {
                 "organization_id": organization_id,
@@ -115,6 +121,28 @@ class MessageRouterService:
             logger.error(f"❌ Customer lookup/creation failed: {e}")
             raise
 
+    def _update_customer_name_if_needed(self, customer: Dict[str, Any], new_name: Optional[str]) -> Dict[str, Any]:
+        """
+        Helper to update 'Unknown' names if we get a better name later.
+        """
+        try:
+            current_name = customer.get("name", "")
+            # If we have a new name, and the current one is "Unknown" or empty
+            if new_name and (not current_name or "Unknown" in current_name):
+                logger.info(f"📝 Updating customer name from '{current_name}' to '{new_name}'")
+                
+                # Update DB
+                self.supabase.table("customers").update({
+                    "name": new_name
+                }).eq("id", customer["id"]).execute()
+                
+                # Return updated object locally
+                customer["name"] = new_name
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update customer name: {e}")
+            
+        return customer
+    
     async def find_active_chat(
         self,
         customer_id: str,

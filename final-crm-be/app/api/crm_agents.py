@@ -22,6 +22,8 @@ from app.auth.dependencies import get_current_user
 from app.models.user import User
 from app.services.organization_service import get_organization_service
 from app.config import settings as app_settings
+from app.services.mcp_service import get_mcp_service
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -1081,4 +1083,27 @@ async def update_agent_integration(
 			detail="Failed to update agent integration"
 		)
 
+class MCPTestRequest(BaseModel):
+    url: str
+    transport: str
+    apiKey: Optional[str] = None
 
+@router.post(
+    "/mcp/test-connection",
+    summary="Test MCP Connection (Handshake)",
+    description="Equivalent to WA 'Activate' or Tele 'Verify'. Validates the server connection."
+)
+async def test_mcp_connection(
+    payload: MCPTestRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Performs a real-time handshake (JSON-RPC Initialize) with the MCP Server.
+    """
+    service = get_mcp_service()
+    result = await service.test_connection(
+        url=payload.url,
+        transport=payload.transport,
+        api_key=payload.apiKey
+    )
+    return result
