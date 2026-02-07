@@ -2,15 +2,16 @@ import logging
 import asyncio
 import json
 import time
-from typing import Dict, Any, Optional
 
+from typing import Dict, Any, Optional, List
 from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
 from app.agents.dynamic_crm_agent_v2 import get_dynamic_crm_agent_v2
 from app.services.webhook_callback_service import get_webhook_callback_service
 from app.services.websocket_service import get_connection_manager
 from app.services.credit_service import get_credit_service, CreditTransactionCreate, TransactionType
-# [FIX] Import the Redis Lock
 from app.services.redis_service import acquire_lock
+from app.services.mcp_service import get_mcp_service
+
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class DynamicAIServiceV2:
         self.speaker = get_dynamic_crm_agent_v2()
         self.webhook_service = get_webhook_callback_service()
         self.credit_service = get_credit_service()
+        self.mcp_service = get_mcp_service()
 
     async def _broadcast_response(self, chat: Dict, message_db_record: Dict, agent_name: str):
         """
@@ -95,7 +97,7 @@ class DynamicAIServiceV2:
 
     async def process_and_respond(self, chat_id: str, msg_id: str, priority: str = "low", ticket_id: str = None) -> Dict[str, Any]:
         """
-        Orchestrate the AI response (Respects Configs: History Limit + Ticket Categories)
+        Orchestrate the AI response: History + Vision + RAG + MCP
         """
         lock_key = f"ai_v2_lock:{chat_id}"
         
@@ -122,7 +124,7 @@ class DynamicAIServiceV2:
                         if cust_res.data: real_customer_name = cust_res.data.get("name", "Customer")
                     except: pass
 
-                # 2. Fetch Agent Settings (Source of Truth)
+                # 2. Fetch Agent Settings
                 agent_id = chat.get("sender_agent_id") 
                 if not agent_id:
                     agent_res = await asyncio.to_thread(lambda: self.supabase.table("agents").select("id").eq("organization_id", chat["organization_id"]).limit(1).execute())
@@ -131,7 +133,10 @@ class DynamicAIServiceV2:
                 agent_settings = {}
                 if agent_id:
                     settings_res = await asyncio.to_thread(lambda: self.supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute())
-                    if settings_res.data: agent_settings = settings_res.data[0]
+                    if settings_res.data: 
+                        agent_settings = settings_res.data[0]
+                        # [CRITICAL FIX] Inject agent_id so the Agent class can use it for tool execution later
+                        agent_settings["agent_id"] = agent_id 
                 
                 def parse_cfg(key):
                     val = agent_settings.get(key, {})
@@ -141,19 +146,17 @@ class DynamicAIServiceV2:
                     return val if isinstance(val, dict) else {}
 
                 persona_config = parse_cfg("persona_config")
-                advanced_config = parse_cfg("advanced_config") # contains historyLimit
-                ticketing_config = parse_cfg("ticketing_config") # contains categories
+                advanced_config = parse_cfg("advanced_config")
+                ticketing_config = parse_cfg("ticketing_config")
                 
                 agent_name = persona_config.get("name", "AI Assistant")
 
-                # 3. DYNAMIC SNAPSHOT (Respects 'historyLimit' from advanced_config)
+                # 3. DYNAMIC SNAPSHOT
                 history_limit = int(advanced_config.get("historyLimit", 10))
-                                
-                # Buffer fetch to find boundary
                 fetch_buffer = history_limit * 2 
                 msgs_res = await asyncio.to_thread(
                     lambda: self.supabase.table("messages")
-                    .select("content, sender_type, metadata") # <--- ONLY WHAT YOU NEED
+                    .select("content, sender_type, metadata")
                     .eq("chat_id", chat_id)
                     .order("created_at", desc=True)
                     .limit(fetch_buffer) 
@@ -161,21 +164,13 @@ class DynamicAIServiceV2:
                 )
                 raw_snapshot = msgs_res.data
 
-                # 4. MEMORY RECOVERY (Robust Version + Vision Fix)
+                # 4. MEMORY RECOVERY
                 pending_user_messages = []
                 history_messages = []
                 found_last_ai = False 
                 
-                # Initialize variables to prevent "UndefinedVariable" errors
-                clean_history = []
-                full_user_prompt_text = ""
-
-                # raw_snapshot is [Newest, ..., Oldest]
                 for msg in raw_snapshot:
-                    # ROBUST SENDER CHECK: Handle NULLs, Whitespace, and Casing
                     raw_sender = str(msg.get("sender_type", "") or "").strip().lower()
-                    
-                    # [FIX] Keep 'metadata' so Vision/RAG can find the images!
                     clean_msg = {
                         "role": "assistant" if raw_sender in ["ai", "agent", "system"] else "user",
                         "content": msg.get("content", "") or "",
@@ -183,43 +178,31 @@ class DynamicAIServiceV2:
                     }
 
                     if not found_last_ai:
-                        # MODE 1: Pending User Input (The User's latest rant)
                         if raw_sender in ["ai", "agent", "system"]:
-                            # We hit the boundary! Switch to History Mode.
                             found_last_ai = True
                             history_messages.append(clean_msg) 
                         else:
-                            # Keep adding to the "Prompt"
                             pending_user_messages.append(clean_msg)
                     else:
-                        # MODE 2: History Context (The "Memory")
                         history_messages.append(clean_msg)
 
-                # Fallback: If we never found an AI message, everything is pending input
                 if not found_last_ai and not pending_user_messages:
                      pending_user_messages = [
-                         {
-                             "role": "user", 
-                             "content": m.get("content", "") or "",
-                             "metadata": m.get("metadata") or {} # [FIX] Also here
-                         } 
+                         {"role": "user", "content": m.get("content", ""), "metadata": m.get("metadata")} 
                          for m in raw_snapshot
                      ]
 
-                # Restore Chronological Order [Oldest -> Newest]
                 pending_user_messages = pending_user_messages[::-1] 
                 clean_history = history_messages[::-1] 
 
-                # Guard: If user hasn't typed anything new, don't trigger AI
                 if not pending_user_messages:
                     return {"success": False, "reason": "no_pending_messages"}
 
-                # Final Prompt Construction
                 full_user_prompt_text = "\n".join(
                     [m["content"] for m in pending_user_messages if m["content"]]
                 )
 
-                # 5. VISION & RAG
+                # 5. VISION
                 valid_image_urls = []
                 for pm in pending_user_messages:
                     meta = pm.get("metadata") or {}
@@ -232,7 +215,6 @@ class DynamicAIServiceV2:
                     target_img = valid_image_urls[0] 
                     custom_vision = advanced_config.get("vision_prompt")
                     vision_prompt = custom_vision if custom_vision else "Analyze this image. Extract ALL text/codes. Describe context."
-                    
                     try:
                         vision_desc = await self.speaker.analyze_image(
                             image_url=target_img, 
@@ -242,31 +224,53 @@ class DynamicAIServiceV2:
                         vision_context = f"\nSystem Analysis of User Image: {vision_desc}"
                     except: pass
 
+                # 6. RAG + MCP RESOURCES (CONTEXT)
                 rag_query = f"{full_user_prompt_text} {vision_context}".strip()
-                context = ""
+                rag_context = ""
                 if rag_query and self.reader:
                     try:
-                        context = await self.reader.query_context(query=rag_query, agent_id=agent_id)
+                        rag_context = await self.reader.query_context(query=rag_query, agent_id=agent_id)
                     except: pass
-                
-                # 6. CALL SPEAKER V2 (With TICKET CATEGORIES)
+
+                # [NEW] Fetch Active Resources from MCP
+                mcp_context = ""
+                if agent_id:
+                    try:
+                        mcp_context = await self.mcp_service.fetch_active_resources(self.supabase, agent_id)
+                    except Exception as e:
+                        logger.warning(f"MCP Resource Fetch Failed: {e}")
+
+                # Combine Contexts
+                final_context = f"{rag_context}\n\n{mcp_context}".strip()
+
+                # 7. FETCH MCP TOOLS (SKILLS)
+                mcp_tools = []
+                if agent_id:
+                    try:
+                        mcp_tools = await self.mcp_service.get_all_tools_schema(self.supabase, agent_id)
+                    except Exception as e:
+                        logger.warning(f"MCP Tool Discovery Failed: {e}")
+
+                # 8. CALL SPEAKER V2 (With TOOLS)
                 ticket_categories = ticketing_config.get("categories", [])
+                
                 response_data = await self.speaker.process_message(
                     chat_id=chat_id,
                     customer_message=full_user_prompt_text, 
                     chat_history=clean_history,             
                     agent_settings=agent_settings,
                     organization_id=chat.get("organization_id", ""), 
-                    rag_context=context,
+                    rag_context=final_context,  
                     category=priority, 
                     name_user=real_customer_name,
                     image_urls=valid_image_urls,
                     ticket_categories=ticket_categories,
-                    ticket_id=ticket_id
+                    ticket_id=ticket_id,
+                    external_tools=mcp_tools,    
+                    supabase=self.supabase       
                 )
                 
                 reply_text = response_data.get("content", "Maaf, saya tidak dapat menjawab saat ini.")
-                # AI might return a category like "elektronik"
                 detected_category = response_data.get("category", priority) 
                 usage = response_data.get("usage", {})
                 metadata = response_data.get("metadata", {})
@@ -275,7 +279,7 @@ class DynamicAIServiceV2:
                     if not self._check_and_update_alert_cooldown(chat_id):
                         return {"success": False, "reason": "alert_rate_limit"}
 
-                # 8. Save Response (Include Category in Metadata for Webhook/Ticketing Service)
+                # 9. Save Response
                 ai_msg = {
                     "chat_id": chat_id,
                     "sender_type": "ai",
@@ -284,8 +288,9 @@ class DynamicAIServiceV2:
                     "metadata": {
                         "is_internal": False,
                         "model": "v2_proxy_local",
-                        "rag_enabled": bool(context),
-                        "guard_priority": detected_category, # AI's classification
+                        "rag_enabled": bool(final_context),
+                        "mcp_enabled": bool(mcp_tools),
+                        "guard_priority": detected_category,
                         "token_usage": usage,
                         "is_error": metadata.get("is_error", False)
                     }
@@ -315,7 +320,8 @@ class DynamicAIServiceV2:
             except Exception as e:
                 logger.error(f"❌ Manager V2 Critical Failure: {e}", exc_info=True)
                 return {"success": False, "error": str(e)}
-                                                 
+            
+                                                           
 def process_dynamic_ai_response_v2(chat_id: str, msg_id: str, supabase: Any, priority: str = "medium", ticket_id: str = None):
     service = DynamicAIServiceV2(supabase)
     return service.process_and_respond(chat_id, msg_id, priority, ticket_id)

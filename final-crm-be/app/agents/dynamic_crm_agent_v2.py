@@ -232,7 +232,9 @@ class DynamicCRMAgentV2:
         name_user: str = "Customer",
         image_urls: List[str] = None,
         ticket_categories: List[str] = None,
-        ticket_id: str = ""
+        ticket_id: str = "",
+        external_tools: List[Dict] = None,
+        supabase: Any = None
     ) -> Dict[str, Any]:
         """
         Generate AI response with robust error handling (The 3 Safety Blocks)
@@ -246,7 +248,6 @@ class DynamicCRMAgentV2:
             temperature = temp_map.get(advanced.get("temperature", "balanced").lower(), 0.7)
 
             # === 2. BUILD SYSTEM PROMPT ===
-            # [CRITICAL FIX] Removed 'ticket_categories' from this call
             system_prompt = self._build_system_prompt(
                 persona=persona,
                 advanced=advanced,
@@ -262,63 +263,122 @@ class DynamicCRMAgentV2:
                 customer_message=customer_message,
                 image_urls=image_urls
             )
-
-#             logger.info(
-#     "LLM messages:\n%s",
-#     json.dumps(messages, indent=2, ensure_ascii=False)
-# )
             
-            # === 4. BUILD PAYLOAD ===
-            payload = {
-                "messages": messages,
-                "files": [], 
-                "category": category,
-                "nameUser": name_user,
-                "temperature": temperature,
-                "organization_id": organization_id,
-                "ticket_categories": ticket_categories or [],
-                "ticket_id":ticket_id
-            }
-
-            # === 5. CALL PROXY (WITH 3 ERROR BLOCKS) ===
+            # === 4. EXECUTION LOOP (MCP SUPPORT) ===
+            current_turn = 0
+            max_turns = 5 
+            final_usage = {"total_tokens": 0}
             timeout = aiohttp.ClientTimeout(total=300)
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    self.proxy_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"}
-                ) as response:
-                    
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"❌ Proxy Error {response.status}: {error_text}")
+            while current_turn < max_turns:
+                current_turn += 1
+
+                # Build Payload
+                payload = {
+                    "messages": messages,
+                    "files": [], 
+                    "category": category,
+                    "nameUser": name_user,
+                    "temperature": temperature,
+                    "organization_id": organization_id,
+                    "ticket_categories": ticket_categories or [],
+                    "ticket_id": ticket_id
+                }
+
+                # Inject Tools
+                if external_tools:
+                    payload["tools"] = external_tools
+                    payload["tool_choice"] = "auto"
+
+                logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
+                
+                # === 5. CALL PROXY ===
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        self.proxy_url,
+                        json=payload,
+                        headers={"Content-Type": "application/json"}
+                    ) as response:
+                        
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.error(f"❌ Proxy Error {response.status}: {error_text}")
+                            return {
+                                "content": "Sorry, the system is currently busy. Please try again in a moment.",
+                                "metadata": {"error": f"Proxy {response.status}", "is_error": True},
+                                "usage": final_usage
+                            }
+                        
+                        result = await response.json()
+                        
+                        # Handle varied proxy response structures
+                        choice = result.get("choices", [{}])[0]
+                        message = choice.get("message", {})
+                        
+                        # Accumulate usage
+                        u = result.get("usage", {})
+                        final_usage["total_tokens"] += u.get("total_tokens", 0)
+
+                        # === 6. HANDLE TOOL CALLS ===
+                        tool_calls = message.get("tool_calls")
+                        
+                        if tool_calls:
+                            # A. Append AI's intent to history
+                            messages.append(message) 
+                            
+                            # B. Execute Tools
+                            for tool in tool_calls:
+                                func_name = tool["function"]["name"]
+                                func_args = json.loads(tool["function"]["arguments"])
+                                call_id = tool["id"]
+                                
+                                logger.info(f"🛠️ Agent calling: {func_name}")
+                                
+                                # Execute via MCP Service using passed supabase client
+                                if not supabase:
+                                    logger.error("❌ Supabase client missing for MCP tool execution!")
+                                    tool_output = "Error: Database connection missing."
+                                else:
+                                    tool_result = await self.mcp_service.execute_mcp_tool(
+                                        supabase, 
+                                        agent_id=agent_settings.get("agent_id"), 
+                                        tool_call_name=func_name, 
+                                        arguments=func_args
+                                    )
+                                    tool_output = str(tool_result.get("output", "Error executing tool"))
+                                
+                                # C. Append Result to history
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": call_id,
+                                    "name": func_name,
+                                    "content": tool_output
+                                })
+                            
+                            # D. Loop again!
+                            continue 
+                        
+                        # === 7. FINAL TEXT RESPONSE ===
+                        content = ""
+                        try:
+                            content = message["content"]
+                        except (KeyError, IndexError):
+                            content = result.get("reply") or result.get("content") or ""
+                        
+                        if not content:
+                            content = "Mohon Maaf ya, kali ini kami belum bisa menjawab, silahkan ditanyakan kembali 😊."
+                            logger.warning("⚠️ Empty response from proxy")
+
+                        # Apply Cleaner
+                        clean_content = self._sanitize_text_results(content)
+
                         return {
-                            "content": "Sorry, the system is currently busy. Please try again in a moment.",
-                            "metadata": {"error": f"Proxy {response.status}", "is_error": True},
-                            "usage": {}
+                            "content": clean_content, 
+                            "metadata": result.get("metadata", {}),
+                            "usage": final_usage
                         }
-                    
-                    result = await response.json()
-                    
-                    content = ""
-                    try:
-                        content = result["choices"][0]["message"]["content"]
-                    except (KeyError, IndexError):
-                        content = result.get("reply") or result.get("content") or ""
-                    
-                    if not content:
-                        content = "Mohon Maaf ya, kali ini kami belum bisa menjawab, silahkan ditanyakan kembali 😊."
-                        logger.warning("⚠️ Empty response from proxy")
 
-                    # [NEW] APPLY THE CLEANER HERE
-                    clean_content = self._sanitize_text_results(content)
-
-                    return {
-                        "content": clean_content, 
-                        "metadata": result.get("metadata", {}),
-                        "usage": result.get("usage", {})
-                    }
+            return {"content": "Loop limit reached.", "metadata": {"is_error": True}, "usage": final_usage}
 
         # [ERROR BLOCK 1] Connection Failed (Offline)
         except aiohttp.ClientConnectorError:
@@ -345,8 +405,9 @@ class DynamicCRMAgentV2:
                 "content": "Maaf ya, kali ini kami belum bisa menjawab, silahkan coba lagi",
                 "metadata": {"error": str(e), "is_error": True},
                 "usage": {}
-            }    
-
+            }
+        
+        
 # === SINGLETON ===
 _dynamic_crm_agent_v2 = None
 
