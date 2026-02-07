@@ -1,28 +1,29 @@
 import logging
 import requests
 import chromadb
+import torch
+import os
+
 from chromadb import Settings
 from typing import List, Any, Dict, Tuple
 from app.config import settings
 from app.services.credit_service import get_credit_service, CreditTransactionCreate, TransactionType
-import os
-from app.config import settings
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
+
+from langchain_core.documents import Document
+from langchain_community.retrievers import BM25Retriever
+from langchain_community.vectorstores import Chroma
+from langchain.retrievers import EnsembleRetriever
+from langchain_core.embeddings import Embeddings
 
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# 1. EMBEDDING FUNCTION (Proxy Mode)
-# ==========================================
 class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        # Proxy handles key, we just send a placeholder
         self.api_key = "proxy-managed"
 
     def _call_api(self, input: List[str]) -> Tuple[List[List[float]], Dict[str, Any]]:
-        # [CHANGE] No model param, let Proxy default to text-embedding-3-small
         payload = { "input": input }
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}" }
 
@@ -60,19 +61,27 @@ class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
         return self._call_api(input)
 
 
-# ==========================================
+class LangChainProxyEmbedding(Embeddings):
+    def __init__(self, proxy_fn: LocalProxyEmbeddingFunction):
+        self.proxy_fn = proxy_fn
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self.proxy_fn(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        result = self.proxy_fn([text])
+        return result[0] if result else []
+
 # 2. SERVICE CLASS (With Transformer Reranking)
-# ==========================================
 class CRMChromaServiceV2:
     def __init__(self):
-        # [FIX] Wrap connection in try-except to prevent app crash on startup
         try:
             self.client = chromadb.HttpClient(
                 host=settings.CHROMADB_HOST, 
                 port=settings.CHROMADB_PORT,
                 settings=Settings(allow_reset=True, anonymized_telemetry=False)
             )
-            # Test connection immediately to catch errors early
+
             self.client.heartbeat()
             logger.info(f"✅ Connected to ChromaDB at {settings.CHROMADB_HOST}:{settings.CHROMADB_PORT}")
         except Exception as e:
@@ -154,7 +163,6 @@ class CRMChromaServiceV2:
         try:
             if not texts: return False
 
-            logger.info(f"🧠 Embedding {len(texts)} chunks for Agent {agent_id}...")
             embeddings, usage = self.embedding_fn.embed_with_usage(texts)
 
             if not embeddings: raise Exception("Embedding failed")
@@ -196,106 +204,149 @@ class CRMChromaServiceV2:
             logger.error(f"❌ Failed to add documents: {e}")
             return False
 
-    async def query_context(self, query: str, agent_id: str, n_results: int = 50) -> str:
+    async def query_context(self, query: str, agent_id: str, n_results: int = 5) -> str:
         """
-        [OPTIMIZED V4] High-Accuracy RAG with "Unlimited Space" Regex
+        Triple-Layer Hybrid RAG
+        Layer 1: BM25 
+        Layer 2: Vector Search (Semantic understanding)
+        Layer 3: Transformer Reranker (Neural precision)
         """
         try:
             clean_query = query.strip()
-            # 1. Skip meaningless queries
+            
+            # Skip meaningless queries
             if len(clean_query) < 5 or clean_query.lower() in ["test", "halo", "hi", "ping", "p", "hello"]:
+                logger.info(f"⏭️ Skipping trivial query: '{clean_query}'")
                 return ""
-
-            import re
-            def extract_codes(text: str) -> list:
-                # [FIX] Allow unlimited spaces/hyphens between letters and numbers
-                # Matches: "RC58", "RC 58", "RC   58", "RC-58", "RC - 58"
-                pattern = r'\b([A-Za-z]+[\s\-_]*\d+[A-Za-z0-9]*)\b'
-                raw_codes = re.findall(pattern, text)
-                # Clean up: "RC - 58" -> "RC58"
-                return [re.sub(r'[\s\-_]+', '', c).upper() for c in raw_codes]
-
-            # 2. Detect codes
-            query_codes = extract_codes(query)
-            if query_codes:
-                logger.info(f"🔢 Detected codes: {query_codes}")
             
             collection = self.get_or_create_collection(agent_id)
             
-            # 3. Semantic Search (Fetch 50 to ensure target is in the pool)
-            results = collection.query(
-                query_texts=[query],
-                n_results=n_results,
-                include=['documents', 'distances', 'metadatas']
-            )
-
-            if not results["documents"] or not results["documents"][0]:
+            # Get all documents from ChromaDB
+            all_docs_data = collection.get(include=['documents', 'metadatas'])
+            
+            if not all_docs_data['documents'] or len(all_docs_data['documents']) == 0:
+                logger.warning(f"⚠️ No documents found for agent {agent_id}")
                 return ""
-
-            candidates = results['documents'][0]
-            distances = results['distances'][0]
             
-            logger.info(f"🔎 RAG Query: '{query}' → Retrieved {len(candidates)} candidates")
-
-            # 4. Code Filter (Strict Logic)
-            if query_codes:
-                filtered_candidates = []
-                for doc, dist in zip(candidates, distances):
-                    doc_codes = extract_codes(doc)
-                    # Check if ANY query code exists in the document
-                    if any(qc in doc_codes for qc in query_codes):
-                        filtered_candidates.append((doc, dist))
-                
-                # Update BOTH candidates AND distances
-                if filtered_candidates:
-                    candidates = [doc for doc, _ in filtered_candidates]
-                    distances = [dist for _, dist in filtered_candidates]
-                    logger.info(f"✂️ Code filter: {len(results['documents'][0])} → {len(candidates)} docs")
-                else:
-                    logger.warning("⚠️ No docs matched code filter, reverting to semantic matches.")
-
-            # 5. Reranking (Try Neural, Fallback to Distance)
-            final_docs = []
+            total_docs = len(all_docs_data['documents'])
+            logger.info(f"🔎 RAG Query: '{clean_query}' → Searching {total_docs} documents")
             
-            # Try to load reranker
+            # Convert to LangChain Document format
+            documents = [
+                Document(
+                    page_content=doc, 
+                    metadata=meta if meta else {}
+                )
+                for doc, meta in zip(all_docs_data['documents'], all_docs_data['metadatas'])
+            ]
+            
+            # LAYER 1: BM25 Retriever (Keyword Matching)            
+            bm25_retriever = BM25Retriever.from_documents(documents)
+            bm25_retriever.k = 50  # Get top 50 candidates
+                        
+            # LAYER 2: Vector Search (Semantic Matching)
+            vectorstore = Chroma(
+                client=self.client,
+                collection_name=agent_id,
+                embedding_function=LangChainProxyEmbedding(self.embedding_fn)  
+            )
+            vector_retriever = vectorstore.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 50}  # Get top 50 candidates
+            )
+            
+            logger.info("🧠 Vector retriever initialized")
+            
+            # ENSEMBLE: Combine BM25 + Vector with Reciprocal Rank Fusion
+            ensemble_retriever = EnsembleRetriever(
+                retrievers=[bm25_retriever, vector_retriever],
+                weights=[0.3, 0.7]  # Tune these based on your use case
+            )
+                    
+            # Retrieve candidates
+            hybrid_results = ensemble_retriever.invoke(clean_query)
+            
+            if not hybrid_results or len(hybrid_results) == 0:
+                logger.warning("⚠️ No results from hybrid retrieval")
+                return ""
+            
+            logger.info(f"✅ Hybrid search returned {len(hybrid_results)} candidates")
+            
+            # LAYER 3: Neural Reranker (Transformer Model)   
             model, tokenizer = self._get_reranker()
             
-            if model and tokenizer and candidates:
+            if model and tokenizer and len(hybrid_results) > n_results:
                 try:
-                    # Prepare pairs for Cross-Encoder
-                    pairs = [[query, doc] for doc in candidates]
+                    # Extract text content from LangChain Documents
+                    candidates = [doc.page_content for doc in hybrid_results[:50]]
+                    
+                    # Prepare query-document pairs for cross-encoder
+                    pairs = [[clean_query, doc] for doc in candidates]
+                    
+                    logger.info(f"🎯 Reranking top {len(pairs)} candidates with transformer model...")
                     
                     with torch.no_grad():
-                        inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+                        # Tokenize all pairs at once (batch processing)
+                        inputs = tokenizer(
+                            pairs, 
+                            padding=True, 
+                            truncation=True, 
+                            return_tensors='pt', 
+                            max_length=512
+                        )
                         
-                        if next(model.parameters()).is_cuda:
-                            inputs = {k: v.cuda() for k, v in inputs.items()}
-                        
+                        # Get relevance scores from cross-encoder
                         scores = model(**inputs).logits.squeeze(-1)
-                        if scores.is_cuda: scores = scores.cpu()
+                        
+                        # Move to CPU for processing
+                        if scores.is_cuda:
+                            scores = scores.cpu()
+                        
                         scores = scores.tolist()
-
-                    # Sort by Score (High is better)
-                    scored_docs = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-                    final_docs = [doc for doc, score in scored_docs[:5]]
                     
-                    logger.info(f"🎯 Reranked Top Match: Score {scored_docs[0][1]:.4f}")
-
+                    # Sort by reranker score (higher = more relevant)
+                    scored_results = list(zip(hybrid_results[:50], scores))
+                    scored_results.sort(key=lambda x: x[1], reverse=True)
+                    
+                    # Extract top N documents
+                    final_results = [doc.page_content for doc, score in scored_results[:n_results]]
+                    
+                    top_score = scored_results[0][1]
+                    logger.info(f"🏆 Reranking complete. Top score: {top_score:.4f}")
+                    
+                    # Log score distribution for debugging
+                    if len(scored_results) >= 3:
+                        logger.debug(
+                            f"📈 Score distribution: "
+                            f"Top={scored_results[0][1]:.4f}, "
+                            f"2nd={scored_results[1][1]:.4f}, "
+                            f"3rd={scored_results[2][1]:.4f}"
+                        )
+                    
                 except Exception as rerank_error:
-                    logger.error(f"⚠️ Reranking failed, using distance: {rerank_error}")
-                    final_docs = [doc for doc, dist in zip(candidates, distances) if dist < 1.4][:5]
+                    logger.error(f"⚠️ Reranking failed, falling back to hybrid scores: {rerank_error}")
+                    final_results = [doc.page_content for doc in hybrid_results[:n_results]]
+            
             else:
-                final_docs = [doc for doc, dist in zip(candidates, distances) if dist < 1.4][:5]
-
-            if not final_docs:
+                # Reranker not available or not enough results
+                if not model or not tokenizer:
+                    logger.warning("⚠️ Reranker model not loaded, using hybrid results")
+                
+                final_results = [doc.page_content for doc in hybrid_results[:n_results]]
+            
+            if not final_results:
+                logger.warning("⚠️ No final results after processing")
                 return ""
             
-            return "\n\n###\n\n".join(final_docs)
-
+            logger.info(f"✅ Returning {len(final_results)} final results")
+            
+            # Join results with separator
+            return "\n\n###\n\n".join(final_results)
+            
         except Exception as e:
-            logger.error(f"❌ Query failed: {e}", exc_info=True)
-            return ""
-        
+            logger.error(f"❌ Query context failed: {e}", exc_info=True)
+            return ""    
+    
     def delete_document(self, agent_id: str, file_id: str):
         """
         Smart Delete:

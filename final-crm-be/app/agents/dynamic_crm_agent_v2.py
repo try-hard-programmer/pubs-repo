@@ -4,6 +4,7 @@ import asyncio
 import json
 from typing import List, Dict, Any, Optional
 from app.config import settings
+from app.services.mcp_service import get_mcp_service
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +13,8 @@ class DynamicCRMAgentV2:
         # Ensure URL ends with /chat
         base = settings.PROXY_BASE_URL.rstrip('/')
         self.proxy_url = f"{base}/chat"
-        
+        self.mcp_service = get_mcp_service()  
+
         logger.info(f"🔊 Speaker V2 initialized → {self.proxy_url}")
 
     def _sanitize_text_results(self, text: str) -> str:
@@ -55,6 +57,7 @@ class DynamicCRMAgentV2:
             rag_context: str,
             name_user: str,
             has_current_image: bool,
+            external_tools: List[Dict] = None,  
         ) -> str:
             name = persona.get("name", "Support Agent")
             tone = persona.get("tone", "friendly")
@@ -73,16 +76,39 @@ class DynamicCRMAgentV2:
                     triggers += f" OR types {kw_str}"
                 prompt += f"""HANDOFF RULE: If user {triggers} → empathize + say 'SWITCH TO HUMAN'"""
 
+            if external_tools and len(external_tools) > 0:
+                tool_descriptions = []
+                for tool in external_tools:
+                    tool_name = tool['function']['name'].split('__')[-1].replace('_', ' ')
+                    tool_desc = tool['function'].get('description', '')
+                    tool_descriptions.append(f"• {tool_name}: {tool_desc}")
+                
+                prompt += f"""
+            ## AVAILABLE TOOLS
+            You have access to these tools to help users:
+            {chr(10).join(tool_descriptions)}
+
+            IMPORTANT: When users ask about reservations, availability, booking, or checking status - USE THESE TOOLS!
+            Examples:
+            - "What's available on Feb 14?" → use list_available_slots
+            - "Make a reservation for 4 people" → use make_reservation
+            - "Check my reservation" → use check_reservation
+            """
+    
             if rag_context and rag_context.strip():
                 prompt += f"""## KNOWLEDGE BASE
-            IMPORTANT: Use ONLY this info.
+            IMPORTANT: Use this info to answer questions.
             ---
             {rag_context}
             ---
             """
+            elif external_tools and len(external_tools) > 0:
+                prompt += """## KNOWLEDGE BASE
+            No static knowledge base. Use the AVAILABLE TOOLS above to help users with reservations and bookings.
+            """
             else:
                 prompt += """## KNOWLEDGE BASE
-                No knowledge base provided. Answer general greetings only.
+            No knowledge base provided. Answer general greetings only.
             """
 
             if has_current_image:
@@ -97,10 +123,9 @@ class DynamicCRMAgentV2:
             else:
                 prompt += f"""
         ## CORE BEHAVIOR
-        - ONLY answer based on the KNOWLEDGE BASE provided below.
-        - If answer NOT in knowledge base, refuse politely.
-        - NEVER make up facts.
-        - Ignore previous history unless necessary.
+        - If tools are available and user asks about reservations/availability → USE THE TOOLS
+        - For other questions, use the KNOWLEDGE BASE if available
+        - If no knowledge base and no relevant tools → answer general greetings only
         # NAME POLICY
         - User: "{name_user}".
         - **General Rule:** Do NOT use the name in normal technical explanations. It sounds robotic.
@@ -254,6 +279,7 @@ class DynamicCRMAgentV2:
                 rag_context=rag_context,
                 name_user=name_user,
                 has_current_image=bool(image_urls),
+                external_tools=external_tools,  
             )
 
             # === 3. BUILD MESSAGES ===
@@ -334,18 +360,15 @@ class DynamicCRMAgentV2:
                                 
                                 logger.info(f"🛠️ Agent calling: {func_name}")
                                 
-                                # Execute via MCP Service using passed supabase client
-                                if not supabase:
-                                    logger.error("❌ Supabase client missing for MCP tool execution!")
-                                    tool_output = "Error: Database connection missing."
-                                else:
-                                    tool_result = await self.mcp_service.execute_mcp_tool(
-                                        supabase, 
-                                        agent_id=agent_settings.get("agent_id"), 
-                                        tool_call_name=func_name, 
-                                        arguments=func_args
-                                    )
-                                    tool_output = str(tool_result.get("output", "Error executing tool"))
+                                # Execute via MCP Service
+                                tool_result = await self.mcp_service.execute_mcp_tool(
+                                    supabase=supabase,
+                                    agent_id=agent_settings.get("agent_id"),
+                                    tool_call_name=func_name,
+                                    arguments=func_args
+                                )
+                                
+                                tool_output = tool_result.get("output", "Error executing tool")
                                 
                                 # C. Append Result to history
                                 messages.append({
@@ -354,7 +377,7 @@ class DynamicCRMAgentV2:
                                     "name": func_name,
                                     "content": tool_output
                                 })
-                            
+
                             # D. Loop again!
                             continue 
                         

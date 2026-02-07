@@ -54,7 +54,6 @@ class MessageRouterService:
 
                 # B. [NEW] Secondary Check: LID Lookup in Metadata
                 if str(contact).isdigit() and len(str(contact)) >= 14:
-                    logger.info(f"🔍 Contact {contact} looks like an LID. Checking metadata...")
                     lid_query = self.supabase.table("customers").select("*") \
                         .eq("organization_id", organization_id) \
                         .eq("metadata->>whatsapp_lid", contact) \
@@ -62,7 +61,6 @@ class MessageRouterService:
                     
                     if lid_query.data:
                         real_customer = lid_query.data[0]
-                        logger.info(f"👻 Ghost Prevented! Mapped LID {contact} -> Real User {real_customer.get('phone')}")
                         return self._update_customer_name_if_needed(real_customer, customer_name)
 
             # 2. TELEGRAM 
@@ -91,9 +89,6 @@ class MessageRouterService:
                         self.supabase.table("customers").update({"name": customer_name}).eq("id", customer["id"]).execute()
                     except: pass
                 return customer
-
-            # CREATE NEW
-            logger.info(f"📝 Creating NEW customer for '{contact}' (Channel: {channel})")
             
             final_name = customer_name or self._extract_name_from_contact(contact, channel)
 
@@ -129,7 +124,6 @@ class MessageRouterService:
             current_name = customer.get("name", "")
             # If we have a new name, and the current one is "Unknown" or empty
             if new_name and (not current_name or "Unknown" in current_name):
-                logger.info(f"📝 Updating customer name from '{current_name}' to '{new_name}'")
                 
                 # Update DB
                 self.supabase.table("customers").update({
@@ -153,7 +147,6 @@ class MessageRouterService:
         Find active chat for customer on specific channel.
         """
         try:
-            logger.info(f"🔍 Finding active chat: customer={customer_id}, channel={channel}")
 
             query = self.supabase.table("chats") \
                 .select("*") \
@@ -173,7 +166,6 @@ class MessageRouterService:
                 chat = response.data[0]
                 return chat
 
-            logger.info(f"ℹ️  No active chat found for customer {customer_id} on {channel}")
             return None
 
         except Exception as e:
@@ -268,9 +260,8 @@ class MessageRouterService:
             is_group_msg = meta.get("is_group", False)
             group_id_context = contact if is_group_msg else None
 
-            # =========================================================
+            
             # 1. WHATSAPP LOGIC (Restored from your 'waworks' file)
-            # =========================================================
             if channel == "whatsapp":
                 raw_participant = meta.get("real_contact_number") or meta.get("participant")
                 participant_name = meta.get("sender_display_name") or meta.get("push_name")
@@ -292,26 +283,20 @@ class MessageRouterService:
                             customer_metadata["is_lid_user"] = True
                             customer_metadata["whatsapp_lid"] = clean_part
 
-            # =========================================================
             # 2. TELEGRAM LOGIC (Keeps the new fixes)
-            # =========================================================
             elif channel == "telegram":
                 raw_participant = meta.get("participant") or meta.get("telegram_sender_id")
                 
                 # SWAP LOGIC: Group ID -> User ID
                 if is_group_msg and raw_participant and str(contact) != str(raw_participant):
-                    logger.info(f"🔀 [TELE SWAP] Group({contact}) -> User({raw_participant})")
                     contact = raw_participant 
                     
                     if customer_metadata is None: customer_metadata = {}
                     customer_metadata["last_seen_in_group"] = group_id_context
                     customer_metadata["telegram_user_id"] = raw_participant
                     customer_metadata["identity_swapped"] = True
-
-            # =========================================================
+            
             # COMMON EXECUTION
-            # =========================================================
-
             # Step 1: Find/Create Customer
             customer = await self.find_or_create_customer(
                 organization_id, channel, contact, customer_name, customer_metadata
@@ -357,7 +342,6 @@ class MessageRouterService:
 
                 if existing_message:
                     # [THE FIX] MERGE INSTEAD OF INSERT
-                    logger.info(f"🔄 Merging split message events for ID: {wa_msg_id}")
                     message_id = existing_message["id"]
                     is_merged_event = True
                     
@@ -373,9 +357,7 @@ class MessageRouterService:
                     self.supabase.table("messages").update(update_data).eq("id", message_id).execute()
 
                 else:
-                    # INSERT NEW (Only if it doesn't exist)
-                    logger.info(f"📥 Adding message: {chat_id}")
-                    
+                    # INSERT NEW (Only if it doesn't exist)                    
                     update_data = {"last_message_at": datetime.utcnow().isoformat()}
                     if status == "resolved":
                         update_data["status"] = "open"
@@ -396,7 +378,6 @@ class MessageRouterService:
             
             else:
                 # NEW CHAT
-                logger.info(f"📝 New chat: {customer_id}")
                 handled_by = "ai" if is_ai_agent else "human"
                 
                 c_res = self.supabase.table("chats").insert({

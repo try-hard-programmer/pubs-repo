@@ -787,7 +787,7 @@ async def create_knowledge_document(
 
         try:
             logger.info(f"✂️ Chunking text...")
-            chunks = split_into_chunks(text=clean_text, size=1200, overlap=200)
+            chunks = split_into_chunks(text=clean_text, size=1000, overlap=200)
             logger.info(f"✅ Created {len(chunks)} chunks")
             
             # [FIX 2] Inject agent_name into Chroma Metadata ONLY

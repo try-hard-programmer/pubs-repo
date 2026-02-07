@@ -232,16 +232,9 @@ class DynamicAIServiceV2:
                         rag_context = await self.reader.query_context(query=rag_query, agent_id=agent_id)
                     except: pass
 
-                # [NEW] Fetch Active Resources from MCP
-                mcp_context = ""
-                if agent_id:
-                    try:
-                        mcp_context = await self.mcp_service.fetch_active_resources(self.supabase, agent_id)
-                    except Exception as e:
-                        logger.warning(f"MCP Resource Fetch Failed: {e}")
-
                 # Combine Contexts
-                final_context = f"{rag_context}\n\n{mcp_context}".strip()
+                final_context = rag_context.strip() if rag_context else ""
+
 
                 # 7. FETCH MCP TOOLS (SKILLS)
                 mcp_tools = []

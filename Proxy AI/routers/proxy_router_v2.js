@@ -219,7 +219,13 @@ async function logEmbeddingUsage(orgId, response, provider, startTime) {
 // 5. CHAT PROVIDER HANDLERS
 // ==========================================
 
-async function handleOpenAI(messages, files = [], temperature = 0.7) {
+async function handleOpenAI(
+  messages,
+  files = [],
+  temperature = 0.7,
+  tools = null,
+  tool_choice = null,
+) {
   const config = API_CONFIGS.openai;
   // Use Vision Model if files present OR inline images detected
   const hasInlineImages = messages.some(
@@ -262,14 +268,21 @@ async function handleOpenAI(messages, files = [], temperature = 0.7) {
     processedMessages[lastUserIndex] = { ...lastMessage, content: content };
   }
 
+  const requestBody = {
+    model,
+    messages: processedMessages,
+    temperature,
+    max_tokens: config.maxTokens,
+  };
+
+  if (tools && tools.length > 0) {
+    requestBody.tools = tools;
+    if (tool_choice) requestBody.tool_choice = tool_choice;
+  }
+
   const response = await axios.post(
     `${config.baseUrl}/chat/completions`,
-    {
-      model,
-      messages: processedMessages,
-      temperature,
-      max_tokens: config.maxTokens,
-    },
+    requestBody,
     {
       headers: { Authorization: `Bearer ${getApiKey("openai")}` },
       timeout: 180000,
@@ -278,7 +291,12 @@ async function handleOpenAI(messages, files = [], temperature = 0.7) {
   return response.data;
 }
 
-async function handleGemini(messages, files = [], temperature = 0.7) {
+async function handleGemini(
+  messages,
+  files = [],
+  temperature = 0.7,
+  tools = null,
+) {
   const config = API_CONFIGS.gemini;
   const apiKey = getApiKey("gemini");
 
@@ -299,6 +317,34 @@ async function handleGemini(messages, files = [], temperature = 0.7) {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const parts = [];
+
+    // ✅ Handle tool results (OpenAI format → Gemini functionResponse)
+    if (msg.role === "tool") {
+      contents.push({
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              name: msg.name,
+              response: { content: msg.content },
+            },
+          },
+        ],
+      });
+      continue;
+    }
+
+    // ✅ Handle assistant messages with tool_calls (→ Gemini functionCall)
+    if (msg.role === "assistant" && msg.tool_calls) {
+      const fnParts = msg.tool_calls.map((tc) => ({
+        functionCall: {
+          name: tc.function.name,
+          args: JSON.parse(tc.function.arguments),
+        },
+      }));
+      contents.push({ role: "model", parts: fnParts });
+      continue;
+    }
 
     // [FIX] HANDLE MULTIMODAL ARRAYS (The cause of your 400 Error)
     if (Array.isArray(msg.content)) {
@@ -354,20 +400,64 @@ async function handleGemini(messages, files = [], temperature = 0.7) {
     });
   }
 
+  const requestBody = {
+    contents,
+    generationConfig: { temperature, maxOutputTokens: config.maxTokens },
+  };
+
+  if (tools && tools.length > 0) {
+    requestBody.tools = [
+      {
+        functionDeclarations: tools.map((t) => ({
+          name: t.function.name,
+          description: t.function.description,
+          parameters: t.function.parameters,
+        })),
+      },
+    ];
+  }
+
   try {
     const response = await axios.post(
       `${config.baseUrl}/models/${model}:generateContent?key=${apiKey}`,
-      {
-        contents,
-        generationConfig: { temperature, maxOutputTokens: config.maxTokens },
-      },
+      requestBody,
       { headers: { "Content-Type": "application/json" }, timeout: 180000 },
     );
 
     const candidate = response.data.candidates?.[0];
+    const parts = candidate?.content?.parts || [];
+
+    // ✅ Check if Gemini returned a function call
+    const functionCallParts = parts.filter((p) => p.functionCall);
+
+    if (functionCallParts.length > 0) {
+      // Convert Gemini function calls → OpenAI tool_calls format
+      const tool_calls = functionCallParts.map((p, i) => ({
+        id: `call_${Date.now()}_${i}`,
+        type: "function",
+        function: {
+          name: p.functionCall.name,
+          arguments: JSON.stringify(p.functionCall.args || {}),
+        },
+      }));
+
+      return {
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: tool_calls,
+            },
+          },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 0 },
+      };
+    }
+
+    // Normal text response
     const text =
-      candidate?.content?.parts?.[0]?.text ||
-      "⚠️ I cannot answer this due to safety filters.";
+      parts[0]?.text || "⚠️ I cannot answer this due to safety filters.";
 
     return {
       choices: [{ message: { role: "assistant", content: text } }],
@@ -387,21 +477,25 @@ async function routeWithFallback(
   messages,
   files = [],
   temperature = 0.7,
+  tools = null,
+  tool_choice = null,
 ) {
   try {
     if (provider === "gemini")
-      return await handleGemini(messages, files, temperature);
-    return await handleOpenAI(messages, files, temperature);
+      return await handleGemini(messages, files, temperature, tools);
+    return await handleOpenAI(messages, files, temperature, tools, tool_choice);
   } catch (error) {
-    console.error(`[FALLBACK] ${provider} failed: ${error.message}`);
-
-    // Simple Toggle Fallback: If Gemini fails, try OpenAI. If OpenAI fails, try Gemini.
     const fallback = provider === "openai" ? "gemini" : "openai";
-
     if (getApiKey(fallback)) {
       if (fallback === "openai")
-        return await handleOpenAI(messages, files, temperature);
-      return await handleGemini(messages, files, temperature);
+        return await handleOpenAI(
+          messages,
+          files,
+          temperature,
+          tools,
+          tool_choice,
+        );
+      return await handleGemini(messages, files, temperature, tools);
     }
     throw new Error("All providers failed");
   }
@@ -501,6 +595,8 @@ async function processUserQueue(userId) {
           job.messages,
           job.files,
           job.temperature,
+          job.tools,
+          job.tool_choice,
         );
 
         const queryType = detectQueryType(job.messages, job.files);
@@ -618,6 +714,8 @@ router.post("/chat", authenticate, async (req, res) => {
       category,
       nameUser,
       startTime,
+      tools: req.body.tools || null,
+      tool_choice: req.body.tool_choice || null,
     };
 
     await redisClient.rpush(`queue:${userId}`, JSON.stringify(job));

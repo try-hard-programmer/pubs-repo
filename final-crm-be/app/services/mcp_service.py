@@ -24,9 +24,7 @@ class MCPService:
         transport: str,
         api_key: Optional[str] = None
     ) -> Optional[ClientSession]:
-        """
-        Get existing session or create new one using official MCP SDK.
-        """
+        """Get existing session or create new one using official MCP SDK."""
         session_key = f"{transport}:{url}"
         
         # Return cached session if exists
@@ -61,8 +59,7 @@ class MCPService:
                     return session
                     
                 elif transport == "http":
-                    # For HTTP, we use direct httpx calls (no persistent session needed)
-                    # Return None to signal direct HTTP mode
+                    # For HTTP, return None - we use direct httpx calls
                     return None
                     
             except Exception as e:
@@ -112,19 +109,22 @@ class MCPService:
                 resp = await client.post(url, json=payload, headers=headers)
                 
                 if resp.status_code != 200:
-                    logger.error(f"HTTP Error {resp.status_code}: {resp.text}")
+                    logger.error(f"MCP HTTP Error {resp.status_code}: {resp.text}")
                     return {"error": f"HTTP {resp.status_code}", "success": False}
 
                 data = resp.json()
                 
                 if "error" in data:
-                    logger.error(f"JSON-RPC Error: {data['error']}")
+                    logger.error(f"MCP JSON-RPC Error: {data['error']}")
                     return {"error": data["error"], "success": False}
 
                 return {"result": data.get("result"), "success": True}
 
+        except httpx.TimeoutException:
+            logger.error(f"MCP Timeout calling {method} on {url}")
+            return {"error": "Connection timed out", "success": False}
         except Exception as e:
-            logger.error(f"HTTP Request Error: {e}")
+            logger.error(f"MCP HTTP Request Error: {e}")
             return {"error": str(e), "success": False}
     
     async def _sse_call_tool(
@@ -201,7 +201,24 @@ class MCPService:
     # 4. TOOL AGGREGATION
     # =========================================================
     async def get_all_tools_schema(self, supabase, agent_id: str) -> List[Dict[str, Any]]:
-        """Get all tools from active MCP servers and convert to OpenAI schema."""
+        """Get all tools with Redis caching (5min TTL)"""
+        from app.services.redis_service import get_redis
+        import json
+        
+        redis = get_redis()
+        cache_key = f"mcp:tools:{agent_id}"
+        
+        # Try cache first
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                tools = json.loads(cached)
+                logger.info(f"✅ MCP: Using Redis cached tools for {agent_id} ({len(tools)} tools)")
+                return tools
+        except Exception as e:
+            logger.warning(f"Redis cache read failed: {e}")
+        
+        # Cache miss - fetch fresh
         servers = await self._get_active_servers(supabase, agent_id)
         aggregated_tools = []
 
@@ -215,17 +232,14 @@ class MCPService:
             
             try:
                 if transport == "sse":
-                    # Use MCP SDK session
                     session = await self._get_or_create_session(url, transport, api_key)
                     if not session:
                         logger.error(f"Failed to create session for {server_name}")
                         continue
                     
-                    # List tools using SDK
                     tools_result = await session.list_tools()
                     mcp_tools = tools_result.tools if hasattr(tools_result, 'tools') else []
                     
-                    # Convert to OpenAI schema
                     for tool in mcp_tools:
                         namespaced_name = f"{server_name}__{tool.name}"
                         
@@ -262,8 +276,16 @@ class MCPService:
                 logger.error(f"Error listing tools from {server_name}: {e}")
                 continue
 
+        # Store in Redis (5 minutes TTL)
+        try:
+            await redis.setex(cache_key, 300, json.dumps(aggregated_tools))
+            logger.info(f"✅ MCP: Cached {len(aggregated_tools)} tools in Redis (5min TTL)")
+        except Exception as e:
+            logger.warning(f"Redis cache write failed: {e}")
+        
         return aggregated_tools
-
+    
+    
     # =========================================================
     # 5. TOOL EXECUTION
     # =========================================================
@@ -274,10 +296,10 @@ class MCPService:
         tool_call_name: str, 
         arguments: Dict
     ) -> Dict[str, Any]:
-        """Execute MCP tool."""
+        """Execute MCP tool and return result."""
         try:
             if "__" not in tool_call_name:
-                return {"error": f"Invalid tool format: {tool_call_name}"}
+                return {"status": "error", "output": f"Invalid tool format: {tool_call_name}"}
             
             target_server_name, real_tool_name = tool_call_name.split("__", 1)
             
@@ -291,7 +313,7 @@ class MCPService:
                     break
             
             if not target_server:
-                return {"error": f"MCP Server '{target_server_name}' not found"}
+                return {"status": "error", "output": f"MCP Server '{target_server_name}' not found"}
 
             transport = target_server.get("transport", "http")
             
@@ -306,7 +328,7 @@ class MCPService:
                 )
                 
                 if not session:
-                    return {"error": "Failed to create MCP session"}
+                    return {"status": "error", "output": "Failed to create MCP session"}
                 
                 response = await self._sse_call_tool(session, real_tool_name, arguments)
                 
@@ -327,7 +349,7 @@ class MCPService:
                 output_str = "\n".join([c.get("text", "") for c in result_content if c.get("type") == "text"])
                 return {"status": "success", "output": output_str}
             else:
-                return {"status": "error", "output": response.get("error")}
+                return {"status": "error", "output": str(response.get("error", "Unknown error"))}
 
         except Exception as e:
             logger.error(f"MCP Execution Failed: {e}")
@@ -395,7 +417,7 @@ class MCPService:
     # 7. CONNECTION TESTER
     # =========================================================
     async def test_connection(self, url: str, transport: str, api_key: str = None) -> Dict[str, Any]:
-        """Test MCP server connection."""
+        """Test MCP server connection by listing tools."""
         try:
             if transport.lower() == "sse":
                 # Use MCP SDK to test SSE connection
@@ -404,6 +426,8 @@ class MCPService:
                 if session:
                     # Test by listing tools
                     tools_result = await session.list_tools()
+                    tools = tools_result.tools if hasattr(tools_result, 'tools') else []
+                    
                     caps = ["tools"]
                     
                     # Check if resources are supported
@@ -416,25 +440,28 @@ class MCPService:
                     return {
                         "success": True,
                         "status": "connected",
-                        "capabilities": caps
+                        "capabilities": caps,
+                        "tools_count": len(tools)
                     }
                 else:
-                    return {"success": False, "status": "error", "error": "Failed to establish session"}
+                    return {"success": False, "status": "error", "error": "Failed to establish SSE session"}
             
             else:  # HTTP
-                res = await self._http_request(url, "initialize", params={
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "Syntra CRM", "version": "1.0"}
-                }, api_key=api_key, timeout=5.0)
+                # Test by calling tools/list
+                response = await self._http_request(url, "tools/list", api_key=api_key, timeout=5.0)
                 
-                if res.get("success"):
-                    result = res.get("result") or {}
-                    caps = list(result.get("capabilities", {}).keys())
+                if response.get("success"):
+                    result = response.get("result") or {}
+                    tools = result.get("tools", [])
                     
-                    return {"success": True, "status": "connected", "capabilities": caps}
+                    return {
+                        "success": True,
+                        "status": "connected",
+                        "capabilities": ["tools"],
+                        "tools_count": len(tools)
+                    }
                 else:
-                    return {"success": False, "status": "error", "error": res.get("error")}
+                    return {"success": False, "status": "error", "error": str(response.get("error", "Unknown error"))}
         
         except Exception as e:
             logger.error(f"Connection test failed: {e}")
@@ -452,4 +479,5 @@ class MCPService:
 
 # Singleton
 _mcp_service = MCPService()
-def get_mcp_service(): return _mcp_service
+def get_mcp_service(): 
+    return _mcp_service

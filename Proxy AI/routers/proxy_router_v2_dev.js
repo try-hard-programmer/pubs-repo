@@ -1,20 +1,53 @@
 // ==========================================
 // FILE: routers/proxy_router_v2.js
-// PURPOSE: Multi-agent LLM proxy with credit tracking
-// VERSION: 2.0 - Production Ready with Embedding Cost Tracking
+// PURPOSE: Multi-agent LLM proxy with Redis Queue (Dual Connection)
+// VERSION: 2.5 - Fixed Gemini Multimodal + No RunPod
 // ==========================================
 
 const express = require("express");
 const axios = require("axios");
+const Redis = require("ioredis");
 const router = express.Router();
 
 // ==========================================
-// API CONFIGURATIONS
+// 1. REDIS SETUP (Dual Connection Strategy)
+// ==========================================
+
+const redisConfig = {
+  host: process.env.REDIS_HOST || "localhost",
+  port: process.env.REDIS_PORT || 6379,
+  maxRetriesPerRequest: 3,
+};
+
+// 1. General Client (Non-blocking: RPUSH, GET, SET)
+const redisClient = new Redis(redisConfig);
+
+// 2. Worker Client (Blocking: BLPOP only)
+const redisBlocking = new Redis(redisConfig);
+
+redisClient.on("error", (err) => console.error("Redis (Main) Error:", err));
+redisBlocking.on("error", (err) => console.error("Redis (Block) Error:", err));
+
+redisClient.on("connect", () => console.log("✓ Redis (Main) Connected"));
+redisBlocking.on("connect", () => console.log("✓ Redis (Block) Connected"));
+
+const userWorkers = {};
+
+const CLEANUP_SCRIPT = `
+  local queueLen = redis.call('LLEN', KEYS[1])
+  if queueLen == 0 then
+    redis.call('DEL', KEYS[2])
+    return 1
+  end
+  return 0
+`;
+
+// ==========================================
+// 2. API CONFIGURATIONS
 // ==========================================
 
 const API_CONFIGS = {
   openai: {
-    name: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
     chatModel: "gpt-4o-mini",
     visionModel: "gpt-4o-mini",
@@ -23,7 +56,6 @@ const API_CONFIGS = {
     supportsVision: true,
   },
   gemini: {
-    name: "Google Gemini",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta",
     chatModel: "gemini-2.0-flash-exp",
     visionModel: "gemini-2.0-flash-exp",
@@ -31,20 +63,7 @@ const API_CONFIGS = {
     maxTokens: 8192,
     supportsVision: true,
   },
-  runpod: {
-    name: "RunPod",
-    baseUrl: process.env.RUNPOD_BASE_URL || "https://api.runpod.ai/v2",
-    endpointId: process.env.RUNPOD_ENDPOINT_ID,
-    chatModel: "openai-compatible",
-    embeddingModel: "sentence-transformers",
-    maxTokens: 4096,
-    supportsVision: false,
-  },
 };
-
-// ==========================================
-// CREDIT COSTS
-// ==========================================
 
 const CREDIT_COSTS = {
   basic_query: 1,
@@ -52,47 +71,28 @@ const CREDIT_COSTS = {
   document_analysis: 3,
   image_analysis: 4,
   complex_query: 5,
-  embedding: 0.5, // Embeddings cost less
+  embedding: 0.5,
 };
 
 // ==========================================
-// UTILITY FUNCTIONS
+// 3. UTILITY FUNCTIONS
 // ==========================================
 
 const getApiKey = (provider) => {
   const keys = {
     openai: process.env.OPENAI_API_KEY,
     gemini: process.env.GEMINI_API_KEY,
-    runpod: process.env.RUNPOD_API_KEY,
   };
   return keys[provider];
 };
 
 const authenticate = (req, res, next) => {
-  if (!process.env.SERVICE_API_KEY) {
-    return next();
-  }
-
+  if (!process.env.SERVICE_API_KEY) return next();
   const apiKey = req.headers["x-service-key"];
   if (apiKey !== process.env.SERVICE_API_KEY) {
-    console.error("[AUTH] ❌ Authentication failed");
     return res.status(401).json({ error: "Unauthorized" });
   }
-
   next();
-};
-
-const detectFiles = (files) => {
-  if (!files || !Array.isArray(files) || files.length === 0) {
-    return null;
-  }
-
-  const fileTypes = files.map((f) => f.type);
-  if (fileTypes.includes("image")) return "image";
-  if (fileTypes.includes("pdf")) return "pdf";
-  if (fileTypes.includes("audio")) return "audio";
-  if (fileTypes.includes("video")) return "video";
-  return "unknown";
 };
 
 async function downloadFileAsBase64(url) {
@@ -102,66 +102,71 @@ async function downloadFileAsBase64(url) {
       timeout: 30000,
     });
     const base64 = Buffer.from(response.data).toString("base64");
-    const mimeType =
-      response.headers["content-type"] || "application/octet-stream";
-    return { base64, mimeType };
+    return {
+      base64,
+      mimeType: response.headers["content-type"] || "application/octet-stream",
+    };
   } catch (error) {
-    console.error(`[DOWNLOAD] ❌ Failed: ${error.message}`);
+    console.warn(`[WARN] Failed to download image: ${url}`);
     throw new Error(`Failed to download file from ${url}`);
   }
 }
 
+function getProvider(requested) {
+  if (
+    requested &&
+    process.env.ALLOW_PROVIDER_OVERRIDE === "true" &&
+    API_CONFIGS[requested]
+  )
+    return requested;
+  return process.env.PRIMARY_LLM_PROVIDER || "openai";
+}
+
 function detectQueryType(messages, files) {
   const lastMessage = messages[messages.length - 1]?.content || "";
+
+  // Check for inline images in messages (New Python Payload)
+  const hasInlineImage =
+    Array.isArray(lastMessage) &&
+    lastMessage.some((m) => m.type === "image_url");
+
   const hasFiles = files && files.length > 0;
-  const messageLength = lastMessage.length;
 
   if (hasFiles && files[0]?.type === "image") return "image_analysis";
+  if (hasInlineImage) return "image_analysis";
   if (hasFiles && files[0]?.type === "pdf") return "document_analysis";
-  if (messageLength < 50) return "basic_query";
-  if (
-    lastMessage.toLowerCase().includes("search") ||
-    lastMessage.toLowerCase().includes("find")
-  ) {
-    return "file_search";
-  }
-  if (messageLength > 200) return "complex_query";
+
+  // Text length check
+  const textLen = Array.isArray(lastMessage)
+    ? lastMessage.find((m) => m.type === "text")?.text?.length || 0
+    : lastMessage.length;
+
+  if (textLen < 50) return "basic_query";
+  if (textLen > 200) return "complex_query";
   return "basic_query";
 }
 
-function calculateTokenCost(provider, inputTokens, outputTokens) {
+function calculateTokenCost(provider, input, output) {
   const pricing = {
-    openai: {
-      input: 0.15 / 1_000_000,
-      output: 0.6 / 1_000_000,
-      embedding: 0.02 / 1_000_000, // text-embedding-3-small
-    },
-    gemini: {
-      input: 0.075 / 1_000_000,
-      output: 0.3 / 1_000_000,
-      embedding: 0.025 / 1_000_000, // text-embedding-004
-    },
-    runpod: {
-      input: 0,
-      output: 0,
-      embedding: 0,
-    },
+    openai: { input: 0.15 / 1e6, output: 0.6 / 1e6 },
+    gemini: { input: 0.075 / 1e6, output: 0.3 / 1e6 },
   };
-
   const rates = pricing[provider] || pricing.gemini;
-  return inputTokens * rates.input + outputTokens * rates.output;
+  return input * rates.input + output * rates.output;
 }
 
 function calculateEmbeddingCost(provider, tokens) {
   const pricing = {
-    openai: 0.02 / 1_000_000, // $0.00002 per 1K tokens
-    gemini: 0.025 / 1_000_000, // $0.000025 per 1K tokens
-    runpod: 0,
+    openai: 0.02 / 1e6,
+    gemini: 0.025 / 1e6,
   };
-
   const rate = pricing[provider] || pricing.openai;
   return tokens * rate;
 }
+
+// ==========================================
+// 4. LOGGING FUNCTIONS
+// ==========================================
 
 async function logCreditUsage(
   orgId,
@@ -169,42 +174,26 @@ async function logCreditUsage(
   response,
   provider,
   startTime,
-  priority = null
+  priority = null,
 ) {
   const responseTime = Date.now() - startTime;
   const credits = CREDIT_COSTS[queryType];
-
   const tokenCost = calculateTokenCost(
     provider,
     response.usage?.prompt_tokens || 0,
-    response.usage?.completion_tokens || 0
+    response.usage?.completion_tokens || 0,
   );
 
-  const usage = {
+  return {
     organization_id: orgId,
     query_type: queryType,
-    priority: priority,
     credits_used: credits,
     response_time_ms: responseTime,
     provider: provider,
-    model: response.model,
-    input_tokens: response.usage?.prompt_tokens || 0,
-    output_tokens: response.usage?.completion_tokens || 0,
     cost_usd: tokenCost,
     status: "completed",
     created_at: new Date(),
   };
-
-  console.log(
-    `[CREDITS] ${queryType}: ${credits} credits, $${tokenCost.toFixed(
-      6
-    )}, ${responseTime}ms`
-  );
-
-  // TODO: Insert into database
-  // await db.query('INSERT INTO credit_usage (...) VALUES (...)', [...]);
-
-  return usage;
 }
 
 async function logEmbeddingUsage(orgId, response, provider, startTime) {
@@ -212,49 +201,39 @@ async function logEmbeddingUsage(orgId, response, provider, startTime) {
   const credits = CREDIT_COSTS.embedding;
   const tokens =
     response.usage?.total_tokens || response.usage?.prompt_tokens || 0;
-
   const tokenCost = calculateEmbeddingCost(provider, tokens);
 
-  const usage = {
+  return {
     organization_id: orgId,
     query_type: "embedding",
-    priority: null,
     credits_used: credits,
     response_time_ms: responseTime,
     provider: provider,
-    model: response.model || API_CONFIGS[provider].embeddingModel,
-    input_tokens: tokens,
-    output_tokens: 0,
     cost_usd: tokenCost,
     status: "completed",
     created_at: new Date(),
   };
-
-  console.log(
-    `[CREDITS] embedding: ${credits} credits, ${tokens} tokens, $${tokenCost.toFixed(
-      6
-    )}, ${responseTime}ms`
-  );
-
-  // TODO: Insert into database
-  // await db.query('INSERT INTO credit_usage (...) VALUES (...)', [...]);
-
-  return usage;
 }
 
 // ==========================================
-// PROVIDER HANDLERS - CHAT
+// 5. CHAT PROVIDER HANDLERS
 // ==========================================
 
 async function handleOpenAI(messages, files = [], temperature = 0.7) {
   const config = API_CONFIGS.openai;
+  // Use Vision Model if files present OR inline images detected
+  const hasInlineImages = messages.some(
+    (m) =>
+      Array.isArray(m.content) && m.content.some((p) => p.type === "image_url"),
+  );
   const hasFiles = files && files.length > 0;
-  const model = hasFiles ? config.visionModel : config.chatModel;
 
-  console.log(`[OPENAI] Model: ${model}`);
+  const model =
+    hasFiles || hasInlineImages ? config.visionModel : config.chatModel;
 
   let processedMessages = messages;
 
+  // Handle Legacy "files" array (if used)
   if (hasFiles) {
     const lastUserIndex = messages
       .map((m, i) => ({ role: m.role, index: i }))
@@ -263,79 +242,106 @@ async function handleOpenAI(messages, files = [], temperature = 0.7) {
 
     processedMessages = [...messages];
     const lastMessage = processedMessages[lastUserIndex];
-    const content = [{ type: "text", text: lastMessage.content || "" }];
+
+    // Normalize content to array
+    let content = [];
+    if (typeof lastMessage.content === "string") {
+      content.push({ type: "text", text: lastMessage.content });
+    } else if (Array.isArray(lastMessage.content)) {
+      content = [...lastMessage.content];
+    }
 
     for (const file of files) {
       if (file.type === "image") {
         content.push({
           type: "image_url",
-          image_url: {
-            url: file.url || `data:image/jpeg;base64,${file.data}`,
-          },
+          image_url: { url: file.url || `data:image/jpeg;base64,${file.data}` },
         });
       }
     }
-
     processedMessages[lastUserIndex] = { ...lastMessage, content: content };
   }
 
   const response = await axios.post(
     `${config.baseUrl}/chat/completions`,
     {
-      model: model,
+      model,
       messages: processedMessages,
-      temperature: temperature,
+      temperature,
       max_tokens: config.maxTokens,
     },
     {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${getApiKey("openai")}`,
-      },
-      timeout: parseInt(process.env.REQUEST_TIMEOUT) || 180000,
-    }
+      headers: { Authorization: `Bearer ${getApiKey("openai")}` },
+      timeout: 180000,
+    },
   );
-
-  console.log(`[OPENAI] ✅ ${response.data.usage.total_tokens} tokens`);
   return response.data;
 }
 
 async function handleGemini(messages, files = [], temperature = 0.7) {
   const config = API_CONFIGS.gemini;
-  const hasFiles = files && files.length > 0;
-  const model = hasFiles ? config.visionModel : config.chatModel;
   const apiKey = getApiKey("gemini");
 
-  console.log(`[GEMINI] Model: ${model}`);
+  // Auto-detect if we need vision based on content
+  const hasInlineImages = messages.some(
+    (m) =>
+      Array.isArray(m.content) && m.content.some((p) => p.type === "image_url"),
+  );
+  const hasFiles = files && files.length > 0;
+
+  // Gemini 2.0 Flash supports everything, but good to be explicit
+  const model =
+    hasFiles || hasInlineImages ? config.visionModel : config.chatModel;
 
   const contents = [];
 
+  // Use for...of loop to handle AWAIT for image downloads
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const parts = [];
 
-    if (msg.content) {
+    // [FIX] HANDLE MULTIMODAL ARRAYS (The cause of your 400 Error)
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === "text") {
+          parts.push({ text: part.text });
+        } else if (part.type === "image_url") {
+          // Gemini NEEDS Base64. It cannot take "url": "..." directly.
+          const imgUrl = part.image_url?.url;
+          if (imgUrl) {
+            try {
+              const { base64, mimeType } = await downloadFileAsBase64(imgUrl);
+              parts.push({
+                inline_data: {
+                  mime_type: mimeType || "image/jpeg",
+                  data: base64,
+                },
+              });
+            } catch (e) {
+              console.error(`Skipping inline image: ${e.message}`);
+            }
+          }
+        }
+      }
+    }
+    // Handle Simple String
+    else if (msg.content) {
       parts.push({ text: msg.content });
     }
 
+    // Handle Legacy "files" array
     if (msg.role === "user" && hasFiles && i === messages.length - 1) {
       for (const file of files) {
         if (file.type === "image") {
           let base64Data;
-
           if (file.url) {
             const { base64 } = await downloadFileAsBase64(file.url);
             base64Data = base64;
-          } else if (file.data) {
-            base64Data = file.data;
-          }
+          } else if (file.data) base64Data = file.data;
 
           if (base64Data) {
             parts.push({
-              inline_data: {
-                mime_type: "image/jpeg",
-                data: base64Data,
-              },
+              inline_data: { mime_type: "image/jpeg", data: base64Data },
             });
           }
         }
@@ -348,118 +354,31 @@ async function handleGemini(messages, files = [], temperature = 0.7) {
     });
   }
 
-  const response = await axios.post(
-    `${config.baseUrl}/models/${model}:generateContent?key=${apiKey}`,
-    {
-      contents: contents,
-      generationConfig: {
-        temperature: temperature,
-        maxOutputTokens: config.maxTokens,
-      },
-    },
-    {
-      headers: { "Content-Type": "application/json" },
-      timeout: parseInt(process.env.REQUEST_TIMEOUT) || 180000,
-    }
-  );
-
-  console.log(
-    `[GEMINI] ✅ ${response.data.usageMetadata?.totalTokenCount || 0} tokens`
-  );
-
-  return {
-    id: `gemini-${Date.now()}`,
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model: model,
-    choices: [
+  try {
+    const response = await axios.post(
+      `${config.baseUrl}/models/${model}:generateContent?key=${apiKey}`,
       {
-        index: 0,
-        message: {
-          role: "assistant",
-          content: response.data.candidates[0].content.parts[0].text,
-        },
-        finish_reason: "stop",
+        contents,
+        generationConfig: { temperature, maxOutputTokens: config.maxTokens },
       },
-    ],
-    usage: {
-      prompt_tokens: response.data.usageMetadata?.promptTokenCount || 0,
-      completion_tokens: response.data.usageMetadata?.candidatesTokenCount || 0,
-      total_tokens: response.data.usageMetadata?.totalTokenCount || 0,
-    },
-  };
-}
+      { headers: { "Content-Type": "application/json" }, timeout: 180000 },
+    );
 
-async function handleRunPod(messages, files = [], temperature = 0.7) {
-  const config = API_CONFIGS.runpod;
-  const endpointId = config.endpointId;
+    const candidate = response.data.candidates?.[0];
+    const text =
+      candidate?.content?.parts?.[0]?.text ||
+      "⚠️ I cannot answer this due to safety filters.";
 
-  if (!endpointId) {
-    throw new Error("RUNPOD_ENDPOINT_ID not configured");
-  }
-
-  console.log(`[RUNPOD] Endpoint: ${endpointId}`);
-
-  const response = await axios.post(
-    `${config.baseUrl}/${endpointId}/runsync`,
-    {
-      input: {
-        messages: messages,
-        temperature: temperature,
-        max_tokens: config.maxTokens,
-      },
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${getApiKey("runpod")}`,
-      },
-      timeout: parseInt(process.env.REQUEST_TIMEOUT) || 180000,
-    }
-  );
-
-  console.log(`[RUNPOD] ✅ Response received`);
-  return response.data.output || response.data;
-}
-
-// ==========================================
-// ROUTING - CONTROLLED BY ENV
-// ==========================================
-
-function getProvider(requestedProvider = null) {
-  // Allow per-request override if enabled
-  if (requestedProvider && process.env.ALLOW_PROVIDER_OVERRIDE === "true") {
-    if (API_CONFIGS[requestedProvider]) {
-      console.log(`[ROUTER] Override: ${requestedProvider}`);
-      return requestedProvider;
-    }
-  }
-
-  // Use PRIMARY_LLM_PROVIDER from .env
-  const primary = process.env.PRIMARY_LLM_PROVIDER || "openai";
-  console.log(`[ROUTER] Primary: ${primary}`);
-  return primary;
-}
-
-async function routeRequest(provider, messages, files = [], temperature = 0.7) {
-  const fileType = detectFiles(files);
-
-  console.log(`[ROUTE] Provider: ${provider}, Files: ${fileType || "none"}`);
-
-  if (fileType && !API_CONFIGS[provider].supportsVision) {
-    console.warn(`[ROUTE] ⚠️ ${provider} doesn't support files, ignoring`);
-    files = [];
-  }
-
-  switch (provider) {
-    case "openai":
-      return await handleOpenAI(messages, files, temperature);
-    case "gemini":
-      return await handleGemini(messages, files, temperature);
-    case "runpod":
-      return await handleRunPod(messages, files, temperature);
-    default:
-      throw new Error(`Unknown provider: ${provider}`);
+    return {
+      choices: [{ message: { role: "assistant", content: text } }],
+      usage: { prompt_tokens: 0, completion_tokens: 0 },
+    };
+  } catch (error) {
+    console.error(
+      "Gemini API Error:",
+      JSON.stringify(error.response?.data || error.message, null, 2),
+    );
+    throw error;
   }
 }
 
@@ -467,70 +386,41 @@ async function routeWithFallback(
   provider,
   messages,
   files = [],
-  temperature = 0.7
+  temperature = 0.7,
 ) {
-  if (process.env.ENABLE_FALLBACK !== "true") {
-    return await routeRequest(provider, messages, files, temperature);
-  }
-
   try {
-    return await routeRequest(provider, messages, files, temperature);
+    if (provider === "gemini")
+      return await handleGemini(messages, files, temperature);
+    return await handleOpenAI(messages, files, temperature);
   } catch (error) {
-    console.error(`[FALLBACK] ❌ ${provider} failed: ${error.message}`);
+    console.error(`[FALLBACK] ${provider} failed: ${error.message}`);
 
-    const fallbackOrder = ["openai", "gemini", "runpod"].filter(
-      (p) => p !== provider && getApiKey(p)
-    );
+    // Simple Toggle Fallback: If Gemini fails, try OpenAI. If OpenAI fails, try Gemini.
+    const fallback = provider === "openai" ? "gemini" : "openai";
 
-    for (const fallback of fallbackOrder) {
-      try {
-        console.log(`[FALLBACK] Trying: ${fallback}`);
-        return await routeRequest(fallback, messages, files, temperature);
-      } catch (fallbackError) {
-        console.error(
-          `[FALLBACK] ❌ ${fallback} failed: ${fallbackError.message}`
-        );
-        continue;
-      }
+    if (getApiKey(fallback)) {
+      if (fallback === "openai")
+        return await handleOpenAI(messages, files, temperature);
+      return await handleGemini(messages, files, temperature);
     }
-
     throw new Error("All providers failed");
   }
 }
 
 // ==========================================
-// EMBEDDINGS - CONTROLLED BY ENV
+// 6. EMBEDDING FUNCTIONS
 // ==========================================
 
 async function getOpenAIEmbeddings(texts) {
   const config = API_CONFIGS.openai;
-  console.log(`[EMBED] OpenAI...`);
-
   const response = await axios.post(
     `${config.baseUrl}/embeddings`,
+    { model: config.embeddingModel, input: texts },
     {
-      model: config.embeddingModel,
-      input: texts,
+      headers: { Authorization: `Bearer ${getApiKey("openai")}` },
+      timeout: 60000,
     },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${getApiKey("openai")}`,
-      },
-      timeout: parseInt(process.env.EMBEDDINGS_TIMEOUT) || 60000,
-    }
   );
-
-  // Calculate cost
-  const tokens = response.data.usage?.total_tokens || 0;
-  const cost = calculateEmbeddingCost("openai", tokens);
-
-  console.log(
-    `[EMBED] ✅ ${
-      response.data.data.length
-    } embeddings, ${tokens} tokens, $${cost.toFixed(6)}`
-  );
-
   return response.data;
 }
 
@@ -538,324 +428,232 @@ async function getGeminiEmbeddings(texts) {
   const config = API_CONFIGS.gemini;
   const apiKey = getApiKey("gemini");
   const requests = Array.isArray(texts) ? texts : [texts];
-
-  console.log(`[EMBED] Gemini ${requests.length} texts...`);
-
   const embeddings = [];
   let totalTokens = 0;
 
   for (const text of requests) {
     const response = await axios.post(
       `${config.baseUrl}/models/${config.embeddingModel}:embedContent?key=${apiKey}`,
-      {
-        content: {
-          parts: [{ text: text }],
-        },
-      },
-      {
-        headers: { "Content-Type": "application/json" },
-        timeout: parseInt(process.env.EMBEDDINGS_TIMEOUT) || 60000,
-      }
+      { content: { parts: [{ text: text }] } },
+      { headers: { "Content-Type": "application/json" }, timeout: 60000 },
     );
-
     embeddings.push({
       object: "embedding",
       embedding: response.data.embedding.values,
       index: embeddings.length,
     });
-
-    // Estimate tokens (rough: ~1 token per 4 chars)
     totalTokens += Math.ceil(text.length / 4);
   }
-
-  // Calculate cost
-  const cost = calculateEmbeddingCost("gemini", totalTokens);
-
-  console.log(
-    `[EMBED] ✅ ${
-      embeddings.length
-    } embeddings, ~${totalTokens} tokens (est), $${cost.toFixed(6)}`
-  );
-
   return {
     object: "list",
     data: embeddings,
     model: config.embeddingModel,
-    usage: {
-      prompt_tokens: totalTokens,
-      total_tokens: totalTokens,
-    },
-  };
-}
-
-async function getRunPodEmbeddings(texts) {
-  const config = API_CONFIGS.runpod;
-  const endpointId = config.endpointId;
-
-  if (!endpointId) {
-    throw new Error("RUNPOD_ENDPOINT_ID not configured");
-  }
-
-  console.log(`[EMBED] RunPod...`);
-
-  const response = await axios.post(
-    `${config.baseUrl}/${endpointId}/runsync`,
-    {
-      input: {
-        texts: texts,
-        model: config.embeddingModel,
-      },
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${getApiKey("runpod")}`,
-      },
-      timeout: parseInt(process.env.EMBEDDINGS_TIMEOUT) || 60000,
-    }
-  );
-
-  console.log(`[EMBED] ✅ RunPod done`);
-
-  // Estimate tokens if not provided
-  const texts_array = Array.isArray(texts) ? texts : [texts];
-  const estimatedTokens = texts_array.reduce(
-    (sum, text) => sum + Math.ceil(text.length / 4),
-    0
-  );
-
-  return {
-    ...(response.data.output || response.data),
-    usage: {
-      prompt_tokens: estimatedTokens,
-      total_tokens: estimatedTokens,
-    },
+    usage: { prompt_tokens: totalTokens, total_tokens: totalTokens },
   };
 }
 
 async function routeEmbeddings(texts, provider = null) {
-  // Use EMBEDDING_PROVIDER from .env
-  const embeddingProvider =
-    provider || process.env.EMBEDDING_PROVIDER || "openai";
-
-  console.log(`[EMBED] Provider: ${embeddingProvider}`);
-
-  switch (embeddingProvider) {
-    case "openai":
-      return await getOpenAIEmbeddings(texts);
-    case "gemini":
-      return await getGeminiEmbeddings(texts);
-    case "runpod":
-      return await getRunPodEmbeddings(texts);
-    default:
-      return await getOpenAIEmbeddings(texts);
-  }
+  const p = provider || process.env.EMBEDDING_PROVIDER || "openai";
+  if (p === "gemini") return await getGeminiEmbeddings(texts);
+  return await getOpenAIEmbeddings(texts);
 }
 
 // ==========================================
-// ROUTES
+// 7. WORKER SYSTEM
+// ==========================================
+
+async function processUserQueue(userId) {
+  const queueKey = `queue:${userId}`;
+  const lockKey = `lock:${userId}`;
+
+  try {
+    const locked = await redisClient.set(lockKey, "1", "EX", 300, "NX");
+    if (!locked) return;
+
+    console.log(`[${userId}] Worker started.`);
+
+    while (true) {
+      const jobData = await redisBlocking.blpop(queueKey, 1);
+
+      if (!jobData) {
+        const deleted = await redisClient.eval(
+          CLEANUP_SCRIPT,
+          2,
+          queueKey,
+          lockKey,
+        );
+        if (deleted === 1) {
+          delete userWorkers[userId];
+          console.log(`[${userId}] Worker stopped (Idle).`);
+          break;
+        } else {
+          continue;
+        }
+      }
+
+      const [, jobStr] = jobData;
+      const job = JSON.parse(jobStr);
+      console.log(`[${userId}] Processing Job ${job.jobId}`);
+
+      try {
+        const response = await routeWithFallback(
+          job.provider,
+          job.messages,
+          job.files,
+          job.temperature,
+        );
+
+        const queryType = detectQueryType(job.messages, job.files);
+        const creditUsage = await logCreditUsage(
+          job.organization_id,
+          queryType,
+          response,
+          job.provider,
+          job.startTime,
+          job.category,
+        );
+
+        const finalResponse = {
+          ...response,
+          metadata: {
+            request_id: job.requestId,
+            provider: job.provider,
+            nameUser: job.nameUser || "Anonymous",
+            hasFiles: job.files.length > 0,
+            timestamp: new Date().toISOString(),
+            query_type: queryType,
+            priority: job.category || null,
+            credits_used: creditUsage.credits_used,
+            response_time_ms: creditUsage.response_time_ms,
+            cost_usd: creditUsage.cost_usd,
+          },
+        };
+
+        await redisClient.setex(
+          `result:${job.jobId}`,
+          300,
+          JSON.stringify({ success: true, data: finalResponse }),
+        );
+        console.log(`[${userId}] Job ${job.jobId} completed`);
+      } catch (error) {
+        console.error(`[${userId}] Job Failed: ${error.message}`);
+        await redisClient.setex(
+          `result:${job.jobId}`,
+          300,
+          JSON.stringify({ success: false, error: error.message }),
+        );
+      }
+    }
+  } catch (error) {
+    console.error(`[${userId}] Worker Crashed:`, error);
+    await redisClient.del(lockKey).catch(() => {});
+    delete userWorkers[userId];
+  }
+}
+
+async function waitForResult(jobId, timeoutMs, req) {
+  const startTime = Date.now();
+  return new Promise((resolve, reject) => {
+    const interval = setInterval(async () => {
+      if (Date.now() - startTime > timeoutMs) {
+        clearInterval(interval);
+        reject(new Error("Timeout"));
+        return;
+      }
+
+      const result = await redisClient.get(`result:${jobId}`);
+      if (result) {
+        clearInterval(interval);
+        await redisClient.del(`result:${jobId}`);
+        resolve(JSON.parse(result));
+      }
+    }, 100);
+  });
+}
+
+// ==========================================
+// 8. ROUTES
 // ==========================================
 
 router.get("/test", (req, res) => {
-  console.log("✅ Proxy v2 test");
   res.json({
-    message: "Proxy Router v2 - Multi-Agent System",
+    message: "Proxy Router v2 - Production + Queue",
     timestamp: new Date(),
-    config: {
-      primary_llm: process.env.PRIMARY_LLM_PROVIDER || "openai",
-      embedding: process.env.EMBEDDING_PROVIDER || "openai",
-      fallback_enabled: process.env.ENABLE_FALLBACK === "true",
-    },
+    redis_status: "Dual Connection Active",
   });
 });
 
 router.post("/chat", authenticate, async (req, res) => {
   const startTime = Date.now();
   const requestId = `req-${Date.now()}`;
-  const fs = require("fs").promises;
-  const path = require("path");
-  const crypto = require("crypto");
-
-  // ==========================================
-  // 🎚️ MOCK TOGGLE FOR CHAT
-  // ==========================================
-  const USE_MOCK = false;
-
-  console.log(
-    `\n[v2] 🚀 ${requestId} ${USE_MOCK ? "(MOCK MODE)" : "(REAL API)"}`
-  );
 
   try {
-    console.log("📨 RAW REQUEST BODY:", JSON.stringify(req.body, null, 2));
     const {
       messages,
       files = [],
       temperature = 0.7,
-      provider: requestedProvider = null,
-      nameUser,
+      provider: reqProvider,
       organization_id,
       category,
+      nameUser,
+      ticket_id,
+      ticket_categories = [],
     } = req.body;
 
-    console.log(`[v2] User: ${nameUser || "Anonymous"}`);
-    console.log(`[v2] Org: ${organization_id || "N/A"}`);
-    console.log(`[v2] Messages: ${messages?.length || 0}`);
-
-    if (!messages || !Array.isArray(messages)) {
+    if (!messages || !Array.isArray(messages))
       return res.status(400).json({ error: "Missing messages array" });
-    }
 
-    // ✅ CREATE CACHE KEY (hash of messages + files)
-    const cacheKey = crypto
-      .createHash("md5")
-      .update(JSON.stringify({ messages, files, temperature }))
-      .digest("hex");
-    const cacheDir = path.join(__dirname, "../cache/chat");
-    const cacheFile = path.join(cacheDir, `${cacheKey}.json`);
+    const userId = organization_id || "default_org";
+    const jobId = `${userId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const provider = getProvider(reqProvider);
 
-    let response;
-    let fromCache = false;
-    let usedCacheFile = null;
-
-    // ✅ TRY TO LOAD FROM CACHE IF MOCK ENABLED
-    if (USE_MOCK) {
-      try {
-        // First try exact match
-        const cached = await fs.readFile(cacheFile, "utf8");
-        response = JSON.parse(cached);
-        fromCache = true;
-        usedCacheFile = cacheKey.substring(0, 8);
-        console.log(`📦 EXACT MATCH CACHE: ${usedCacheFile}...`);
-      } catch (err) {
-        // If no exact match, use newest cache file
-        console.log(`⚠️ No exact match, using newest cache...`);
-        try {
-          const cacheFiles = await fs.readdir(cacheDir);
-          if (cacheFiles.length > 0) {
-            // Get file stats with modification time
-            const fileStats = await Promise.all(
-              cacheFiles
-                .filter((f) => f.endsWith(".json"))
-                .map(async (f) => ({
-                  name: f,
-                  time: (await fs.stat(path.join(cacheDir, f))).mtime,
-                  path: path.join(cacheDir, f),
-                }))
-            );
-
-            // Sort by newest first
-            const newest = fileStats.sort((a, b) => b.time - a.time)[0];
-
-            const cached = await fs.readFile(newest.path, "utf8");
-            response = JSON.parse(cached);
-            fromCache = true;
-            usedCacheFile = newest.name.replace(".json", "").substring(0, 8);
-            console.log(
-              `📦 LOADED NEWEST CACHE: ${usedCacheFile}... (${newest.name})`
-            );
-          } else {
-            console.log(`⚠️ No cache files found, falling back to real API...`);
-          }
-        } catch (cacheError) {
-          console.log(`⚠️ Cache read error: ${cacheError.message}`);
-        }
-      }
-    }
-
-    // ✅ CALL REAL API IF NOT USING MOCK OR CACHE MISS
-    if (!fromCache) {
-      const provider = getProvider(requestedProvider);
-      console.log(`🌐 CALLING REAL API: ${provider}`);
-
-      response = await routeWithFallback(
-        provider,
-        messages,
-        files,
-        temperature
-      );
-
-      // ✅ SAVE TO CACHE FOR FUTURE USE
-      try {
-        await fs.mkdir(cacheDir, { recursive: true });
-        await fs.writeFile(cacheFile, JSON.stringify(response, null, 2));
-        console.log(`💾 CACHED: ${cacheKey.substring(0, 8)}...`);
-      } catch (cacheError) {
-        console.warn(`⚠️ Cache save failed: ${cacheError.message}`);
-      }
-    }
-
-    const queryType = detectQueryType(messages, files);
-    const creditUsage = await logCreditUsage(
+    const job = {
+      jobId,
+      requestId,
+      provider,
+      messages,
+      files,
+      temperature,
       organization_id,
-      queryType,
-      response,
-      fromCache ? "cached" : getProvider(requestedProvider),
+      category,
+      nameUser,
       startTime,
-      category
-    );
-
-    const finalResponse = {
-      ...response,
-      metadata: {
-        request_id: requestId,
-        provider: fromCache ? "cached" : getProvider(requestedProvider),
-        nameUser: nameUser || "Anonymous",
-        hasFiles: files.length > 0,
-        timestamp: new Date().toISOString(),
-        query_type: queryType,
-        priority: category || null,
-        credits_used: creditUsage.credits_used,
-        response_time_ms: creditUsage.response_time_ms,
-        cost_usd: fromCache ? 0 : creditUsage.cost_usd,
-        from_cache: fromCache,
-        cache_key: usedCacheFile || cacheKey.substring(0, 8),
-      },
     };
 
-    const totalTime = Date.now() - startTime;
-    console.log(
-      `[v2] ✅ ${totalTime}ms ${
-        fromCache
-          ? "📦 MOCK"
-          : "💸 REAL ($" + creditUsage.cost_usd.toFixed(6) + ")"
-      }\n`
-    );
+    await redisClient.rpush(`queue:${userId}`, JSON.stringify(job));
 
-    res.json(finalResponse);
+    if (!userWorkers[userId]) {
+      userWorkers[userId] = processUserQueue(userId);
+    }
+
+    const result = await waitForResult(jobId, 180000, req);
+
+    if (result.success) {
+      res.json(result.data);
+
+      // Fire and forget - update ticket after response sent
+      if (category?.toLowerCase() === "low" && ticket_id) {
+        const aiResponse = result.data.choices[0].message.content;
+        updateTicket(ticket_id, category, ticket_categories, aiResponse);
+      }
+    } else {
+      res.status(500).json({ error: result.error });
+    }
   } catch (error) {
-    console.error(`[v2] ❌ ${error.message}\n`);
-    res.status(error.response?.status || 500).json({
-      error: error.message || "Internal server error",
-      request_id: requestId,
-    });
+    if (error.message !== "Client disconnected") {
+      console.error(`[ERROR] ${requestId}: ${error.message}`);
+    }
+    if (!res.headersSent) res.status(500).json({ error: error.message });
   }
 });
 
 router.post("/embeddings", authenticate, async (req, res) => {
   const startTime = Date.now();
   const requestId = `embed-${Date.now()}`;
-  const fs = require("fs").promises;
-  const path = require("path");
-  const crypto = require("crypto");
-
-  // ==========================================
-  // 🎚️ MOCK TOGGLE FOR EMBEDDINGS
-  // ==========================================
-  const USE_MOCK = false;
-
-  console.log(
-    `\n[v2] 🧮 ${requestId} ${USE_MOCK ? "(MOCK MODE)" : "(REAL API)"}`
-  );
 
   try {
     const { texts, input, provider, organization_id } = req.body;
     const textsToEmbed = texts || input;
-
-    console.log("📥 INPUT DATA:", {
-      texts: textsToEmbed ? `${textsToEmbed.length} items` : "null",
-      provider: provider || "default",
-      organization_id: organization_id || "N/A",
-    });
 
     if (!textsToEmbed) {
       return res.status(400).json({ error: "Missing texts or input" });
@@ -863,110 +661,15 @@ router.post("/embeddings", authenticate, async (req, res) => {
 
     const embeddingProvider =
       provider || process.env.EMBEDDING_PROVIDER || "openai";
+    const response = await routeEmbeddings(textsToEmbed, embeddingProvider);
 
-    // Create cache key (hash of texts)
-    const cacheKey = crypto
-      .createHash("md5")
-      .update(JSON.stringify(textsToEmbed))
-      .digest("hex");
-    const cacheDir = path.join(__dirname, "../cache/embeddings");
-    const cacheFile = path.join(cacheDir, `${cacheKey}.json`);
-
-    let response;
-    let fromCache = false;
-    let usedCacheFile = null;
-
-    // ✅ TRY TO LOAD FROM CACHE IF MOCK ENABLED
-    if (USE_MOCK) {
-      try {
-        // First try exact match
-        const cached = await fs.readFile(cacheFile, "utf8");
-        response = JSON.parse(cached);
-        fromCache = true;
-        usedCacheFile = cacheKey.substring(0, 8);
-        console.log(`📦 EXACT MATCH CACHE: ${usedCacheFile}...`);
-      } catch (err) {
-        // If no exact match, use newest cache file
-        console.log(`⚠️ No exact match, using newest cache...`);
-        try {
-          const cacheFiles = await fs.readdir(cacheDir);
-          if (cacheFiles.length > 0) {
-            // Get file stats with modification time
-            const fileStats = await Promise.all(
-              cacheFiles
-                .filter((f) => f.endsWith(".json"))
-                .map(async (f) => ({
-                  name: f,
-                  time: (await fs.stat(path.join(cacheDir, f))).mtime,
-                  path: path.join(cacheDir, f),
-                }))
-            );
-
-            // Sort by newest first
-            const newest = fileStats.sort((a, b) => b.time - a.time)[0];
-
-            const cached = await fs.readFile(newest.path, "utf8");
-            response = JSON.parse(cached);
-            fromCache = true;
-            usedCacheFile = newest.name.replace(".json", "").substring(0, 8);
-            console.log(
-              `📦 LOADED NEWEST CACHE: ${usedCacheFile}... (${newest.name})`
-            );
-          } else {
-            console.log(`⚠️ No cache files found, falling back to real API...`);
-          }
-        } catch (cacheError) {
-          console.log(`⚠️ Cache read error: ${cacheError.message}`);
-        }
-      }
-    }
-
-    // ✅ CALL REAL API IF NOT USING MOCK OR CACHE MISS
-    if (!fromCache) {
-      console.log(`🌐 CALLING REAL API: ${embeddingProvider}`);
-      response = await routeEmbeddings(textsToEmbed, embeddingProvider);
-
-      // 🔍 LOG RAW API RESPONSE
-      console.log("📤 RAW API RESPONSE:", {
-        hasData: !!response.data,
-        dataLength: response.data?.length || 0,
-        hasUsage: !!response.usage,
-        usage: response.usage,
-        model: response.model,
-        object: response.object,
-        keys: Object.keys(response),
-      });
-
-      // Save to cache for future use
-      try {
-        await fs.mkdir(cacheDir, { recursive: true });
-        await fs.writeFile(cacheFile, JSON.stringify(response, null, 2));
-        console.log(`💾 CACHED: ${cacheKey.substring(0, 8)}...`);
-      } catch (cacheError) {
-        console.warn(`⚠️ Cache save failed: ${cacheError.message}`);
-      }
-    } else {
-      // 🔍 LOG CACHED RESPONSE
-      console.log("📤 CACHED RESPONSE:", {
-        hasData: !!response.data,
-        dataLength: response.data?.length || 0,
-        hasUsage: !!response.usage,
-        usage: response.usage,
-        model: response.model,
-        object: response.object,
-        keys: Object.keys(response),
-      });
-    }
-
-    // Log embedding usage
     const embeddingUsage = await logEmbeddingUsage(
       organization_id,
       response,
       embeddingProvider,
-      startTime
+      startTime,
     );
 
-    // Add metadata to response
     const finalResponse = {
       ...response,
       metadata: {
@@ -975,59 +678,13 @@ router.post("/embeddings", authenticate, async (req, res) => {
         timestamp: new Date().toISOString(),
         credits_used: embeddingUsage.credits_used,
         response_time_ms: embeddingUsage.response_time_ms,
-        cost_usd: fromCache ? 0 : embeddingUsage.cost_usd,
-        from_cache: fromCache,
-        cache_key: usedCacheFile || cacheKey.substring(0, 8),
+        cost_usd: embeddingUsage.cost_usd,
       },
     };
 
-    // 🔍 LOG FINAL RESPONSE STRUCTURE
-    console.log("📦 FINAL RESPONSE STRUCTURE:", {
-      hasData: !!finalResponse.data,
-      dataLength: finalResponse.data?.length || 0,
-      firstEmbeddingDimension: finalResponse.data?.[0]?.embedding?.length || 0,
-      hasMetadata: !!finalResponse.metadata,
-      hasUsage: !!finalResponse.usage,
-      keys: Object.keys(finalResponse),
-      metadataKeys: Object.keys(finalResponse.metadata || {}),
-    });
-
-    // 🔍 LOG FIRST EMBEDDING SAMPLE (for debugging)
-    if (finalResponse.data && finalResponse.data[0]) {
-      console.log("🔬 FIRST EMBEDDING SAMPLE:", {
-        object: finalResponse.data[0].object,
-        index: finalResponse.data[0].index,
-        embeddingLength: finalResponse.data[0].embedding?.length,
-        embeddingFirst5: finalResponse.data[0].embedding?.slice(0, 5),
-        keys: Object.keys(finalResponse.data[0]),
-      });
-    }
-
-    console.log(
-      `[v2] ✅ Done ${
-        fromCache
-          ? "📦 MOCK"
-          : "💸 REAL ($" + embeddingUsage.cost_usd.toFixed(6) + ")"
-      }\n`
-    );
-
-    // 🔍 LOG WHAT WE'RE SENDING BACK
-    console.log("🚀 SENDING RESPONSE:", {
-      statusCode: 200,
-      bodySize: JSON.stringify(finalResponse).length,
-      hasData: !!finalResponse.data,
-      hasMetadata: !!finalResponse.metadata,
-    });
-
     res.json(finalResponse);
   } catch (error) {
-    console.error(`[v2] ❌ ERROR DETAILS:`, {
-      message: error.message,
-      stack: error.stack?.split("\n").slice(0, 3),
-      response: error.response?.data,
-      status: error.response?.status,
-    });
-
+    console.error(`[ERROR] ${requestId}: ${error.message}`);
     res.status(error.response?.status || 500).json({
       error: error.message || "Internal server error",
       request_id: requestId,
@@ -1035,6 +692,350 @@ router.post("/embeddings", authenticate, async (req, res) => {
   }
 });
 
-module.exports = router;
+process.on("SIGTERM", async () => {
+  console.log("Shutting down...");
+  await redisClient.quit();
+  await redisBlocking.quit();
+  process.exit(0);
+});
 
-console.log("🔧 Proxy Router v2 loaded");
+// ==========================================
+// 9. TICKET UPDATE WEBHOOK
+// ==========================================
+
+async function updateTicket(ticketId, category, listCategory, resultFromAI) {
+  // Guard: Only process if category and ticketId exist
+  if (!ticketId || !category) {
+    return null;
+  }
+
+  // Guard: Only process LOW priority tickets
+  if (category.toLowerCase() !== "low") {
+    return null;
+  }
+
+  try {
+    const systemPrompt = `You are an expert ticket classification system for customer support. Analyze the AI's response to the customer and determine the most appropriate ticket metadata.
+
+Available categories: ${listCategory.join(", ")}
+
+Your task:
+1. Create a concise, professional title (max 60 chars) that captures the core issue
+2. Select the BEST matching category from the available list
+3. Assess urgency and assign priority: low, medium, high, or urgent
+4. Provide a brief, clear reason for your classification
+
+Classification Guidelines:
+- Title: Focus on the problem/topic, not the solution (e.g., "RC68 Transaction Timeout Issue" not "User asked about error")
+- Category: Match based on technical domain (hardware, software, billing, account, etc.)
+- Priority:
+  * low: Greetings, introductions, general chitchat, no actual issue or question
+  * medium: Standard issues, routine problems, how-to questions
+  * high: System errors, repeated issues, multiple users affected
+  * urgent: Service down, critical errors, security concerns, revenue impact
+- Reason: State what issue was identified and why it needs this classification
+
+If no category matches well, use "general".
+If the message is just a greeting or introduction with no real issue, set priority to "low".
+
+Respond ONLY with valid JSON (no markdown, no explanation):
+{
+  "title": "Short descriptive title",
+  "category": "chosen_category",
+  "priority": "low|medium|high|urgent",
+  "reason": "Brief explanation of classification"
+}`;
+
+    const userPrompt = `Customer Support Interaction:
+${resultFromAI}
+
+Current ticket category: ${category}
+Available categories: ${listCategory.join(", ")}
+
+Analyze the interaction and classify this ticket appropriately.`;
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ];
+
+    const provider = getProvider(null);
+
+    // Call OpenAI with JSON mode
+    if (provider === "openai") {
+      const config = API_CONFIGS.openai;
+
+      const response = await axios.post(
+        `${config.baseUrl}/chat/completions`,
+        {
+          model: config.chatModel,
+          messages: messages,
+          temperature: 0.3,
+          max_tokens: 500,
+          response_format: { type: "json_object" },
+        },
+        {
+          headers: { Authorization: `Bearer ${getApiKey("openai")}` },
+          timeout: 30000,
+        },
+      );
+
+      const classification = JSON.parse(
+        response.data.choices[0].message.content,
+      );
+
+      // Validate category
+      if (!listCategory.includes(classification.category)) {
+        classification.category = "general";
+        classification.reason = `Original category not in list. Using general.`;
+      }
+
+      // Prepare webhook payload
+      const payload = {
+        ticket_id: ticketId,
+        title: classification.title,
+        category: classification.category,
+        priority: classification.priority,
+        reason: classification.reason,
+      };
+
+      // Update ticket via webhook
+      const webhookResponse = await axios.put(
+        `${process.env.WEBHOOK_BASE_URL}/webhook/ai/ticket/update`,
+        payload,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": process.env.WEBHOOK_SECRET,
+          },
+          timeout: 10000,
+        },
+      );
+
+      return webhookResponse.data;
+    } else if (provider === "gemini") {
+      const config = API_CONFIGS.gemini;
+      const apiKey = getApiKey("gemini");
+
+      const contents = messages.map((msg) => ({
+        role: msg.role === "assistant" ? "model" : "user",
+        parts: [{ text: msg.content }],
+      }));
+
+      const response = await axios.post(
+        `${config.baseUrl}/models/${config.chatModel}:generateContent?key=${apiKey}`,
+        {
+          contents,
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 500,
+            responseMimeType: "application/json",
+          },
+        },
+        {
+          headers: { "Content-Type": "application/json" },
+          timeout: 30000,
+        },
+      );
+
+      const text =
+        response.data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+      const classification = JSON.parse(text);
+
+      // Validate category
+      if (!listCategory.includes(classification.category)) {
+        classification.category = "general";
+        classification.reason = `Original category not in list. Using general.`;
+      }
+
+      // Prepare webhook payload
+      const payload = {
+        ticket_id: ticketId,
+        title: classification.title,
+        category: classification.category,
+        priority: classification.priority,
+        reason: classification.reason,
+      };
+
+      // Update ticket via webhook
+      const webhookResponse = await axios.put(
+        `${process.env.WEBHOOK_BASE_URL}/webhook/ai/ticket/update`,
+        payload,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": process.env.WEBHOOK_SECRET,
+          },
+          timeout: 10000,
+        },
+      );
+      console.log(
+        `[TICKET] ✅ ${ticketId} updated: "${classification.title}" - ${classification.category} (${classification.priority})`,
+      );
+      return webhookResponse.data;
+    }
+  } catch (error) {
+    console.error(`[TICKET] ❌ Failed to update ticket ${ticketId}`);
+    console.error(`[TICKET] Error Message:`, error.message);
+    console.error(`[TICKET] Error Response Status:`, error.response?.status);
+    console.error(
+      `[TICKET] Error Response Data:`,
+      JSON.stringify(error.response?.data, null, 2),
+    );
+    console.error(`[TICKET] Full Error:`, error);
+
+    if (error.response?.status === 404) {
+      console.error(`[TICKET] Ticket ${ticketId} not found`);
+      return null;
+    }
+
+    if (error.response?.status === 500) {
+      console.error(`[TICKET] Server error on webhook side`);
+    }
+
+    return null;
+  }
+}
+
+// ==========================================
+// 10. AUDIO TRANSCRIPTION (Whisper)
+// ==========================================
+
+router.post("/audio", authenticate, async (req, res) => {
+  const { url, model } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: "Missing audio url" });
+  }
+
+  try {
+    console.log(`🎵 Processing audio transcription`);
+
+    // Download audio file
+    const audioResponse = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 60000,
+    });
+
+    const audioBuffer = Buffer.from(audioResponse.data);
+    const FormData = require("form-data");
+    const form = new FormData();
+
+    form.append("file", audioBuffer, {
+      filename: "audio.mp3",
+      contentType: audioResponse.headers["content-type"] || "audio/mpeg",
+    });
+    form.append("model", "whisper-1");
+
+    const response = await axios.post(
+      "https://api.openai.com/v1/audio/transcriptions",
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${getApiKey("openai")}`,
+          ...form.getHeaders(),
+        },
+        timeout: 300000,
+      },
+    );
+
+    // 1. Get the text result
+    let transcription = response.data.text || "";
+
+    // 2. 🛡️ SAFETY NET: Handle Instrumental/Silent Audio
+    // If Whisper returns empty text (common for music), provide a placeholder.
+    // This tricks the Python backend into thinking it found text, so it SAVES the file.
+    if (!transcription || transcription.trim().length === 0) {
+      console.log(
+        "⚠️ Audio has no spoken words (Instrumental/Silence). Using placeholder.",
+      );
+      transcription =
+        "[Audio processed. No spoken words detected (Music/Instrumental).]";
+    }
+
+    res.json({
+      output: {
+        result: transcription,
+      },
+    });
+  } catch (error) {
+    console.error("Audio transcription error:", error.message);
+
+    // 3. ERROR SAFETY: Instead of sending 500 (which triggers rollback),
+    // send the error message as the "transcription".
+    // This ensures the file is SAVED so you can debug it later.
+    res.json({
+      output: {
+        result: `[Error processing audio: ${error.message}]`,
+      },
+    });
+  }
+});
+
+// ==========================================
+// 11. IMAGE OCR (GPT-4o Vision)
+// ==========================================
+
+router.post("/image/ocr", authenticate, async (req, res) => {
+  const { image_url } = req.body;
+
+  if (!image_url) {
+    return res.status(400).json({ error: "Missing image_url" });
+  }
+
+  try {
+    console.log(`🖼️ Processing image OCR`);
+
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Extract all text found in this image. If the image contains no readable text (like a photo, icon, or drawing), return exactly: '[NO_TEXT_DETECTED]'. Do not add any other explanation.",
+              },
+              {
+                type: "image_url",
+                image_url: { url: image_url },
+              },
+            ],
+          },
+        ],
+        max_tokens: 300,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${getApiKey("openai")}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 60000,
+      },
+    );
+
+    let content = response.data?.choices?.[0]?.message?.content || "";
+
+    // 2. SAFETY NET: If AI returns empty string or the specific tag, give Python something safe
+    if (
+      !content ||
+      content.trim() === "" ||
+      content.includes("[NO_TEXT_DETECTED]")
+    ) {
+      console.log("⚠️ Image has no text. Using placeholder to save file.");
+      content = "Visual content only. No text detected in this image.";
+    }
+
+    // 3. RETURN CONTENT (Python backend will now save the file instead of deleting it)
+    res.json({ content });
+  } catch (error) {
+    console.error("Image OCR error:", error.message);
+    // 4. ERROR HANDLER: Return error as text so the file is saved for debugging
+    res.json({ content: `Error processing image: ${error.message}` });
+  }
+});
+
+module.exports = router;
+console.log(`🚀 Proxy Router v2 loaded [Production Mode]`);

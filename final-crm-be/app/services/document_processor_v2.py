@@ -135,7 +135,6 @@ class DocumentProcessorV2:
                 return {"success": False, "error": "Document too short after normalization"}
 
             # 3. Chunk Text with improved overlap
-            # [IMPROVED] 512 tokens with 100 overlap (was 50)
             chunks = split_into_chunks(text, size=512, overlap=100)
             
             self.logger.info(f"✂️ Generated {len(chunks)} chunks (avg: {len(text)//len(chunks)} chars/chunk)")
