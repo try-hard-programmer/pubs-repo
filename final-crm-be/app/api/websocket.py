@@ -205,6 +205,8 @@ async def websocket_endpoint(
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
 
+            logger.info(f"✅ User {user_id} authorized for org {organization_id}")
+
         except Exception as e:
             logger.error(f"Error verifying user organization: {e}")
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)

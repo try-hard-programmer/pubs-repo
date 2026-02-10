@@ -214,7 +214,8 @@ async def run_rag_agent(
             query=request.query,
             email=current_user.email,
             organization_id=organization_id,  # ⭐ Organization-specific query
-            session_id=request.session_id
+            session_id=request.session_id,
+            topic_id=request.topic_id,
         )
 
         # Extract answer and metadata
@@ -302,7 +303,6 @@ async def run_analysis_agent(request: AgentAnalysisRequest):
             session_id=request.session_id
         )
 
-        print("RESULT", result)
         return AgentFileResponse(
             message=result["message"],
             session_id = result["session_id"]

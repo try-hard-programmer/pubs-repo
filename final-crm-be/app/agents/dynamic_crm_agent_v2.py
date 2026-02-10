@@ -39,6 +39,47 @@ class DynamicCRMAgentV2:
 
         return text.strip()
     
+    async def reformulate_query(self, user_message: str, vision_context: str, organization_id: str) -> str:
+        """Fast LLM call to extract a clean search query from messy user input"""
+        combined = user_message.strip()
+        if vision_context:
+            combined = f"{combined}\n[Image Analysis: {vision_context}]"
+        
+        # Skip if already clean enough
+        if not combined or len(combined) < 3:
+            return combined
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": (
+                    "Extract a concise search query from the user's message. "
+                    "If there's image analysis, prioritize extracting codes, product names, or key terms from it. "
+                    "IMPORTANT: Output in the SAME LANGUAGE as the user's message. "
+                    "Output ONLY the search query, nothing else. Max 15 words."
+                )},
+                {"role": "user", "content": combined}
+            ],
+            "organization_id": organization_id,
+            "temperature": 0.0,
+            "max_tokens": 50
+        }
+        
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.proxy_url, json=payload) as resp:
+                    if resp.status == 200:
+                        res = await resp.json()
+                        query = res.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                        if query and len(query) > 2:
+                            logger.info(f"🔄 Query reformulated: '{user_message[:30]}...' → '{query}'")
+                            return query
+        except Exception as e:
+            logger.warning(f"⚠️ Reformulation failed, using raw: {e}")
+        
+        # Fallback: concat raw
+        return combined
+
     def _parse_json(self, data: Any) -> Dict:
         """Helper to safely parse JSON strings or dicts from Supabase"""
         if isinstance(data, dict):
@@ -68,13 +109,29 @@ class DynamicCRMAgentV2:
 
             prompt = f"""You are {name}. Tone: {tone}. User: {name_user}. LANGUAGE RULE: {lang_instruction}"""
             
+
+            if len(custom_instructions) > 10:
+                prompt += f"""
+            {custom_instructions}
+            """
+            else:
+                prompt += f"""
+                ## CORE INSTRUCTION
+                Please answer the user's questions based on the provided **KNOWLEDGE BASE**. 
+                
+                **Guidelines:**
+                1. Use the information in the Knowledge Base to provide accurate answers.
+                2. If the answer is not found in the Knowledge Base, politely inform the user that you don't have that information.
+                3. Keep the tone natural, helpful, and friendly.
+                """
+                
             if handoff.get("enabled"):
                 keywords = handoff.get("keywords", [])
                 triggers = "is angry OR wants human"
                 if keywords:
                     kw_str = " / ".join([f'"{k}"' for k in keywords])
                     triggers += f" OR types {kw_str}"
-                prompt += f"""HANDOFF RULE: If user {triggers} → empathize + say 'SWITCH TO HUMAN'"""
+                prompt += f"""HANDOFF RULE: If user {triggers} → empathize + say 'Please connect to your engineer!' with keeping using the same {language}"""
 
             if external_tools and len(external_tools) > 0:
                 tool_descriptions = []
@@ -87,12 +144,6 @@ class DynamicCRMAgentV2:
             ## AVAILABLE TOOLS
             You have access to these tools to help users:
             {chr(10).join(tool_descriptions)}
-
-            IMPORTANT: When users ask about reservations, availability, booking, or checking status - USE THESE TOOLS!
-            Examples:
-            - "What's available on Feb 14?" → use list_available_slots
-            - "Make a reservation for 4 people" → use make_reservation
-            - "Check my reservation" → use check_reservation
             """
     
             if rag_context and rag_context.strip():
@@ -115,53 +166,7 @@ class DynamicCRMAgentV2:
                 prompt += """## VISION UPDATE
             User sent an image. Extract codes/text and search the Knowledge Base for matches.
             """
-
-            if len(custom_instructions) > 10:
-                prompt += f"""
-            {custom_instructions}
-            """
-            else:
-                prompt += f"""
-        ## CORE BEHAVIOR
-        - If tools are available and user asks about reservations/availability → USE THE TOOLS
-        - For other questions, use the KNOWLEDGE BASE if available
-        - If no knowledge base and no relevant tools → answer general greetings only
-        # NAME POLICY
-        - User: "{name_user}".
-        - **General Rule:** Do NOT use the name in normal technical explanations. It sounds robotic.
-        - **Exceptions (Allowed):** 1. If the user is **Angry** (to calm them down). 2. If the user says **"Thanks/Makasih/Arigatou"** (e.g., "Sama-sama, {name_user}!" is okay).
-        ## UNIVERSAL FALLBACK PROTOCOL (STRICT & SMART)
-        If the exact answer to the user's question is not available in the Knowledge Base:
-            1. **NO GUESSING:** Never assume or infer information that isn’t clearly available.(Example: If the user asks about "Plan A" but only "Plan B" is listed, do not explain Plan B as if it were the answer.)
-            2. **HONEST RESPONSE:** Use a natural, human-friendly explanation, such as: "Sorry, I don’t have the exact details for that right now.
-            3. **HELPFUL DIRECTION (MANDATORY):**
-                - Review the available information in the **Knowledge Base**.
-                - Share any related **titles**, **topics**, or **error codes** that are available.
-                - Present them as options the user can choose from.  
-                - *Example:*  
-                    "What I can help with right now are these related topics: [list of available titles/codes]."
-            4. **NEXT STEP:** If none of the listed items match the user’s issue, gently suggest reaching out to the support team for further assistance.
-        ## INSTRUCTIONS:
-        1. **GENERIC KNOWLEDGE MODE (DEFAULT)**
-        - Do NOT assume the Knowledge Base is about error codes.
-        - Do NOT assume any specific structure (codes, steps, titles, numbering).
-        - Treat the Knowledge Base as plain reference text.
-        2. **ANSWER DECISION RULE**
-        - If the user's question can be answered CLEARLY and DIRECTLY using the provided Knowledge Base:
-            - Answer using ONLY the relevant part.
-        - If the answer is ambiguous, partial, or missing:
-            - Do NOT guess.
-            - Do NOT substitute with similar topics or codes.
-            - Ask ONE short clarification question OR list up to 3 related items found in the Knowledge Base.
-        3. **STRICT INTEGRITY**
-        - Never invent codes, explanations, or steps.
-        - Never merge information from multiple unrelated sections.
-        - Only explain what is explicitly written.
-        4. **RESPONSE STYLE**
-        - Natural, concise, human.
-        - No forced templates.
-        - No assumptions.
-        """
+                
             return prompt
     
     def _build_messages(
@@ -316,7 +321,7 @@ class DynamicCRMAgentV2:
                     payload["tools"] = external_tools
                     payload["tool_choice"] = "auto"
 
-                logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
+                # logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
                 
                 # === 5. CALL PROXY ===
                 async with aiohttp.ClientSession(timeout=timeout) as session:

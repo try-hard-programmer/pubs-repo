@@ -190,7 +190,8 @@ class MCPService:
                         "api_key": s.get("apiKey"),
                         "transport": s.get("transport", "http")
                     })
-
+            
+            logger.info(f"🔍 MCP DB Query: agent_id={agent_id}, results={len(res.data)} rows")
             return active_servers
 
         except Exception as e:
@@ -276,12 +277,15 @@ class MCPService:
                 logger.error(f"Error listing tools from {server_name}: {e}")
                 continue
 
-        # Store in Redis (5 minutes TTL)
-        try:
-            await redis.setex(cache_key, 300, json.dumps(aggregated_tools))
-            logger.info(f"✅ MCP: Cached {len(aggregated_tools)} tools in Redis (5min TTL)")
-        except Exception as e:
-            logger.warning(f"Redis cache write failed: {e}")
+        # Store in Redis ONLY if we got tools
+        if aggregated_tools:
+            try:
+                await redis.setex(cache_key, 300, json.dumps(aggregated_tools))
+                logger.info(f"✅ MCP: Cached {len(aggregated_tools)} tools in Redis (5min TTL)")
+            except Exception as e:
+                logger.warning(f"Redis cache write failed: {e}")
+        else:
+            logger.warning(f"⚠️ MCP: No tools discovered for {agent_id}. Skipping cache.")
         
         return aggregated_tools
     

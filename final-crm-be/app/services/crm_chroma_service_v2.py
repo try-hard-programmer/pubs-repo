@@ -206,10 +206,10 @@ class CRMChromaServiceV2:
 
     async def query_context(self, query: str, agent_id: str, n_results: int = 5) -> str:
         """
-        Triple-Layer Hybrid RAG
-        Layer 1: BM25 
-        Layer 2: Vector Search (Semantic understanding)
-        Layer 3: Transformer Reranker (Neural precision)
+        Triple-Layer Hybrid RAG (Robust Mode)
+        Layer 1: BM25 (Keywords) - Works even if AI is down
+        Layer 2: Vector Search (Semantic) - Requires Embedding API
+        Layer 3: Transformer Reranker (Neural) - Requires CPU/GPU Model
         """
         try:
             clean_query = query.strip()
@@ -257,20 +257,32 @@ class CRMChromaServiceV2:
             
             logger.info("🧠 Vector retriever initialized")
             
-            # ENSEMBLE: Combine BM25 + Vector with Reciprocal Rank Fusion
-            ensemble_retriever = EnsembleRetriever(
-                retrievers=[bm25_retriever, vector_retriever],
-                weights=[0.3, 0.7]  # Tune these based on your use case
-            )
-                    
-            # Retrieve candidates
-            hybrid_results = ensemble_retriever.invoke(clean_query)
+            # [CRITICAL FIX] SAFE EXECUTION BLOCK
+            # We try Hybrid Search. If Embedding API is down, it crashes.
+            # We catch that crash and fallback to BM25 (Keywords) only.
+            hybrid_results = []
             
+            try:
+                # ENSEMBLE: Combine BM25 + Vector
+                ensemble_retriever = EnsembleRetriever(
+                    retrievers=[bm25_retriever, vector_retriever],
+                    weights=[0.3, 0.7]
+                )
+                hybrid_results = ensemble_retriever.invoke(clean_query)
+                logger.info(f"✅ Hybrid search returned {len(hybrid_results)} candidates")
+                
+            except Exception as vector_error:
+                # 🚨 EMBEDDING API IS DOWN
+                logger.error(f"⚠️ Vector Search Failed (Embedding API likely down): {vector_error}")
+                logger.warning("🔄 FALLBACK: Switching to BM25 (Keyword Only) Search mode.")
+                
+                # Fallback to just Keyword Search
+                hybrid_results = bm25_retriever.invoke(clean_query)
+                logger.info(f"✅ BM25 Fallback returned {len(hybrid_results)} candidates")
+
             if not hybrid_results or len(hybrid_results) == 0:
-                logger.warning("⚠️ No results from hybrid retrieval")
+                logger.warning("⚠️ No results found.")
                 return ""
-            
-            logger.info(f"✅ Hybrid search returned {len(hybrid_results)} candidates")
             
             # LAYER 3: Neural Reranker (Transformer Model)   
             model, tokenizer = self._get_reranker()
@@ -280,13 +292,12 @@ class CRMChromaServiceV2:
                     # Extract text content from LangChain Documents
                     candidates = [doc.page_content for doc in hybrid_results[:50]]
                     
-                    # Prepare query-document pairs for cross-encoder
+                    # Prepare query-document pairs
                     pairs = [[clean_query, doc] for doc in candidates]
                     
-                    logger.info(f"🎯 Reranking top {len(pairs)} candidates with transformer model...")
+                    logger.info(f"🎯 Reranking top {len(pairs)} candidates...")
                     
                     with torch.no_grad():
-                        # Tokenize all pairs at once (batch processing)
                         inputs = tokenizer(
                             pairs, 
                             padding=True, 
@@ -294,59 +305,29 @@ class CRMChromaServiceV2:
                             return_tensors='pt', 
                             max_length=512
                         )
-                        
-                        # Get relevance scores from cross-encoder
                         scores = model(**inputs).logits.squeeze(-1)
-                        
-                        # Move to CPU for processing
-                        if scores.is_cuda:
-                            scores = scores.cpu()
-                        
+                        if scores.is_cuda: scores = scores.cpu()
                         scores = scores.tolist()
                     
-                    # Sort by reranker score (higher = more relevant)
                     scored_results = list(zip(hybrid_results[:50], scores))
                     scored_results.sort(key=lambda x: x[1], reverse=True)
                     
-                    # Extract top N documents
                     final_results = [doc.page_content for doc, score in scored_results[:n_results]]
-                    
-                    top_score = scored_results[0][1]
-                    logger.info(f"🏆 Reranking complete. Top score: {top_score:.4f}")
-                    
-                    # Log score distribution for debugging
-                    if len(scored_results) >= 3:
-                        logger.debug(
-                            f"📈 Score distribution: "
-                            f"Top={scored_results[0][1]:.4f}, "
-                            f"2nd={scored_results[1][1]:.4f}, "
-                            f"3rd={scored_results[2][1]:.4f}"
-                        )
+                    logger.info(f"🏆 Reranking complete. Top score: {scored_results[0][1]:.4f}")
                     
                 except Exception as rerank_error:
-                    logger.error(f"⚠️ Reranking failed, falling back to hybrid scores: {rerank_error}")
+                    logger.error(f"⚠️ Reranking failed, using raw results: {rerank_error}")
                     final_results = [doc.page_content for doc in hybrid_results[:n_results]]
             
             else:
-                # Reranker not available or not enough results
-                if not model or not tokenizer:
-                    logger.warning("⚠️ Reranker model not loaded, using hybrid results")
-                
                 final_results = [doc.page_content for doc in hybrid_results[:n_results]]
             
-            if not final_results:
-                logger.warning("⚠️ No final results after processing")
-                return ""
-            
-            logger.info(f"✅ Returning {len(final_results)} final results")
-            
-            # Join results with separator
             return "\n\n###\n\n".join(final_results)
             
         except Exception as e:
             logger.error(f"❌ Query context failed: {e}", exc_info=True)
-            return ""    
-    
+            return ""
+        
     def delete_document(self, agent_id: str, file_id: str):
         """
         Smart Delete:

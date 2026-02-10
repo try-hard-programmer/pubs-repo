@@ -153,13 +153,12 @@ class DynamicAIServiceV2:
 
                 # 3. DYNAMIC SNAPSHOT
                 history_limit = int(advanced_config.get("historyLimit", 10))
-                fetch_buffer = history_limit * 2 
                 msgs_res = await asyncio.to_thread(
                     lambda: self.supabase.table("messages")
                     .select("content, sender_type, metadata")
                     .eq("chat_id", chat_id)
                     .order("created_at", desc=True)
-                    .limit(fetch_buffer) 
+                    .limit(history_limit) 
                     .execute()
                 )
                 raw_snapshot = msgs_res.data
@@ -221,11 +220,16 @@ class DynamicAIServiceV2:
                             prompt=vision_prompt,
                             organization_id=chat.get("organization_id", "")
                         )
-                        vision_context = f"\nSystem Analysis of User Image: {vision_desc}"
+                        vision_context = vision_desc.strip() if vision_desc else ""
                     except: pass
 
-                # 6. RAG + MCP RESOURCES (CONTEXT)
-                rag_query = f"{full_user_prompt_text} {vision_context}".strip()
+                # 6. RAG QUERY (Always reformulate for clean search)
+                rag_query = await self.speaker.reformulate_query(
+                    user_message=full_user_prompt_text,
+                    vision_context=vision_context,
+                    organization_id=chat.get("organization_id", "")
+                )
+
                 rag_context = ""
                 if rag_query and self.reader:
                     try:
@@ -234,7 +238,6 @@ class DynamicAIServiceV2:
 
                 # Combine Contexts
                 final_context = rag_context.strip() if rag_context else ""
-
 
                 # 7. FETCH MCP TOOLS (SKILLS)
                 mcp_tools = []

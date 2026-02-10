@@ -128,7 +128,10 @@ async def resolve_lid_to_real_number(
     # Only resolve for WhatsApp LIDs
     if channel != "whatsapp" or "@lid" not in str(contact):
         return contact
-    try:        
+    logger.info(f"🔄 [5. LID RESOLVER] Attempting to resolve LID: {contact}")
+    try:
+        logger.info(f"🔄 Resolving LID {contact} to real number...")
+        
         from app.services.whatsapp_service import get_whatsapp_service
         wa_svc = get_whatsapp_service()
         
@@ -137,6 +140,11 @@ async def resolve_lid_to_real_number(
         
         if lookup.get("success") and lookup.get("number"):
             resolved = lookup["number"]
+            logger.info(f"✅ LID Resolved: {contact} → {resolved}")
+            
+            # TODO: Cache resolved number in customer metadata
+            # This prevents needing to resolve the same LID multiple times
+            logger.info(f"🔄 [5. LID RESOLVER] Result: {lookup.get('number', 'FAILED')}")
             return resolved
         else:
             logger.warning(f"⚠️ Could not resolve LID {contact}: {lookup.get('message', 'Unknown error')}")

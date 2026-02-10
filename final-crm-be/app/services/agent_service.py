@@ -94,7 +94,7 @@ class AgentService:
         Raises:
             ValueError: If agent not found or not initialized
         """
-        agent = AgentRegistry.get(agent_name)
+        agent = AgentRegistry.get_or_create(agent_name)
 
         if agent is None:
             available = AgentRegistry.list_agents()
@@ -104,6 +104,7 @@ class AgentService:
             )
 
         if not agent.is_initialized():
+            await agent.initialize()
             raise ValueError(
                 f"Agent '{agent_name}' not initialized. "
                 "Call initialize_agents() first."
@@ -144,7 +145,7 @@ class AgentService:
         Raises:
             ValueError: If agent not found or not initialized
         """
-        agent = AgentRegistry.get(agent_name)
+        agent = AgentRegistry.get_or_create(agent_name)
 
         if agent is None:
             available = AgentRegistry.list_agents()
@@ -154,6 +155,7 @@ class AgentService:
             )
 
         if not agent.is_initialized():
+            await agent.initialize()
             raise ValueError(
                 f"Agent '{agent_name}' not initialized. "
                 "Call initialize_agents() first."

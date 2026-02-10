@@ -129,7 +129,11 @@ class AgentRegistry:
             Agent must be initialized before use.
             Call initialize_all() during startup.
         """
-        return cls._agents.get(name)
+        if name in cls._agents:
+            return cls._agents[name]
+        if name in cls._agent_classes:
+            return cls._initialize_agent(name) 
+        return None
 
     @classmethod
     def get_or_create(cls, name: str) -> BaseAgent:
