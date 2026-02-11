@@ -598,6 +598,8 @@ class Chat(BaseModel):
     resolved_by_agent_id: Optional[str] = Field(None, description="Agent who resolved")
     updated_at: dt = Field(..., description="Last update timestamp")
 
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Chat metadata (is_group, etc.)")
+
     class Config:
         from_attributes = True
 

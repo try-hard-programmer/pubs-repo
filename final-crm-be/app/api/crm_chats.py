@@ -654,22 +654,48 @@ async def get_chats(
 
             # Get customer name
             customer_name = None
+            chat_metadata = chat_data.get("metadata") or {} 
+
             if customer_id:
                 try:
                     customer_response = supabase.table("customers") \
-                        .select("name") \
+                        .select("name, metadata") \
                         .eq("id", customer_id) \
                         .eq("organization_id", organization_id) \
                         .execute()
 
                     if customer_response.data:
-                        customer_name = customer_response.data[0].get("name")
+                        cust = customer_response.data[0]
+                        customer_name = cust.get("name")
+                        
+                        # [ROBUST FIX] Handle Stringified JSON
+                        raw_meta = cust.get("metadata")
+                        cust_meta = {}
+
+                        if isinstance(raw_meta, str):
+                            import json
+                            try:
+                                cust_meta = json.loads(raw_meta)
+                            except:
+                                cust_meta = {}
+                        elif isinstance(raw_meta, dict):
+                            cust_meta = raw_meta
+
+                        # 1. Check strict 'is_group' flag
+                        if cust_meta.get("is_group"):
+                            chat_metadata["is_group"] = True
+                        
+                        # 2. Fallback: Check ID pattern
+                        elif "g.us" in str(cust_meta.get("whatsapp_id", "")):
+                            chat_metadata["is_group"] = True
+                            
                 except Exception as e:
-                    logger.warning(f"Failed to fetch customer name for customer_id {customer_id}: {e}")
+                    logger.warning(f"Failed to fetch customer data: {e}")
                     customer_name = None
 
             # Add customer_name to chat data
             chat_data["customer_name"] = customer_name
+            chat_data["metadata"] = chat_metadata
 
             # Get legacy agent name (for backward compatibility)
             agent_name = None
