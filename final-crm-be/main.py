@@ -22,12 +22,15 @@ from app.api import documents, agents, chat, organizations, file_manager, crm_ag
 
 # Import services
 from app.services import get_agent_service
+from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2 
+from app.services.document_queue_service import get_document_worker
+from app.services.websocket_service import start_redis_pubsub_listener, connection_manager # Initialize logger
 
-# Initialize logger
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,13 +70,28 @@ async def lifespan(app: FastAPI):
     # [NEW] Start LLM Queue Worker
     queue_service = get_llm_queue()
     asyncio.create_task(queue_service.start_worker())
-    
+
+    # Preload reranker model (avoid 18s delay on first query)
+    chroma_service = get_crm_chroma_service_v2()
+    chroma_service.preload_pdf_models()  # ← FIRST (sets HF_HOME env vars)
+    chroma_service._get_reranker()       # ← SECOND (uses env vars already set)
+
+    # Start Document Processing Worker (Redis-based, runs in daemon thread)
+    doc_worker = get_document_worker()
+    doc_worker.start_in_thread()
+
+    # TURN ON THE REDIS LISTENER
+    redis_listener_task = asyncio.create_task(start_redis_pubsub_listener(connection_manager))
+
     logger.info("Application startup complete")
     yield
 
-    # Shutdownbantu saya
+    # Shutdown 
     logger.info("Application shutdown")
     queue_service.is_running = False
+    doc_worker.stop()
+    # Safely cancel the listener when the server shuts down
+    redis_listener_task.cancel()
 
 
 # Create FastAPI application

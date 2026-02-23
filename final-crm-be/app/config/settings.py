@@ -21,6 +21,8 @@ class Settings:
 
     # Save Model RAG
     RERANKER_MODEL_PATH: Optional[str] = os.getenv("RERANKER_MODEL_PATH", "./models/reranker")
+    LAYOUT_MODEL_PATH: Optional[str] = os.getenv("LAYOUT_MODEL_PATH", "./models/layout")
+    TABLE_MODEL_PATH: Optional[str] = os.getenv("TABLE_MODEL_PATH", "./models/table")
 
     # Invitation org link
     INVITATION_URL: str = os.getenv("INVITATION_URL", "https://stgconsole.syntra.id")

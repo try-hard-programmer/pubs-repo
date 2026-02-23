@@ -5,11 +5,12 @@ Provides HTTP endpoints for CRM Agent Management.
 Includes CRUD operations for agents, settings, integrations, and knowledge documents.
 """
 
-from fastapi import APIRouter, File, HTTPException, Query, Depends, status, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Depends, status, UploadFile, Response
 from typing import List, Optional, Dict, Any, Tuple
 import logging
 import re
 from datetime import datetime, timezone
+import mimetypes
 
 from app.models.agent import (
 	Agent, AgentCreate, AgentUpdate, AgentStatusUpdate, AgentListResponse,
@@ -85,7 +86,7 @@ async def check_agent_conflicts(
     """
     # 1. Build Query
     query = supabase.table("agents") \
-        .select("id, status, email, phone, user_id, name") \
+        .select("*") \
         .eq("organization_id", organization_id)
     
     # Build OR condition
@@ -138,12 +139,13 @@ def get_auth_user_id_by_email(supabase, email: str) -> Optional[str]:
 @router.get(
     "/",
     response_model=AgentListResponse,
-    summary="Get all agents",
-    description="Retrieve agents. Hides 'Archived' agents (Inactive + No User ID). Shows 'Offline' agents (Inactive + Has User ID)."
+    summary="Get all agents with integrations",
+    description="Retrieve agents and their active integrations. Hides 'Archived' agents."
 )
 async def get_agents(
     status_filter: Optional[AgentStatus] = Query(None, description="Filter by status"),
     search: Optional[str] = Query(None, description="Search by name or email"),
+    has_channel: Optional[str] = Query(None, description="Filter: Only return agents with a specific connected channel (e.g. 'whatsapp')"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     current_user: User = Depends(get_current_user)
@@ -152,26 +154,43 @@ async def get_agents(
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # [FIX] Filter OUT 'archived' right here in the base query
+        # [FIX] JOIN the agent_integrations table so the frontend knows what is connected
         query = supabase.table("agents") \
-            .select("*", count="exact") \
+            .select("*, agent_integrations(id, channel, status, enabled)", count="exact") \
             .eq("organization_id", organization_id) \
             .neq("status", "archived")
 
-        # 1. Additional Status Filter (Optional)
         if status_filter:
             query = query.eq("status", status_filter.value)
 
-        # 2. Search
         if search:
             query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
 
-        # 3. Execute
         response = query.range(skip, skip + limit - 1).order("created_at", desc=True).execute()
 
+        final_agents = []
+        for agent_data in response.data:
+            # Extract the joined integrations
+            integrations = agent_data.pop("agent_integrations", [])
+            
+            # Attach it to the agent object
+            agent_data["integrations"] = integrations
+            
+            # [BONUS] Backend Filtering: If frontend asks for '?has_channel=whatsapp', 
+            # we strip out any agents that don't have it enabled.
+            if has_channel:
+                has_valid_integration = any(
+                    str(i.get("channel")).lower() == has_channel.lower() and i.get("enabled") is True
+                    for i in integrations
+                )
+                if not has_valid_integration:
+                    continue # Skip this agent, they don't have the required pipe
+                    
+            final_agents.append(Agent(**agent_data))
+
         return AgentListResponse(
-            agents=[Agent(**agent) for agent in response.data],
-            total=response.count or 0
+            agents=final_agents,
+            total=response.count if not has_channel else len(final_agents)
         )
 
     except Exception as e:
@@ -214,16 +233,16 @@ async def get_agent(
 			detail="Failed to fetch agent"
 		)
 
-
 @router.post(
     "/",
     response_model=Agent,
     status_code=status.HTTP_201_CREATED,
     summary="Create new agent",
-    description="Create agent. Auto-normalizes phone. Reactivates if email exists. Reclaims phone if held by inactive agent."
+    description="Create agent. Auto-normalizes phone. Reactivates if email exists. Reclaims phone if held by inactive/archived agent."
 )
 async def create_agent(
     agent: AgentCreate,
+    response: Response,  # <--- INJECT FASTAPI RESPONSE HERE
     current_user: User = Depends(get_current_user)
 ):
     try:
@@ -235,6 +254,7 @@ async def create_agent(
             agent.phone = normalize_phone(agent.phone)
 
         # --- 1. UNIQUENESS CHECK ---
+        # IMPORTANT: check_agent_conflicts MUST use .select("*") for Pydantic to work
         existing_email_agent, existing_phone_agent = await check_agent_conflicts(
             supabase, organization_id, agent.email, agent.phone
         )
@@ -243,14 +263,16 @@ async def create_agent(
         
         # SCENARIO A: Email Exists
         if existing_email_agent:
-            # If Active -> Return it (Idempotent success)
-            if existing_email_agent["status"] != "inactive":
-                logger.info(f"✅ Agent exists and active: {existing_email_agent['email']}. Returning existing.")
-                return Agent(**existing_email_agent)
+            # If Active or Busy -> Hard Failure (Strict Validation)
+            if existing_email_agent["status"] not in ["inactive", "archived"]:
+                logger.warning(f"❌ Creation rejected: Active agent with email {agent.email} already exists.")
+                raise HTTPException(
+                    status_code=409, 
+                    detail=f"An active agent with the email '{agent.email}' already exists."
+                )
             
-            # If Inactive -> Prepare to Reactivate
-            logger.info(f"♻️ Found inactive agent {existing_email_agent['email']}. Reactivating...")
-            # We will handle reactivation in the execution block below using this ID
+            # If Inactive OR Archived -> Prepare to Reactivate
+            logger.info(f"♻️ Found {existing_email_agent['status']} agent {existing_email_agent['email']}. Reactivating...")
         
         # SCENARIO B: Phone Exists (on a DIFFERENT agent)
         if existing_phone_agent and agent.phone:
@@ -258,27 +280,21 @@ async def create_agent(
             is_same_agent = existing_email_agent and existing_phone_agent["id"] == existing_email_agent["id"]
             
             if not is_same_agent:
-                if existing_phone_agent["status"] != "inactive":
+                if existing_phone_agent["status"] not in ["inactive", "archived"]:
                     # Hard Conflict: Phone used by another ACTIVE agent
-                    raise HTTPException(400, f"Phone {agent.phone} is already used by active agent {existing_phone_agent['name']}")
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"The phone number '{agent.phone}' is already assigned to the active agent '{existing_phone_agent['name']}'. Please use a different number or deactivate that agent first."
+                    )
                 else:
-                    # Soft Conflict: Phone used by INACTIVE agent -> Reclaim it
-                    logger.info(f"♻️ Reclaiming phone {agent.phone} from inactive agent {existing_phone_agent['id']}")
+                    # Soft Conflict: Phone used by INACTIVE/ARCHIVED agent -> Reclaim it
+                    logger.info(f"♻️ Reclaiming phone {agent.phone} from {existing_phone_agent['status']} agent {existing_phone_agent['id']}")
                     supabase.table("agents").update({"phone": None}).eq("id", existing_phone_agent["id"]).execute()
 
         # --- 3. PREPARE DATA ---
         
-        # Determine User ID Linking
+        # 💀 AUTO-LINKER KILLED. We strictly use what the frontend sends, or None.
         final_user_id = agent.user_id
-        if not final_user_id:
-            # 1. Check if admin is creating themselves
-            if current_user.user_metadata.get("email") == agent.email:
-                final_user_id = current_user.user_id
-            else:
-                # 2. Try to lookup in Auth system
-                final_user_id = get_auth_user_id_by_email(supabase, agent.email)
-                if final_user_id:
-                    logger.info(f"🔗 Auto-linked agent {agent.email} to Auth User {final_user_id}")
 
         # --- 4. EXECUTION ---
 
@@ -289,11 +305,13 @@ async def create_agent(
                 "name": agent.name,
                 "phone": agent.phone,
                 "avatar_url": agent.avatar_url,
-                "user_id": final_user_id or existing_email_agent["user_id"], # Keep old if no new provided
+                "user_id": final_user_id, # Explicitly overwrite with new (or None)
                 "last_active_at": datetime.now(timezone.utc).isoformat()
             }
-            response = supabase.table("agents").update(reactivate_data).eq("id", existing_email_agent["id"]).execute()
-            return Agent(**response.data[0])
+            db_response = supabase.table("agents").update(reactivate_data).eq("id", existing_email_agent["id"]).execute()
+            
+            response.status_code = status.HTTP_200_OK  # <--- OVERRIDE TO 200 OK because we just updated an old record
+            return Agent(**db_response.data[0])
 
         # SCENARIO: Create New
         logger.info(f"✨ Creating fresh agent: {agent.email}")
@@ -312,12 +330,16 @@ async def create_agent(
             "last_active_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        response = supabase.table("agents").insert(new_agent_data).execute()
+        db_response = supabase.table("agents").insert(new_agent_data).execute()
         
-        if not response.data:
-            raise HTTPException(500, "Failed to create agent")
+        if not db_response.data:
+            # Human readable UX error instead of blank 500
+            raise HTTPException(
+                status_code=500, 
+                detail="We couldn't save the agent to the database. Please check your connection and try again."
+            )
             
-        created_agent = Agent(**response.data[0])
+        created_agent = Agent(**db_response.data[0])
 
         # Initialize settings
         try:
@@ -328,17 +350,23 @@ async def create_agent(
                 "advanced_config": {},
                 "ticketing_config": {}
             }).execute()
-        except:
-            pass 
+        except Exception as settings_err:
+            logger.warning(f"Failed to initialize settings for agent {created_agent.id}: {settings_err}") 
 
+        # Defaults to 201 Created from the decorator
         return created_agent
 
     except HTTPException:
+        # Let our deliberately crafted 400s, 409s, and 500s pass through
         raise
     except Exception as e:
-        logger.error(f"Error creating agent: {e}")
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
-
+        # You read this in the logs, not the user.
+        logger.error(f"Critical error creating agent '{agent.email}': {e}", exc_info=True)
+        # The user reads this clean message.
+        raise HTTPException(
+            status_code=500, 
+            detail="An unexpected system error occurred while setting up this agent. Our team has been notified."
+        )   
 
 @router.put(
     "/{agent_id}",
@@ -688,60 +716,60 @@ async def get_agent_knowledge_documents(
 			detail="Failed to fetch knowledge documents"
 		)
 
+
 @router.post(
     "/{agent_id}/knowledge-documents",
     response_model=KnowledgeDocument,
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload knowledge document (V2)",
-    description="Upload knowledge using V2 Processor. metadata.agent_name saved to Chroma ONLY."
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Upload knowledge document (V2) - Async",
+    description="Accepts file, uploads to storage, and queues background processing to prevent UI freezing."
 )
 async def create_knowledge_document(
     agent_id: str,
+    response: Response,
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """[V2 IMPLEMENTATION] Upload, Process, Embed (with Agent Name), and Bill."""
     from uuid import uuid4
-    import asyncio
-    from app.services.storage_service import StorageService
     from app.services.document_processor_v2 import DocumentProcessorV2
-    from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
-    from app.utils.chunkingv2 import split_into_chunks
-
-    file_id = None
-    storage_uploaded = False
+    from app.services.document_queue_service import get_document_queue_service
 
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # [FIX 1] Select 'name' so we can inject it into Vector Metadata
+        # =========================================================
+        # STEP 1: FAST VALIDATION & SETUP
+        # =========================================================
+        filename = file.filename
+        file_content = await file.read() # Read into memory instantly before connection closes
+        doc_processor = DocumentProcessorV2()
+
+        try:
+            ext = doc_processor.validate_knowledge_file(filename, file_content)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        file_size_kb = len(file_content) // 1024
+        file_type = ext.upper()
+        file_id = str(uuid4())
+        agent_bucket_name = f"agent_{agent_id}"
+
+        # Verify agent ownership
         agent_check = supabase.table("agents").select("id, name").eq("id", agent_id).eq("organization_id", organization_id).execute()
         if not agent_check.data:
-            raise HTTPException(404, detail=f"Agent with ID {agent_id} not found")
-        
-        # Capture Name
+            raise HTTPException(404, detail="Agent not found")
         agent_name = agent_check.data[0]["name"]
 
-        # Read file
-        file_content = await file.read()
-        filename = file.filename
-        file_size_kb = len(file_content) // 1024
-        file_type = filename.rsplit(".", 1)[-1].upper() if "." in filename else "UNKNOWN"
-        file_id = str(uuid4())
-
-        logger.info(f"📤 [V2] Uploading knowledge document for agent {agent_name} ({agent_id}): {filename}")
-
-        # Step 1: Upload to Supabase (Raw File)
-        agent_bucket_name = f"agent_{agent_id}"
-        storage_service = StorageService(supabase)
-
+        # =========================================================
+        # STEP 2: SYNCHRONOUS STORAGE UPLOAD (Backup raw file)
+        # =========================================================
         try:
             buckets = supabase.storage.list_buckets()
             if not any(b.name == agent_bucket_name for b in buckets):
                 supabase.storage.create_bucket(agent_bucket_name, options={"public": False})
         except Exception:
-            pass 
+            pass
 
         try:
             supabase.storage.from_(agent_bucket_name).upload(
@@ -749,119 +777,65 @@ async def create_knowledge_document(
                 file=file_content,
                 file_options={"content-type": file.content_type, "upsert": "false"}
             )
-            storage_uploaded = True
-            logger.info(f"✅ File uploaded to storage: {file_id}")
         except Exception as e:
-            logger.error(f"❌ Storage upload failed: {e}", exc_info=True)
-            raise HTTPException(500, detail=f"File upload failed: {str(e)}")
+            logger.error(f"❌ Fast storage upload failed: {e}")
+            raise HTTPException(500, detail="Failed to save file to storage.")
 
-        # Step 2: Process document (Extract Text)
-        doc_processor = DocumentProcessorV2(storage_service)
-        try:
-            logger.info(f"📄 Processing document: {filename}")
-            
-            loop = asyncio.get_event_loop()
-            clean_text, _ = await loop.run_in_executor(
-                None,
-                doc_processor.process_document,
-                file_content,
-                filename,
-                agent_bucket_name,
-                organization_id,
-                file_id
-            )
-            
-            if not clean_text:
-                raise ValueError("No text extracted from document")
-                
-            logger.info(f"✅ Text extracted: {len(clean_text)} characters")
-            
-        except Exception as e:
-            logger.error(f"❌ Document processing failed: {e}", exc_info=True)
-            if storage_uploaded:
-                supabase.storage.from_(agent_bucket_name).remove([file_id])
-            raise HTTPException(500, detail=f"Document processing failed: {str(e)}")
-
-        # Step 3: Embed & Store (WITH BILLING & METADATA FIX)
-        chroma_service = get_crm_chroma_service_v2()
-
-        try:
-            logger.info(f"✂️ Chunking text...")
-            chunks = split_into_chunks(text=clean_text, size=1000, overlap=200)
-            logger.info(f"✅ Created {len(chunks)} chunks")
-            
-            # [FIX 2] Inject agent_name into Chroma Metadata ONLY
-            chunk_metas = [{
+        # =========================================================
+        # STEP 3: CREATE "PENDING" DB RECORD & RETURN TO FRONTEND
+        # =========================================================
+        doc_data = {
+            "agent_id": agent_id,
+            "name": filename,
+            "file_url": f"storage://{agent_bucket_name}/{file_id}",
+            "file_type": file_type,
+            "file_size_kb": file_size_kb,
+            "metadata": {
                 "file_id": file_id,
-                "filename": filename,
-                "chunk_index": i,
-                "doc_id": file_id,
-                "agent_id": agent_id,
-                "agent_name": agent_name,   # <--- HERE IT IS (Chroma only)
-                "organization_id": organization_id,
-                "processor": "v2"
-            } for i in range(len(chunks))]
-
-            logger.info(f"🧠 Embedding and storing chunks...")
-            success = await chroma_service.add_documents(
-                agent_id=agent_id,
-                texts=chunks,
-                metadatas=chunk_metas,
-                organization_id=organization_id
-            )
-
-            if not success:
-                raise Exception("ChromaDB service failed to save documents")
-                
-            logger.info(f"✅ Chunks embedded and stored successfully")
-
-        except Exception as e:
-            logger.error(f"❌ Embedding failed: {e}", exc_info=True)
-            if storage_uploaded:
-                supabase.storage.from_(agent_bucket_name).remove([file_id])
-            raise HTTPException(500, detail=f"Embedding failed: {str(e)}")
-
-        # Step 4: Save Metadata to Postgres (CLEAN - No Agent Name)
-        try:
-            logger.info(f"💾 Saving document metadata to database...")
-            doc_data = {
-                "agent_id": agent_id,
-                "name": filename,
-                "file_url": f"storage://{agent_bucket_name}/{file_id}",
-                "file_type": file_type,
-                "file_size_kb": file_size_kb,
-                "metadata": {
-                    "file_id": file_id,
-                    "bucket": agent_bucket_name,
-                    "processor_version": "v2",
-                    "chunks": len(chunks)
-                    # [NOTE] agent_name is purposely omitted here
-                }
+                "bucket": agent_bucket_name,
+                "processor_version": "v2",
+                "status": "pending",  # STATE MACHINE IS CRITICAL HERE
+                "chunks": 0
             }
-            response = supabase.table("knowledge_documents").insert(doc_data).execute()
-            
-            if not response.data:
-                raise Exception("Database insert returned no data")
-                
-            logger.info(f"✅ Document metadata saved successfully")
-            return KnowledgeDocument(**response.data[0])
-            
-        except Exception as e:
-            logger.error(f"❌ Database save failed: {e}", exc_info=True)
-            if storage_uploaded:
-                supabase.storage.from_(agent_bucket_name).remove([file_id])
-            raise HTTPException(500, detail=f"Database save failed: {str(e)}")
+        }
+        
+        db_response = supabase.table("knowledge_documents").insert(doc_data).execute()
+        if not db_response.data:
+            supabase.storage.from_(agent_bucket_name).remove([file_id])
+            raise HTTPException(500, detail="Database insert failed")
+
+        created_doc = KnowledgeDocument(**db_response.data[0])
+
+        # =========================================================
+        # STEP 4: PUSH TO REDIS QUEUE (instead of BackgroundTasks)
+        # =========================================================
+        queue = get_document_queue_service()
+        queued = queue.enqueue(
+            doc_id=created_doc.id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            organization_id=organization_id,
+            file_id=file_id,
+            filename=filename,
+            bucket_name=agent_bucket_name,
+        )
+
+        if not queued:
+            logger.error(f"⚠️ Redis queue failed for {filename}, file safe in storage.")
+            error_meta = {**doc_data["metadata"], "status": "queue_failed"}
+            supabase.table("knowledge_documents") \
+                .update({"metadata": error_meta}) \
+                .eq("id", created_doc.id).execute()
+
+        logger.info(f"🚀 Queued background processing for {filename}. Unblocking UI.")
+        response.status_code = status.HTTP_202_ACCEPTED
+        return created_doc
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
-        if storage_uploaded and file_id:
-            try:
-                supabase.storage.from_(f"agent_{agent_id}").remove([file_id])
-            except:
-                pass
-        raise HTTPException(500, detail=str(e))
+        logger.error(f"❌ Upload initialization failed: {e}", exc_info=True)
+        raise HTTPException(500, detail="An unexpected system error occurred.")
 
 
 @router.delete(
@@ -897,30 +871,27 @@ async def delete_knowledge_document(
         version = meta.get("processor_version", "v1")
 
         # =========================================================
-        # 🛑 CRITICAL STEP 1: DELETE FROM CHROMA (The Gatekeeper)
+        # ⚠️ STEP 1: ATTEMPT TO DELETE FROM CHROMA (No longer blocking)
         # =========================================================
         if file_id:
             try:
                 if version == "v2":
                     svc = get_crm_chroma_service_v2()
-                    # We pass agent_id (UUID) because that is the Collection Name
                     success = svc.delete_document(agent_id, file_id)
-                    
                     if not success:
-                        # IF CHROMA FAILS, WE STOP.
-                        raise Exception("ChromaDB delete operation returned False")
+                        logger.warning(f"⚠️ ChromaDB vectors not found or delete failed for {file_id}. Moving on.")
                 else:
                     # Legacy V1 Fallback
                     service = ChromaDBService()
-                    name = f"agent_{agent_id}" # V1 still uses old naming
+                    name = f"agent_{agent_id}"
                     try:
                         col = service.client.get_collection(name=name, embedding_function=service.embedding_function)
                         col.delete(where={"file_id": {"$eq": file_id}})
-                    except ValueError:
-                        pass # Collection already gone, safe to proceed
+                    except Exception:
+                        pass
             except Exception as e:
-                logger.error(f"❌ Aborting Delete: Failed to clear Vector DB: {e}")
-                raise HTTPException(500, detail=f"Integrity Error: Failed to delete vectors. Database not touched. ({str(e)})")
+                # WE DO NOT RAISE A 500 HERE ANYMORE. WE LOG AND PROCEED.
+                logger.warning(f"⚠️ Connection to Vector DB failed: {e}. Moving on to DB/Storage deletion.")
 
         # =========================================================
         # STEP 2: DELETE FROM STORAGE
@@ -945,6 +916,68 @@ async def delete_knowledge_document(
         logger.error(f"Delete failed: {e}")
         raise HTTPException(500, detail=str(e))
 
+@router.get(
+    "/{agent_id}/knowledge-documents/{doc_id}/download",
+    summary="Download knowledge document",
+    description="Downloads the physical file for a knowledge document."
+)
+async def download_knowledge_document(
+    agent_id: str,
+    doc_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # 1. Verify Agent Ownership & Get Document Metadata
+        agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not agent_check.data:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Agent not found")
+
+        doc = supabase.table("knowledge_documents").select("*").eq("id", doc_id).execute()
+        if not doc.data:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Document not found")
+        
+        doc_data = doc.data[0]
+        meta = doc_data.get("metadata", {})
+        
+        # The V2 upload process stores the storage file_id here
+        file_id = meta.get("file_id") 
+        filename = doc_data.get("name", "document.bin")
+        
+        if not file_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="File ID not found in document metadata")
+
+        # 2. Download from Storage
+        bucket_name = f"agent_{agent_id}"
+        try:
+            # Supabase Python SDK download() returns bytes directly into memory.
+            file_bytes = supabase.storage.from_(bucket_name).download(file_id)
+        except Exception as e:
+            logger.error(f"Failed to download file {file_id} from bucket {bucket_name}: {e}")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve file from storage")
+
+        # 3. Determine Content-Type
+        content_type, _ = mimetypes.guess_type(filename)
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        # 4. Return Response with attachment headers
+        return Response(
+            content=file_bytes,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download endpoint failed: {e}")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    
 # ============================================
 # AGENT INTEGRATIONS ENDPOINTS
 # ============================================

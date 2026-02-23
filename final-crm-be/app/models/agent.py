@@ -162,6 +162,7 @@ class Agent(BaseModel):
     last_active_at: dt = Field(..., description="Last activity timestamp")
     created_at: dt = Field(..., description="Creation timestamp")
     updated_at: dt = Field(..., description="Last update timestamp")
+    integrations: Optional[List[Any]] = None
 
     class Config:
         from_attributes = True

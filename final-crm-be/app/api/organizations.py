@@ -25,6 +25,12 @@ from app.services.role_service import get_role_service
 from datetime import datetime
 from app.config import settings
 
+
+import os
+import aiosmtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
@@ -516,95 +522,156 @@ async def invite_user(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Robust Invitation with Correct Redirect Link.
+    Robust Invitation: Sends Clean Link (No Supabase Wrapper), SMTP Sending.
     """
     request_id = secrets.token_hex(4)
     logger.info(f"[{request_id}] 🚀 Starting invitation process for {invite_data.email}")
 
     try:
-        # 1. Security Check (Identity)
-        if invite_data.invited_by != current_user.user_id:
-             raise HTTPException(status_code=403, detail="You can only send invitations on your own behalf")
+        # 1. Security & Context Resolution
+        inviter_id = current_user.user_id
+        target_org_id = invite_data.organization_id
+        
+        # Auto-detect Org ID
+        if not target_org_id:
+            logger.info(f"[{request_id}] 🔍 No organization_id provided. Inferring from current user...")
+            user_org = await get_organization_service().get_user_organization(current_user.user_id)
+            if user_org:
+                target_org_id = user_org.id
+            else:
+                raise HTTPException(status_code=400, detail="You must belong to an organization to send invitations.")
 
         client = get_organization_service().client
 
-        # 2. Security Check (Organization Permission)
-        if invite_data.organization_id:
-            perm_check = client.table("organization_members")\
-                .select("role")\
-                .eq("user_id", current_user.user_id)\
-                .eq("organization_id", invite_data.organization_id)\
-                .execute()
-            
-            if not perm_check.data:
-                 raise HTTPException(status_code=403, detail="You are not a member of this organization.")
+        # 2. Permission Check
+        perm_check = client.table("organization_members")\
+            .select("user_id")\
+            .eq("user_id", inviter_id)\
+            .eq("organization_id", target_org_id)\
+            .execute()
+        
+        if not perm_check.data:
+             raise HTTPException(status_code=403, detail="You are not a member of this organization.")
 
         # 3. Pre-check Profile
         try:
             profile_check = client.table("profiles").select("id").eq("email", invite_data.email).execute()
-            if profile_check.data and len(profile_check.data) > 0:
+            if profile_check.data:
                 raise HTTPException(status_code=409, detail=f"User {invite_data.email} is already registered.")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+        except HTTPException: raise
+        except: pass
 
-        # 4. Prepare Data
+        # 4. Prepare Database Record
         token = secrets.token_urlsafe(32)
         db_data = {
             "invited_email": invite_data.email,
-            "invited_by": invite_data.invited_by,
+            "invited_by": inviter_id,
+            # "organization_id": target_org_id,  <-- REMOVED to prevent DB crash
             "invitation_token": token,
             "status": "pending"
         }
         
-        # 5. DB Operation
         logger.info(f"[{request_id}] 💾 Inserting record into 'user_invitations'...")
         response = client.table("user_invitations").insert(db_data).execute()
+        
         if not response.data:
             raise RuntimeError("Failed to create invitation record")
+        
         invitation_id = response.data[0]["id"]
         
-        # 6. Auth Operation: Trigger Supabase Email
-        logger.info(f"[{request_id}] 📧 Calling Supabase Admin Invite...")
+        # 5. Generate Link & Send Email
+        logger.info(f"[{request_id}] 🔗 Generating Invitation Link...")
         
         try:
-            # [FIXED] Removed the trailing comma. This is now a String, not a Tuple.
-            base_url = settings.INVITATION_URL
+            base_url = settings.INVITATION_URL.rstrip('/')
             
-            # Redirect to 'accept-invitation' with the DB token
+            # [FIXED] This is the Clean URL we will send in the email
             redirect_url = f"{base_url}/accept-invitation?token={token}"
             
-            client.auth.admin.invite_user_by_email(
-                invite_data.email,
-                options={
+            # Call Supabase to register the user (creates auth entry), but ignore the link it returns
+            client.auth.admin.generate_link({
+                "type": "invite",
+                "email": invite_data.email,
+                "options": {
+                    "redirect_to": redirect_url,
                     "data": { 
-                        "custom_invitation_id": invitation_id, 
-                        "organization_id": invite_data.organization_id
-                    },
-                    "redirect_to": redirect_url 
+                        "custom_invitation_id": invitation_id,
+                        "organization_id": target_org_id, 
+                        "inviter_name": current_user.display_name or current_user.email
+                    }
                 }
-            )
-            logger.info(f"[{request_id}] ✅ Supabase Invite Sent. Redirect Target: {redirect_url}")
+            })
             
+            # We don't use the Supabase link. We use our clean 'redirect_url'
+            final_link = redirect_url
+
+            logger.info(f"[{request_id}] 📧 Sending Email via SMTP...")
+            
+            # --- SMTP EMAIL SENDING ---
+            smtp_host = os.getenv("SMTP_HOST")
+            smtp_port = os.getenv("SMTP_PORT")
+            smtp_user = os.getenv("SMTP_USER")
+            smtp_pass = os.getenv("SMTP_PASS")
+            from_email = os.getenv("SMTP_FROM_EMAIL")
+            from_name = os.getenv("SMTP_FROM_NAME", "Syntra")
+
+            if not all([smtp_host, smtp_port, smtp_user, smtp_pass, from_email]):
+                 logger.error("SMTP Configuration missing")
+            else:
+                inviter_name = current_user.display_name or current_user.email
+                subject = "You have been invited to join Syntra"
+                
+                html_body = f"""
+                <!DOCTYPE html>
+                <html>
+                <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+                    <div style="max-width: 600px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 8px;">
+                        <h2 style="color: #333; text-align: center;">Invitation to Collaborate</h2>
+                        <p style="color: #666; font-size: 16px; text-align: center;">
+                            <strong>{inviter_name}</strong> has invited you to join them on Syntra.
+                        </p>
+                        <div style="text-align: center; margin: 30px 0;">
+                            <a href="{final_link}" style="background-color: #007bff; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: bold;">Accept Invitation</a>
+                        </div>
+                        <p style="color: #999; font-size: 12px; text-align: center;">
+                            If the button doesn't work, copy this link:<br>
+                            <a href="{final_link}" style="color: #007bff; word-break: break-all;">{final_link}</a>
+                        </p>
+                    </div>
+                </body>
+                </html>
+                """
+                
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject
+                msg["From"] = f"{from_name} <{from_email}>"
+                msg["To"] = invite_data.email
+                msg.attach(MIMEText(html_body, "html"))
+                
+                smtp = aiosmtplib.SMTP(hostname=smtp_host, port=int(smtp_port), use_tls=False)
+                await smtp.connect()
+                # await smtp.starttls() 
+                await smtp.login(smtp_user, smtp_pass)
+                await smtp.send_message(msg)
+                await smtp.quit()
+                logger.info(f"[{request_id}] ✅ Email sent successfully")
+
         except Exception as auth_error:
-            # Error Handling / Rollback Logic
-            error_msg = str(auth_error)
-            logger.warning(f"[{request_id}] ⚠️ Auth Error: {error_msg}")
-            
-            if "already" in error_msg:
-                 try:
+            logger.error(f"[{request_id}] ⚠️ Email/Link Error: {auth_error}")
+            # Even if email fails, we return the link to the user
+            if 'final_link' not in locals():
+                try:
                     client.table("user_invitations").delete().eq("id", invitation_id).execute()
-                 except: 
-                    pass
-                 raise HTTPException(status_code=409, detail="User is already registered.")
-            
-            raise HTTPException(status_code=500, detail=f"Failed to send email: {error_msg}")
+                except: pass
+                raise HTTPException(status_code=500, detail=f"Failed to process invitation: {str(auth_error)}")
 
         return InvitationResponse(
             success=True,
             message="Invitation processed.",
-            data=InvitationData(invitation_id=invitation_id)
+            data=InvitationData(
+                invitation_id=invitation_id,
+                invitation_link=final_link # Returns the Clean Link
+            )
         )
 
     except HTTPException:
@@ -612,7 +679,7 @@ async def invite_user(
     except Exception as e:
         logger.error(f"[{request_id}] 💥 Critical Failure: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
+            
 # ============ Organization Member Endpoints ============
 
 @router.get("/{org_id}/members", response_model=OrganizationMemberListResponse)

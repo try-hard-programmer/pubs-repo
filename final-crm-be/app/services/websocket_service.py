@@ -4,11 +4,52 @@ Manages WebSocket connections for real-time notifications to frontend clients
 """
 from fastapi import WebSocket, WebSocketDisconnect
 from typing import Dict, List, Set, Any
+from datetime import datetime
+from app.config import settings
+
 import logging
 import json
-from datetime import datetime
+import asyncio
+import json
+import logging
+import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
+
+
+async def start_redis_pubsub_listener(websocket_manager_instance):
+    """
+    Listens to Redis Pub/Sub channels from the background worker 
+    and forwards messages to active WebSockets.
+    """
+    redis_client = aioredis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}",
+        password=settings.REDIS_PASSWORD or None,
+        decode_responses=True
+    )
+    pubsub = redis_client.pubsub()
+    
+    # Subscribe to all organization channels
+    await pubsub.psubscribe("ws_org_*")
+    logger.info("🎧 WebSocket service is now listening for Redis notifications...")
+
+    try:
+        async for message in pubsub.listen():
+            if message["type"] == "pmessage":
+                channel = message["channel"]
+                data = json.loads(message["data"])
+                
+                # Extract org ID from channel name (e.g., ws_org_12345 -> 12345)
+                org_id = channel.replace("ws_org_", "")
+                
+                # Broadcast using your existing WebSocket manager logic
+                logger.info(f"🚀 Forwarding worker notification to Org {org_id}")
+                await websocket_manager_instance.broadcast_to_org(org_id, data)
+                
+    except asyncio.CancelledError:
+        logger.info("🛑 Redis PubSub listener shutting down...")
+    except Exception as e:
+        logger.error(f"❌ Redis Listener crashed: {e}", exc_info=True)
 
 
 class ConnectionManager:

@@ -128,22 +128,18 @@ async def resolve_lid_to_real_number(
     # Only resolve for WhatsApp LIDs
     if channel != "whatsapp" or "@lid" not in str(contact):
         return contact
-    logger.info(f"🔄 [5. LID RESOLVER] Attempting to resolve LID: {contact}")
-    try:
-        logger.info(f"🔄 Resolving LID {contact} to real number...")
-        
+    
+    try:        
         from app.services.whatsapp_service import get_whatsapp_service
         wa_svc = get_whatsapp_service()
         
         # Attempt to resolve LID
         lookup = await wa_svc.get_contact_by_id(agent_id, contact)
         
+        # TODO: Cache resolved number in customer metadata
+        # This prevents needing to resolve the same LID multiple times
         if lookup.get("success") and lookup.get("number"):
             resolved = lookup["number"]
-            logger.info(f"✅ LID Resolved: {contact} → {resolved}")
-            
-            # TODO: Cache resolved number in customer metadata
-            # This prevents needing to resolve the same LID multiple times
             logger.info(f"🔄 [5. LID RESOLVER] Result: {lookup.get('number', 'FAILED')}")
             return resolved
         else:
@@ -234,7 +230,6 @@ async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[s
         if body and isinstance(body, str) and (body.startswith("/9j/") or (len(body) > 500 and " " not in body[:50])):
             try:
                 # Treat as Image upload
-                logger.info("🕵️ Detected Base64 image sent as text. Converting...")
                 media_url = await _upload_media_to_supabase(body, "image/jpeg", "jpg")
                 content = "" # Clear text content
                 msg_type = "image"
@@ -432,8 +427,6 @@ async def _upload_media_to_supabase(
         bucket_name = "tmp" 
         supabase = get_supabase_client()
         
-        logger.info(f"   📤 [UPLOAD] Uploading to {bucket_name}/{filename} (Size: {len(media_data)})")
-
         # --- ATTEMPT 1: Optimistic Upload ---
         try:
             supabase.storage.from_(bucket_name).upload(
@@ -470,7 +463,6 @@ async def _upload_media_to_supabase(
         if not public_url:
             raise Exception("Generated URL is empty")
 
-        logger.info(f"   🔗 [UPLOAD] URL: {public_url[:50]}...")
         return public_url
 
     except Exception as e:
@@ -628,9 +620,9 @@ async def process_webhook_message_v2(
             if channel == "whatsapp" and message_metadata.get("message_type") in ["image", "video", "document"]:
                 initial_url = message_metadata.get("media_url")
                 
-                # Try 3 times (1s interval)
+                # Try 3 times 
                 for i in range(3):
-                    await asyncio.sleep(1) # Wait for DB consistency
+                    await asyncio.sleep(0.6) # Wait for DB consistency
                     try:
                         msg_res = supabase.table("messages").select("metadata").eq("id", msg_id).single().execute()
                         if msg_res.data and msg_res.data.get("metadata"):
@@ -780,6 +772,41 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
         dedup_key = f"{whatsapp_id}_{message.dataType}"
         if await is_duplicate_message(dedup_key):
             return JSONResponse(content={"status": "ignored", "reason": "duplicate_redis_cache"})
+        
+
+        # =========================================================================
+        # 2.5 THE TRUE LOOP SHIELD (Block outgoing echoes using Integration Data)
+        # =========================================================================
+        raw_sender = data_content.get("from", "")
+        clean_raw_sender = re.sub(r'[^\d]', '', str(raw_sender).split('@')[0])
+        
+        integ_check = supabase.table("agent_integrations")\
+            .select("config")\
+            .eq("channel", "whatsapp")\
+            .eq("enabled", True)\
+            .execute()
+            
+        system_numbers = []
+        for integ in integ_check.data:
+            config_data = integ.get("config")
+            
+            # The Safe JSON Parser: Handles BOTH stringified DB rows AND auto-parsed dicts
+            if isinstance(config_data, str):
+                try:
+                    import json
+                    config_data = json.loads(config_data)
+                except Exception:
+                    config_data = {}
+                    
+            if isinstance(config_data, dict) and "phoneNumber" in config_data:
+                sys_num = re.sub(r'[^\d]', '', str(config_data["phoneNumber"]))
+                system_numbers.append(sys_num)
+                if sys_num.startswith("62"):
+                    system_numbers.append("0" + sys_num[2:])
+                
+        if clean_raw_sender in system_numbers:
+            logger.info(f"🛡️ LOOP SHIELD ACTIVATED: Ignored echo from system number {clean_raw_sender}")
+            return JSONResponse(content={"status": "ignored", "reason": "system_echo_blocked"})
 
         # 3. Agent Verify
         agent_res = supabase.table("agents").select("*").eq("id", agent_id).execute()
@@ -814,14 +841,37 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
         pushname = raw_me.get("pushname")
 
         if is_group_raw:
+            logger.warning(f"🚨 DEBUG STATE -> Agent DB Phone: {agent.get('phone')} | Payload 'me': {raw_me}")
+            logger.warning(f"🚨 DEBUG POTENTIAL IDs: {potential_ids}")
             is_mentioned_raw = False
             
             # --- A. Explicit Mentions (Metadata) ---
             raw_mentions = data_content.get("mentionedJidList", [])
+            # 1. Direct ID Match
             for m in raw_mentions:
                 if any(pid in str(m) for pid in potential_ids):
                     is_mentioned_raw = True
                     break
+            
+            # 2. The Amnesia Patch (Resolve LIDs to find ourselves)
+            if not is_mentioned_raw:
+                for m in raw_mentions:
+                    if "@lid" in str(m):
+                        try:
+                            # Resolve the mentioned LID to a real phone number
+                            resolved_m = await resolve_lid_to_real_number(m, agent_id, "whatsapp", supabase)
+                            clean_resolved = _extract_phone_number(resolved_m)
+                            
+                            # Check if the resolved real number is our bot
+                            if any(pid in str(clean_resolved) for pid in potential_ids):
+                                is_mentioned_raw = True
+                                logger.info(f"✅ Pre-Flight: Amnesia Patch matched! Mention {m} -> Me ({clean_resolved})")
+                                
+                                # Add it to potential IDs so we don't have to resolve it again for this message
+                                potential_ids.add(_extract_phone_number(m))
+                                break
+                        except Exception as e:
+                            logger.error(f"⚠️ Failed to resolve mention LID {m}: {e}")
             
             # --- B. Reply Context Check ---
             quoted_participant = data_content.get("quotedParticipant") or \

@@ -15,8 +15,6 @@ class DynamicCRMAgentV2:
         self.proxy_url = f"{base}/chat"
         self.mcp_service = get_mcp_service()  
 
-        logger.info(f"🔊 Speaker V2 initialized → {self.proxy_url}")
-
     def _sanitize_text_results(self, text: str) -> str:
         """
         Forcefully cleans AI output to match WhatsApp formatting.
@@ -42,7 +40,18 @@ class DynamicCRMAgentV2:
     async def reformulate_query(self, user_message: str, vision_context: str, organization_id: str) -> str:
         """Fast LLM call to extract a clean search query from messy user input"""
         combined = user_message.strip()
+                
+        # [TRACE] Flag if this looks like a no-content image
         if vision_context:
+            lower_ctx = vision_context.lower()
+            is_no_content = any(p in lower_ctx for p in [
+                "visual content only", "no text detected", "no readable text",
+                "[no_text_detected]", "no spoken words", "instrumental",
+                "error processing image", "error processing audio"
+            ])
+            if is_no_content:
+                logger.warning(f"📊 [TRACE:QUERY] ⚠️ IRRELEVANT IMAGE DETECTED — vision has no useful content, but RAG will still run (no gate yet)")
+            
             combined = f"{combined}\n[Image Analysis: {vision_context}]"
         
         # Skip if already clean enough
@@ -72,12 +81,13 @@ class DynamicCRMAgentV2:
                         res = await resp.json()
                         query = res.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                         if query and len(query) > 2:
-                            logger.info(f"🔄 Query reformulated: '{user_message[:30]}...' → '{query}'")
+                            logger.info(f"📊 [TRACE:QUERY] Reformulated: '{user_message[:10]}...' → '{query}'")
                             return query
         except Exception as e:
             logger.warning(f"⚠️ Reformulation failed, using raw: {e}")
         
         # Fallback: concat raw
+        logger.info(f"📊 [TRACE:QUERY] Using raw (no reformulation): '{combined[:10]}...'")
         return combined
 
     def _parse_json(self, data: Any) -> Dict:
@@ -105,26 +115,29 @@ class DynamicCRMAgentV2:
             language = persona.get("language", "english")
             custom_instructions = persona.get("customInstructions", "").strip()
             handoff = advanced.get("handoffTriggers", {})
-            lang_instruction = f"Reply ONLY in {language}."
+            lang_instruction = f"Reply ONLY in {language}."            
 
-            prompt = f"""You are {name}. Tone: {tone}. User: {name_user}. LANGUAGE RULE: {lang_instruction}"""
-            
+            use_custom = len(custom_instructions) > 10
 
-            if len(custom_instructions) > 10:
-                prompt += f"""
-            {custom_instructions}
-            """
-            else:
-                prompt += f"""
-                ## CORE INSTRUCTION
-                Please answer the user's questions based on the provided **KNOWLEDGE BASE**. 
-                
-                **Guidelines:**
-                1. Use the information in the Knowledge Base to provide accurate answers.
-                2. If the answer is not found in the Knowledge Base, politely inform the user that you don't have that information.
-                3. Keep the tone natural, helpful, and friendly.
-                """
-                
+            # ── SWITCH: custom instructions vs default persona ──────────────────────
+            match use_custom:
+                case True:
+                    prompt = f"""
+        {custom_instructions}
+        """
+                case False:
+                    prompt = f"""
+                    You are {name}. Tone: {tone}. User: {name_user}. LANGUAGE RULE: {lang_instruction}
+                    ## CORE INSTRUCTION
+                    Please answer the user's questions based on the provided **KNOWLEDGE BASE**. 
+                    
+                    **Guidelines:**
+                    1. Use the information in the Knowledge Base to provide accurate answers.
+                    2. If the answer is not found in the Knowledge Base, politely inform the user that you don't have that information.
+                    3. Keep the tone natural, helpful, and friendly.
+                    """
+            # ────────────────────────────────────────────────────────────────────────
+
             if handoff.get("enabled"):
                 keywords = handoff.get("keywords", [])
                 triggers = "is angry OR wants human"
@@ -145,24 +158,34 @@ class DynamicCRMAgentV2:
             You have access to these tools to help users:
             {chr(10).join(tool_descriptions)}
             """
-    
-            if rag_context and rag_context.strip():
-                prompt += f"""## KNOWLEDGE BASE
-            IMPORTANT: Use this info to answer questions.
-            ---
-            {rag_context}
-            ---
-            """
-            elif external_tools and len(external_tools) > 0:
-                prompt += """## KNOWLEDGE BASE
-            No static knowledge base. Use the AVAILABLE TOOLS above to help users with reservations and bookings.
-            """
+
+            if not use_custom:
+                if rag_context and rag_context.strip():
+                    prompt += f"""## KNOWLEDGE BASE
+                IMPORTANT: Use this info to answer questions.
+                ---
+                {rag_context}
+                ---
+                """
+                elif external_tools and len(external_tools) > 0:
+                    prompt += """## KNOWLEDGE BASE
+                No static knowledge base. Use the AVAILABLE TOOLS above to help users with reservations and bookings.
+                """
+                else:
+                    logger.info(f"📊 [TRACE:PROMPT] No RAG context — agent will use greeting-only mode")
+                    prompt += """## KNOWLEDGE BASE
+                No knowledge base provided. Answer general greetings only.
+                """
             else:
-                prompt += """## KNOWLEDGE BASE
-            No knowledge base provided. Answer general greetings only.
-            """
+                if rag_context and rag_context.strip():
+                    prompt += f"""## KNOWLEDGE BASE
+                ---
+                {rag_context}
+                ---
+                """
 
             if has_current_image:
+                logger.info(f"📊 [TRACE:PROMPT] Image flag is ON — LLM told to extract codes from image")
                 prompt += """## VISION UPDATE
             User sent an image. Extract codes/text and search the Knowledge Base for matches.
             """
@@ -206,7 +229,6 @@ class DynamicCRMAgentV2:
                     "image_url": {"url": url}
                 })
             messages.append({"role": "user", "content": content_payload})
-            logger.info(f"📸 Attached {len(image_urls)} images inline.")
         else:
             messages.append({"role": "user", "content": customer_message})
         
@@ -224,7 +246,6 @@ class DynamicCRMAgentV2:
                     "type": "image",
                     "url": url
                 })
-            logger.info(f"📸 Attached {len(image_urls)} images.")
         
         return files
 
@@ -362,9 +383,7 @@ class DynamicCRMAgentV2:
                                 func_name = tool["function"]["name"]
                                 func_args = json.loads(tool["function"]["arguments"])
                                 call_id = tool["id"]
-                                
-                                logger.info(f"🛠️ Agent calling: {func_name}")
-                                
+                                                                
                                 # Execute via MCP Service
                                 tool_result = await self.mcp_service.execute_mcp_tool(
                                     supabase=supabase,

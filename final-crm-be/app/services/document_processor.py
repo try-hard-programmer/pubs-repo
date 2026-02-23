@@ -26,6 +26,11 @@ from unstructured.documents.elements import Text, Element
 from app.config import settings
 from app.utils.text_processing import elements_to_clean_text
 
+import re
+import numpy as np
+import pytesseract
+from pdf2image import convert_from_bytes
+
 # Avoid circular import - only import for type checking
 if TYPE_CHECKING:
     from app.services.storage_service import StorageService
@@ -53,35 +58,73 @@ class DocumentProcessor:
         organization_id: str,
         file_id: str
     ) -> Tuple[str, List[dict]]:
-        """
-        Process document content using local Unstructured library
 
-        Args:
-            content: File content as bytes
-            filename: Original filename
-            folder_path: Folder path for storage
-            organization_id: Organization ID
-            file_id: File ID
-
-        Returns:
-            Tuple of (clean_text, elements_json)
-        """
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-        # Handle audio files separately (uses transcription API)
+        # 1️⃣ Audio
         if ext in ("mp3", "wav", "m4a", "ogg", "flac"):
             return self._process_audio(content, filename, folder_path, organization_id, file_id)
 
-        # Handle image files separately (uses OCR API)
+        # 2️⃣ Image
         if ext in ("jpg", "jpeg", "png", "webp", "tiff", "bmp", "gif"):
             return self._process_image(content, filename, folder_path, organization_id, file_id)
 
-        # Process document locally
+        # 3️⃣ Document
         elements = self._partition_by_type(content, filename, ext)
 
-        # Convert to clean text and JSON
         clean_text = elements_to_clean_text(elements)
         elements_json = self._elements_to_json(elements)
+
+        # Bersihkan karakter non-ascii
+        clean_text = re.sub(r'[^\x00-\x7F]+', ' ', clean_text)
+
+        print("TEXT FROM PARTITION:", len(clean_text))
+
+        # 4️⃣ Fallback OCR jika text kosong / terlalu pendek
+        if not clean_text or len(clean_text.strip()) < 20:
+            print("⚠️ Partition gagal, jalankan OCR fallback...")
+            try:
+                pages = convert_from_bytes(content, dpi=300)
+
+                ocr_text = ""
+                custom_config = r'--oem 3 --psm 6'
+
+                for page in pages:
+                    img = np.array(page)
+                    height, width = img.shape[:2]
+
+                    # Split kiri dan kanan (untuk multi-column)
+                    left_part = img[:, :width//2]
+                    right_part = img[:, width//2:]
+
+                    left_text = pytesseract.image_to_string(
+                        left_part,
+                        lang='ind+eng',
+                        config=custom_config
+                    )
+
+                    right_text = pytesseract.image_to_string(
+                        right_part,
+                        lang='ind+eng',
+                        config=custom_config
+                    )
+
+                    ocr_text += left_text + "\n" + right_text
+
+                ocr_text = re.sub(r'[^\x00-\x7F]+', ' ', ocr_text)
+
+                print("TEXT FROM OCR:", len(ocr_text))
+
+                if ocr_text and len(ocr_text.strip()) > 20:
+                    clean_text = ocr_text
+                    elements_json = [] 
+
+            except Exception as e:
+                print("OCR fallback error:", str(e))
+                return clean_text, elements_json
+        
+        if clean_text:
+            clean_text = f"[FILE NAME]: {filename}\n\n{clean_text}"
 
         return clean_text, elements_json
 

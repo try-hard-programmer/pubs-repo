@@ -281,7 +281,6 @@ class MCPService:
         if aggregated_tools:
             try:
                 await redis.setex(cache_key, 300, json.dumps(aggregated_tools))
-                logger.info(f"✅ MCP: Cached {len(aggregated_tools)} tools in Redis (5min TTL)")
             except Exception as e:
                 logger.warning(f"Redis cache write failed: {e}")
         else:

@@ -18,7 +18,11 @@ from app.services.document_processor import DocumentProcessor
 from app.utils import split_into_chunks, to_clean_text_from_strs
 from app.config import settings
 from pdfminer.high_level import extract_text
+from pdf2image import convert_from_bytes
 import pdfplumber
+import pytesseract
+import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -588,8 +592,6 @@ class FileManagerService:
 
             # 2. Calculate parent_path
             parent_path = self._get_parent_path(parent_folder_id) if parent_folder_id else "/"
-
-
 
             # 3. Upload to storage first
             try:
@@ -1264,6 +1266,35 @@ class FileManagerService:
                     
                     # Check apakah ada text
                     if text and len(text.strip()) > 10:
+                        return extension.lower() in embeddable_extensions
+                    else :
+                        pages = convert_from_bytes(file_content, dpi=300)
+
+                        text = ""
+                        custom_config = r'--oem 3 --psm 6'
+
+                        for page in pages:
+                            img = np.array(page)
+
+                            height, width = img.shape[:2]
+
+                            # Split kiri dan kanan
+                            left_part = img[:, :width//2]
+                            right_part = img[:, width//2:]
+
+                            left_text = pytesseract.image_to_string(
+                                left_part,
+                                lang='ind+eng',
+                                config=custom_config
+                            )
+
+                            right_text = pytesseract.image_to_string(
+                                right_part,
+                                lang='ind+eng',
+                                config=custom_config
+                            )
+
+                            text += left_text + "\n" + right_text
                         return extension.lower() in embeddable_extensions
             return False
         except Exception as e:

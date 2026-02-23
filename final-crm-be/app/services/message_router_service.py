@@ -36,27 +36,38 @@ class MessageRouterService:
     ) -> Dict[str, Any]:
         """
         Find existing customer or create new one.
-        [FIX] STRICT SEPARATION: Telegram uses Metadata Lookup, WhatsApp uses Phone Lookup.
+        [FIX] STRICT SEPARATION & NORMALIZATION
         """
         try:
             if not contact or str(contact).strip() == "" or str(contact).lower() == "none":
                 raise ValueError(f"Cannot create customer with empty contact for {channel}")
 
+            clean_contact = contact
+
+            # 1. WHATSAPP
             if channel == "whatsapp":
-                # A. Primary Check: Direct Phone Match
+                import re
+                # 🛡️ THE FIX: Strip EVERYTHING except numbers (kills spaces, dashes, @lid, @c.us)
+                clean_contact = re.sub(r'[^\d]', '', str(contact))
+
+                # A. Primary Check: Robust OR Query (Handles 62... vs 0... automatically)
+                no_prefix = clean_contact[2:] if clean_contact.startswith('62') else clean_contact
+                or_query = f"phone.eq.{clean_contact},phone.eq.0{no_prefix},phone.eq.62{no_prefix}"
+                
                 query = self.supabase.table("customers").select("*") \
                     .eq("organization_id", organization_id) \
-                    .eq("phone", contact)
+                    .or_(or_query)
                 
                 response = query.execute()
                 if response.data:
                     return self._update_customer_name_if_needed(response.data[0], customer_name)
 
-                # B. [NEW] Secondary Check: LID Lookup in Metadata
-                if str(contact).isdigit() and len(str(contact)) >= 14:
+                # B. Secondary Check: LID Lookup in Metadata
+                # Now that clean_contact is purely digits, the length check actually works
+                if len(clean_contact) >= 14:
                     lid_query = self.supabase.table("customers").select("*") \
                         .eq("organization_id", organization_id) \
-                        .eq("metadata->>whatsapp_lid", contact) \
+                        .eq("metadata->>whatsapp_lid", clean_contact) \
                         .execute()
                     
                     if lid_query.data:
@@ -65,37 +76,38 @@ class MessageRouterService:
 
             # 2. TELEGRAM 
             elif channel == "telegram":
-                # STRICT: Check telegram_id AND is_group flag
                 is_group_context = (metadata or {}).get("is_group", False)
                 query = self.supabase.table("customers").select("*") \
                     .eq("organization_id", organization_id) \
                     .eq("metadata->>telegram_id", contact) \
                     .contains("metadata", {"is_group": is_group_context})
+                
+                response = query.execute()
+                if response.data:
+                    return self._update_customer_name_if_needed(response.data[0], customer_name)
 
             # 3. OTHERS
             elif channel == "email":
                 query = self.supabase.table("customers").select("*").eq("organization_id", organization_id).eq("email", contact)
+                response = query.execute()
+                if response.data:
+                    return self._update_customer_name_if_needed(response.data[0], customer_name)
             elif channel == "web":
                 query = self.supabase.table("customers").select("*").eq("organization_id", organization_id).eq("metadata->>session_id", contact)
+                response = query.execute()
+                if response.data:
+                    return self._update_customer_name_if_needed(response.data[0], customer_name)
             else:
                 raise ValueError(f"Unsupported channel: {channel}")
-
-            response = query.execute()
-
-            if response.data:
-                customer = response.data[0]
-                if customer_name and "Unknown" in customer.get('name', ''):
-                    try:
-                        self.supabase.table("customers").update({"name": customer_name}).eq("id", customer["id"]).execute()
-                    except: pass
-                return customer
             
+            # --- CREATE NEW CUSTOMER ---
             final_name = customer_name or self._extract_name_from_contact(contact, channel)
 
             customer_data = {
                 "organization_id": organization_id,
                 "name": final_name,
-                "phone": contact if channel == "whatsapp" else (metadata or {}).get("phone"),
+                # 🛡️ THE FIX: Save the purely sanitized number into the database
+                "phone": clean_contact if channel == "whatsapp" else (metadata or {}).get("phone"),
                 "email": (metadata or {}).get("email"),
                 "metadata": {
                     **(metadata or {}),
@@ -107,6 +119,10 @@ class MessageRouterService:
             if channel == "telegram":
                 customer_data["metadata"]["telegram_id"] = contact
                 customer_data["metadata"]["is_group"] = (metadata or {}).get("is_group", False)
+            elif channel == "whatsapp":
+                # Ensure the LID is properly stored if it was originally an LID
+                if "@lid" in str(contact):
+                    customer_data["metadata"]["whatsapp_lid"] = clean_contact
 
             res = self.supabase.table("customers").insert(customer_data).execute()
             if not res.data: raise Exception("Failed to create customer")
@@ -115,7 +131,7 @@ class MessageRouterService:
         except Exception as e:
             logger.error(f"❌ Customer lookup/creation failed: {e}")
             raise
-
+        
     def _update_customer_name_if_needed(self, customer: Dict[str, Any], new_name: Optional[str]) -> Dict[str, Any]:
         """
         Helper to update 'Unknown' names if we get a better name later.
