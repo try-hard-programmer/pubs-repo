@@ -965,6 +965,7 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
             if not is_mentioned_raw:
                 raw_caption = data_content.get("caption", "")
                 raw_body = data_content.get("body", "")
+                logger.info(f"[TRIPWIRE 6] 🛬 RAW PAYLOAD HIT PYTHON: {raw_body[:200]}...") # Only log first 200 chars to avoid Base64 spam
                 
                 raw_text = ""
                 if raw_caption:
