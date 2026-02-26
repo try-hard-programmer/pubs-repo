@@ -27,32 +27,27 @@ def get_redis() -> redis.Redis:
 async def acquire_lock(lock_name: str, expire: int = 60, wait_time: int = 10) -> AsyncGenerator[bool, None]:
     """
     Robust Distributed Lock (Blocking).
-    
-    Args:
-        lock_name: The unique key for the lock.
-        expire: How long (seconds) to hold the lock before auto-releasing (Safety net).
-        wait_time: How long (seconds) to wait/spin for the lock before giving up.
     """
     client = get_redis()
-    # redis-py's lock() handles the spinning/backoff logic efficiently
     lock = client.lock(f"lock:{lock_name}", timeout=expire, blocking_timeout=wait_time)
     
     acquired = False
+    
+    # 1. Isolate the acquisition logic. Only catch errors related to getting the lock.
     try:
-        # Attempt to acquire. This BLOCKS up to `wait_time` seconds.
         acquired = await lock.acquire()
-        yield acquired
-    except redis_exceptions.LockError:
-        # Catch the correct exception class if acquisition fails
-        yield False
     except Exception as e:
-        logger.error(f"Redis Lock Error: {e}")
+        logger.error(f"Redis Lock Acquisition Error: {e}")
         yield False
+        return
+
+    # 2. Yield to the business logic. Let internal exceptions bubble up normally.
+    try:
+        yield acquired
     finally:
+        # 3. Always release if we own it, even if the business logic crashed.
         if acquired:
             try:
-                # Only release if we actually own it
                 await lock.release()
             except redis_exceptions.LockError:
-                # Lock might have expired already; ignore
                 pass

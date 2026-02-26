@@ -482,8 +482,11 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
     """
     Unified converter: Extracts Real Sender Number & Enforces 'Group Name' format.
     """
+    if not unofficial.data or not isinstance(unofficial.data, dict):
+        raise ValueError("Webhook data is missing or not a valid dict")
+
     raw_payload = unofficial.data
-    
+
     # 1. EXTRACT IDENTITY
     wrapper = raw_payload.get("message", {}) or raw_payload.get("messageMedia", {})
     identity_source = wrapper.get("_data", {}) or wrapper
@@ -756,6 +759,10 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
         if message.dataType in system_events:
             return JSONResponse(content={"success": True, "status": "processed_system_event"})
 
+        # Guard: data must be a non-null dict to proceed
+        if not message.data or not isinstance(message.data, dict):
+            return JSONResponse(content={"status": "ignored", "reason": "null_or_invalid_data"})
+
         # 2. Structure & Dedup
         data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
         data_content = data_wrapper.get("_data", {}) or data_wrapper 
@@ -782,6 +789,7 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
         
         integ_check = supabase.table("agent_integrations")\
             .select("config")\
+            .eq("agent_id", agent_id)\
             .eq("channel", "whatsapp")\
             .eq("enabled", True)\
             .execute()

@@ -361,7 +361,7 @@ async def create_ticket(
     "/customers",
     response_model=CustomerListResponse,
     summary="Get all customers",
-    description="Retrieve all customers for the organization"
+    description="Retrieve all customers for the organization (excluding groups)"
 )
 async def get_customers(
     search: Optional[str] = Query(None, description="Search by name, email, or phone"),
@@ -377,9 +377,22 @@ async def get_customers(
         # Build query
         query = supabase.table("customers").select("*", count="exact").eq("organization_id", organization_id)
 
-        # Apply search filter
-        if search:
-            query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%,phone.ilike.%{search}%")
+        # 🛑 1. THE GROUP EXCLUSION 🛑
+        # Exclude WhatsApp/Telegram groups directly in the database to preserve exact pagination limits.
+        # We must allow rows where 'is_group' is missing (null) OR explicitly false.
+        query = query.or_("metadata->>is_group.is.null,metadata->>is_group.eq.false")
+
+        # 🛑 2. THE SEARCH VALIDATION 🛑
+        if search is not None:
+            clean_search = search.strip()
+            if clean_search:  # Proceed only if not empty after stripping
+                if len(clean_search) < 3:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Search query must be at least 3 characters long."
+                    )
+                # Apply sanitized search filter
+                query = query.or_(f"name.ilike.%{clean_search}%,email.ilike.%{clean_search}%,phone.ilike.%{clean_search}%")
 
         # Apply pagination
         query = query.range(skip, skip + limit - 1).order("created_at", desc=True)
@@ -402,7 +415,8 @@ async def get_customers(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch customers"
         )
-
+    
+    
 @router.get(
     "/customers/{customer_id}",
     response_model=Customer,
@@ -1028,6 +1042,60 @@ async def create_chat(
                 if new_cust.data: customer_id = new_cust.data[0]["id"]
                 else: raise HTTPException(500, "Failed to create customer")
 
+        # # ==============================================================================
+        # # 3. REUSE OR CREATE CHAT dont delete this just for backup
+        # # ==============================================================================
+        # chat_obj = None
+        # lock_key = f"chat_create:{organization_id}:{customer_id}:{channel_val}"
+        
+        # async with acquire_lock(lock_key, expire=5) as acquired:
+        #     if not acquired:
+        #         raise HTTPException(429, "Concurrent creation detected. Please retry.")
+
+        #     active_chat = supabase.table("chats")\
+        #         .select("*")\
+        #         .eq("customer_id", customer_id)\
+        #         .eq("channel", channel_val)\
+        #         .neq("status", "resolved")\
+        #         .neq("status", "closed")\
+        #         .execute()
+            
+        #     if active_chat.data:
+        #         chat_obj = active_chat.data[0]
+        #         logger.info(f"♻️ Reusing Chat {chat_obj['id']}")
+                
+        #         upd = {"sender_agent_id": sender_agent_id}
+                
+        #         if assigned_agent_id:
+        #             upd.update({
+        #                 "status": status_value,
+        #                 "handled_by": handled_by,
+        #                 "assigned_agent_id": assigned_agent_id
+        #             })
+        #             if human_agent_id: upd["human_agent_id"] = human_agent_id
+        #             if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
+        #         elif handled_by == "ai":
+        #             # THE FIX: Only force back to "open" and "ai" if it wasn't ALREADY handled by a human.
+        #             if chat_obj.get("handled_by") != "human":
+        #                 upd.update({
+        #                     "status": "open",
+        #                     "handled_by": "ai",
+        #                     "assigned_agent_id": None,
+        #                     "human_agent_id": None
+        #                 })
+                
+        #         supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
+        #         chat_obj.update(upd)
+        #     else:
+        #         new_chat_data = {
+        #             "organization_id": organization_id, "customer_id": customer_id, "channel": channel_val,
+        #             "assigned_agent_id": assigned_agent_id, "ai_agent_id": ai_agent_id, "human_agent_id": human_agent_id,
+        #             "handled_by": handled_by, "status": status_value, "sender_agent_id": sender_agent_id,
+        #             "unread_count": 0, "last_message_at": datetime.utcnow().isoformat()
+        #         }
+        #         res = supabase.table("chats").insert(new_chat_data).execute()
+        #         chat_obj = res.data[0]
+
         # ==============================================================================
         # 3. REUSE OR CREATE CHAT
         # ==============================================================================
@@ -1048,7 +1116,19 @@ async def create_chat(
             
             if active_chat.data:
                 chat_obj = active_chat.data[0]
-                logger.info(f"♻️ Reusing Chat {chat_obj['id']}")
+                
+                # 🛑 THE NEW VALIDATION 🛑
+                # If the chat is already handled by a human or explicitly assigned, throw an error.
+                is_already_assigned = chat_obj.get("handled_by") == "human" or chat_obj.get("assigned_agent_id") is not None
+                
+                if is_already_assigned:
+                    logger.warning(f"⛔ Blocked attempt to hijack assigned chat {chat_obj['id']}")
+                    raise HTTPException(
+                        status_code=409, # 409 Conflict is the correct semantic status here
+                        detail="This customer already has an active chat assigned to an agent."
+                    )
+
+                logger.info(f"♻️ Reusing unassigned Chat {chat_obj['id']}")
                 
                 upd = {"sender_agent_id": sender_agent_id}
                 
@@ -1061,14 +1141,12 @@ async def create_chat(
                     if human_agent_id: upd["human_agent_id"] = human_agent_id
                     if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
                 elif handled_by == "ai":
-                    # THE FIX: Only force back to "open" and "ai" if it wasn't ALREADY handled by a human.
-                    if chat_obj.get("handled_by") != "human":
-                        upd.update({
-                            "status": "open",
-                            "handled_by": "ai",
-                            "assigned_agent_id": None,
-                            "human_agent_id": None
-                        })
+                    upd.update({
+                        "status": "open",
+                        "handled_by": "ai",
+                        "assigned_agent_id": None,
+                        "human_agent_id": None
+                    })
                 
                 supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
                 chat_obj.update(upd)

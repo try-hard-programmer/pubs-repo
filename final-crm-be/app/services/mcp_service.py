@@ -1,486 +1,310 @@
 import logging
 import httpx
-import asyncio
 import json
 from typing import Dict, Any, List, Optional
-from mcp import ClientSession
-from mcp.client.sse import sse_client
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class MCPService:
-    
-    def __init__(self):
-        # Cache for active MCP client sessions
-        self._sessions: Dict[str, ClientSession] = {}
-        self._session_locks: Dict[str, asyncio.Lock] = {}
-    
-    # =========================================================
-    # 1. SESSION MANAGEMENT
-    # =========================================================
-    async def _get_or_create_session(
-        self, 
-        url: str,
-        transport: str,
-        api_key: Optional[str] = None
-    ) -> Optional[ClientSession]:
-        """Get existing session or create new one using official MCP SDK."""
-        session_key = f"{transport}:{url}"
-        
-        # Return cached session if exists
-        if session_key in self._sessions:
-            return self._sessions[session_key]
-        
-        # Ensure lock exists
-        if session_key not in self._session_locks:
-            self._session_locks[session_key] = asyncio.Lock()
-        
-        async with self._session_locks[session_key]:
-            # Double-check after acquiring lock
-            if session_key in self._sessions:
-                return self._sessions[session_key]
-            
-            try:
-                headers = {}
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
-                
-                if transport == "sse":
-                    # Use official MCP SSE client
-                    read, write = await sse_client(url, headers=headers).__aenter__()
-                    session = ClientSession(read, write)
-                    await session.__aenter__()
-                    
-                    # Initialize the session
-                    await session.initialize()
-                    
-                    self._sessions[session_key] = session
-                    logger.info(f"✅ MCP SSE Session created: {url}")
-                    return session
-                    
-                elif transport == "http":
-                    # For HTTP, return None - we use direct httpx calls
-                    return None
-                    
-            except Exception as e:
-                logger.error(f"Failed to create MCP session for {url}: {e}")
-                return None
-        
-        return None
-    
-    async def _close_session(self, url: str, transport: str):
-        """Close and remove a cached session."""
-        session_key = f"{transport}:{url}"
-        if session_key in self._sessions:
-            try:
-                await self._sessions[session_key].__aexit__(None, None, None)
-            except:
-                pass
-            del self._sessions[session_key]
-    
-    # =========================================================
-    # 2. TRANSPORT HELPERS
-    # =========================================================
-    async def _http_request(
-        self,
-        url: str,
-        method: str,
-        params: Optional[Dict] = None,
-        api_key: Optional[str] = None,
-        timeout: float = 10.0
-    ) -> Dict[str, Any]:
-        """Direct HTTP JSON-RPC request (for HTTP transport)."""
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Syntra-CRM-Backend/1.0"
-        }
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-            "id": 1
-        }
+class MCPService:
+
+    # =========================================================
+    # 1. CORE HTTP CLIENT
+    # =========================================================
+    async def _rest_request(
+        self,
+        method: str,
+        base_url: str,
+        endpoint: str,
+        payload: Optional[Dict] = None,
+        api_key: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Raw HTTP request to a Palapa AI endpoint."""
+        full_url = f"{base_url.rstrip('/')}{endpoint}"
+
+        # Palapa only uses X-API-Key — Bearer is not needed
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["X-API-Key"] = api_key
+
+        logger.info(f"🌐 [REST-PROXY] OUTBOUND {method} {full_url}")
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers)
-                
-                if resp.status_code != 200:
-                    logger.error(f"MCP HTTP Error {resp.status_code}: {resp.text}")
-                    return {"error": f"HTTP {resp.status_code}", "success": False}
+                if method.upper() == "GET":
+                    resp = await client.get(full_url, headers=headers)
+                else:
+                    resp = await client.post(full_url, json=payload or {}, headers=headers)
 
-                data = resp.json()
-                
-                if "error" in data:
-                    logger.error(f"MCP JSON-RPC Error: {data['error']}")
-                    return {"error": data["error"], "success": False}
+            logger.info(f"📥 [REST-PROXY] RESPONSE CODE: {resp.status_code}")
 
-                return {"result": data.get("result"), "success": True}
+            if resp.status_code != 200:
+                logger.error(f"❌ [REST-PROXY] ERROR BODY: {resp.text}")
+                return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+            data = resp.json()
+            return {"success": True, "data": data}
 
         except httpx.TimeoutException:
-            logger.error(f"MCP Timeout calling {method} on {url}")
-            return {"error": "Connection timed out", "success": False}
+            logger.error(f"⏱️ [REST-PROXY] TIMEOUT calling {full_url}")
+            return {"success": False, "error": "Connection timed out"}
         except Exception as e:
-            logger.error(f"MCP HTTP Request Error: {e}")
-            return {"error": str(e), "success": False}
-    
-    async def _sse_call_tool(
-        self,
-        session: ClientSession,
-        tool_name: str,
-        arguments: Dict
-    ) -> Dict[str, Any]:
-        """Call tool using MCP SDK session."""
-        try:
-            result = await session.call_tool(tool_name, arguments)
-            
-            # Extract text content
-            output_parts = []
-            for content in result.content:
-                if hasattr(content, 'text'):
-                    output_parts.append(content.text)
-            
-            return {
-                "success": True,
-                "result": {
-                    "content": [{"type": "text", "text": "\n".join(output_parts)}]
-                }
-            }
-        except Exception as e:
-            logger.error(f"SSE tool call error: {e}")
-            return {"error": str(e), "success": False}
+            logger.error(f"💥 [REST-PROXY] NETWORK EXCEPTION: {e}")
+            return {"success": False, "error": str(e)}
 
     # =========================================================
-    # 3. SERVER DISCOVERY
+    # 2. SERVER DISCOVERY
     # =========================================================
     async def _get_active_servers(self, supabase, agent_id: str) -> List[Dict]:
-        """Fetch MCP servers from agent_integrations table."""
+        """Fetch active MCP servers for an agent from agent_integrations."""
         try:
-            res = supabase.table("agent_integrations")\
-                .select("config")\
-                .eq("agent_id", agent_id)\
-                .eq("channel", "mcp")\
-                .eq("enabled", True)\
+            res = (
+                supabase.table("agent_integrations")
+                .select("config")
+                .eq("agent_id", agent_id)
+                .eq("channel", "mcp")
+                .eq("enabled", True)
                 .execute()
-            
+            )
             if not res.data:
                 return []
 
             active_servers = []
-            
             for row in res.data:
-                config_raw = row.get("config")
-                
-                if isinstance(config_raw, str):
-                    try:
-                        config_data = json.loads(config_raw)
-                    except:
-                        continue
-                else:
-                    config_data = config_raw or {}
-
-                servers = config_data.get("servers", [])
-                for s in servers:
+                config_raw = row.get("config", {})
+                config_data = json.loads(config_raw) if isinstance(config_raw, str) else config_raw
+                for s in config_data.get("servers", []):
                     active_servers.append({
                         "name": s.get("name"),
                         "url": s.get("url"),
                         "api_key": s.get("apiKey"),
-                        "transport": s.get("transport", "http")
                     })
-            
-            logger.info(f"🔍 MCP DB Query: agent_id={agent_id}, results={len(res.data)} rows")
             return active_servers
-
         except Exception as e:
-            logger.error(f"Failed to fetch MCP servers for agent {agent_id}: {e}")
+            logger.error(f"Failed to fetch servers for agent {agent_id}: {e}")
             return []
 
     # =========================================================
-    # 4. TOOL AGGREGATION
+    # 3. SCHEMA → OPENAI TOOLS
     # =========================================================
     async def get_all_tools_schema(self, supabase, agent_id: str) -> List[Dict[str, Any]]:
-        """Get all tools with Redis caching (5min TTL)"""
-        from app.services.redis_service import get_redis
-        import json
-        
-        redis = get_redis()
-        cache_key = f"mcp:tools:{agent_id}"
-        
-        # Try cache first
-        try:
-            cached = await redis.get(cache_key)
-            if cached:
-                tools = json.loads(cached)
-                logger.info(f"✅ MCP: Using Redis cached tools for {agent_id} ({len(tools)} tools)")
-                return tools
-        except Exception as e:
-            logger.warning(f"Redis cache read failed: {e}")
-        
-        # Cache miss - fetch fresh
+        """
+        Calls GET /mcp/schema (always fresh — bypasses cache) and maps
+        resources + relationships into OpenAI function definitions.
+
+        Real Palapa /mcp/initialize response shape (for reference):
+            {
+                "resources": [
+                    {
+                        "name": "orders",
+                        "type": "table",
+                        "fields": [
+                            {"name": "id", "type": "integer", "primary_key": true, "nullable": false},
+                            ...
+                        ],
+                        "foreign_keys": [...],
+                        "indexes": [...],
+                        "access": "read"
+                    }
+                ]
+            }
+
+        GET /mcp/schema adds a top-level "relationships" array derived from FK metadata.
+        It does NOT read from the schema cache — always introspects the DB fresh.
+        """
         servers = await self._get_active_servers(supabase, agent_id)
         aggregated_tools = []
 
-        logger.info(f"🔌 MCP: Discovering tools from {len(servers)} servers for Agent {agent_id}")
+        logger.info(f"🔌 [REST-PROXY] Discovering schema for Agent {agent_id}")
 
         for server in servers:
             url = server.get("url")
             api_key = server.get("api_key")
-            transport = server.get("transport", "http")
-            server_name = server.get("name", "mcp").replace(" ", "_").lower()
-            
-            try:
-                if transport == "sse":
-                    session = await self._get_or_create_session(url, transport, api_key)
-                    if not session:
-                        logger.error(f"Failed to create session for {server_name}")
-                        continue
-                    
-                    tools_result = await session.list_tools()
-                    mcp_tools = tools_result.tools if hasattr(tools_result, 'tools') else []
-                    
-                    for tool in mcp_tools:
-                        namespaced_name = f"{server_name}__{tool.name}"
-                        
-                        openai_tool = {
-                            "type": "function",
-                            "function": {
-                                "name": namespaced_name,
-                                "description": tool.description or "",
-                                "parameters": tool.inputSchema if hasattr(tool, 'inputSchema') else {}
-                            }
-                        }
-                        aggregated_tools.append(openai_tool)
-                
-                else:  # HTTP transport
-                    response = await self._http_request(url, "tools/list", api_key=api_key)
-                    
-                    if response.get("success") and response.get("result"):
-                        mcp_tools = response["result"].get("tools", [])
-                        
-                        for tool in mcp_tools:
-                            namespaced_name = f"{server_name}__{tool['name']}"
-                            
-                            openai_tool = {
-                                "type": "function",
-                                "function": {
-                                    "name": namespaced_name,
-                                    "description": tool.get("description", ""),
-                                    "parameters": tool.get("inputSchema", {})
-                                }
-                            }
-                            aggregated_tools.append(openai_tool)
-            
-            except Exception as e:
-                logger.error(f"Error listing tools from {server_name}: {e}")
+            server_name = server.get("name", "db").replace(" ", "_").lower()
+
+            # /mcp/schema always returns fresh data + relationships in one call.
+            # No need to call /mcp/initialize first — it does not affect /mcp/schema.
+            schema_resp = await self._rest_request("GET", url, "/mcp/schema", api_key=api_key)
+
+            if not schema_resp.get("success"):
+                logger.error(f"⚠️ [REST-PROXY] Schema fetch failed for {server_name}: {schema_resp.get('error')}")
                 continue
 
-        # Store in Redis ONLY if we got tools
-        if aggregated_tools:
-            try:
-                await redis.setex(cache_key, 300, json.dumps(aggregated_tools))
-            except Exception as e:
-                logger.warning(f"Redis cache write failed: {e}")
-        else:
-            logger.warning(f"⚠️ MCP: No tools discovered for {agent_id}. Skipping cache.")
-        
+            data = schema_resp["data"]
+
+            # Log the real raw output so you can verify the server response
+            logger.info(
+                f"📦 [REST-PROXY] RAW /mcp/schema from '{server_name}':\n"
+                + json.dumps(data, indent=2)
+            )
+
+            resources = data.get("resources", [])
+            relationships = data.get("relationships", [])
+
+            if not resources:
+                logger.warning(f"⚠️ [REST-PROXY] No resources returned for '{server_name}'.")
+                continue
+
+            # Build relationship lookup: table_name → [human-readable join hints]
+            rel_map: Dict[str, List[str]] = {}
+            for rel in relationships:
+                frm = rel.get("from_resource")
+                to = rel.get("to_resource")
+                if not frm or not to:
+                    continue
+                rel_map.setdefault(frm, []).append(
+                    f"Can join to `{to}` via `{frm}.{rel['from_column']} = {to}.{rel['to_column']}`"
+                )
+                rel_map.setdefault(to, []).append(
+                    f"Can join from `{frm}` via `{frm}.{rel['from_column']} = {to}.{rel['to_column']}`"
+                )
+
+            for res in resources:
+                res_name = res.get("name")
+                if not res_name:
+                    continue
+
+                pks = [f["name"] for f in res.get("fields", []) if f.get("primary_key")]
+                indexed_cols = list({
+                    col
+                    for idx in res.get("indexes", [])
+                    for col in idx.get("columns", [])
+                })
+
+                desc_parts = [f"Query the '{res_name}' table from '{server_name}'."]
+                if pks:
+                    desc_parts.append(f"Primary Key(s): {', '.join(pks)}.")
+                if indexed_cols:
+                    desc_parts.append(f"Indexed columns (prefer for filters): {', '.join(indexed_cols)}.")
+                if res_name in rel_map:
+                    desc_parts.append("Relationships: " + " | ".join(rel_map[res_name]) + ".")
+                desc_parts.append(
+                    "Do NOT use JOINs. Query one table at a time; use 'IN' filters to link results."
+                )
+
+                aggregated_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": f"{server_name}__{res_name}",
+                        "description": " ".join(desc_parts),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "fields": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Columns to return. Omit or leave empty to return all.",
+                                },
+                                "filters": {
+                                    "type": "object",
+                                    "description": (
+                                        "Filter conditions. Key = column name. "
+                                        "Value = {\"op\": \"=\", \"value\": ...}. "
+                                        "Operators: =, !=, >, <, >=, <=, LIKE, IN, IS NULL, IS NOT NULL."
+                                    ),
+                                },
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Rows to return (default 50, max 1000).",
+                                },
+                                "order_by": {
+                                    "type": "object",
+                                    "properties": {
+                                        "field": {"type": "string"},
+                                        "direction": {"type": "string", "enum": ["asc", "desc"]},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                })
+
+        logger.info(f"✅ [REST-PROXY] Mapped {len(aggregated_tools)} tables to OpenAI tools.")
         return aggregated_tools
-    
-    
+
     # =========================================================
-    # 5. TOOL EXECUTION
+    # 4. TOOL EXECUTION
     # =========================================================
     async def execute_mcp_tool(
-        self, 
-        supabase, 
-        agent_id: str, 
-        tool_call_name: str, 
-        arguments: Dict
+        self,
+        supabase,
+        agent_id: str,
+        tool_call_name: str,
+        arguments: Dict,
     ) -> Dict[str, Any]:
-        """Execute MCP tool and return result."""
-        try:
-            if "__" not in tool_call_name:
-                return {"status": "error", "output": f"Invalid tool format: {tool_call_name}"}
-            
-            target_server_name, real_tool_name = tool_call_name.split("__", 1)
-            
-            servers = await self._get_active_servers(supabase, agent_id)
-            
-            target_server = None
-            for s in servers:
-                s_name = s.get("name", "").replace(" ", "_").lower()
-                if s_name == target_server_name:
-                    target_server = s
-                    break
-            
-            if not target_server:
-                return {"status": "error", "output": f"MCP Server '{target_server_name}' not found"}
+        """Translates an OpenAI tool call into a Palapa POST /mcp/execute request."""
+        if "__" not in tool_call_name:
+            return {"status": "error", "output": f"Invalid tool name format: '{tool_call_name}'"}
 
-            transport = target_server.get("transport", "http")
-            
-            logger.info(f"🚀 MCP: Executing {real_tool_name} on {target_server_name}...")
-            
-            if transport == "sse":
-                # Use MCP SDK
-                session = await self._get_or_create_session(
-                    target_server["url"],
-                    transport,
-                    target_server["api_key"]
-                )
-                
-                if not session:
-                    return {"status": "error", "output": "Failed to create MCP session"}
-                
-                response = await self._sse_call_tool(session, real_tool_name, arguments)
-                
-            else:  # HTTP
-                response = await self._http_request(
-                    url=target_server["url"],
-                    method="tools/call",
-                    params={
-                        "name": real_tool_name,
-                        "arguments": arguments
-                    },
-                    api_key=target_server["api_key"],
-                    timeout=30.0
-                )
-
-            if response.get("success"):
-                result_content = response["result"].get("content", [])
-                output_str = "\n".join([c.get("text", "") for c in result_content if c.get("type") == "text"])
-                return {"status": "success", "output": output_str}
-            else:
-                return {"status": "error", "output": str(response.get("error", "Unknown error"))}
-
-        except Exception as e:
-            logger.error(f"MCP Execution Failed: {e}")
-            return {"status": "error", "output": str(e)}
-
-    # =========================================================
-    # 6. RESOURCE FETCHING
-    # =========================================================
-    async def fetch_active_resources(self, supabase, agent_id: str) -> str:
-        """Fetch resources from connected MCP servers."""
+        target_server_name, resource_name = tool_call_name.split("__", 1)
         servers = await self._get_active_servers(supabase, agent_id)
-        context_str = []
 
-        for server in servers:
-            url = server.get("url")
-            api_key = server.get("api_key")
-            transport = server.get("transport", "http")
-            server_name = server.get("name")
+        target_server = next(
+            (s for s in servers if s.get("name", "").replace(" ", "_").lower() == target_server_name),
+            None,
+        )
+        if not target_server:
+            return {"status": "error", "output": f"Server '{target_server_name}' not found."}
 
-            try:
-                if transport == "sse":
-                    # Use MCP SDK
-                    session = await self._get_or_create_session(url, transport, api_key)
-                    if not session:
-                        continue
-                    
-                    # List resources
-                    resources_result = await session.list_resources()
-                    resources = resources_result.resources if hasattr(resources_result, 'resources') else []
-                    
-                    # Read first 3
-                    for res in resources[:3]:
-                        read_result = await session.read_resource(res.uri)
-                        for content in read_result.contents:
-                            if hasattr(content, 'text'):
-                                context_str.append(f"--- MCP Resource ({server_name}): {res.name} ---\n{content.text[:1000]}")
-                
-                else:  # HTTP
-                    # List resources
-                    list_resp = await self._http_request(url, "resources/list", api_key=api_key)
-                    
-                    if list_resp.get("success"):
-                        resources = list_resp["result"].get("resources", [])
-                        
-                        for res in resources[:3]: 
-                            uri = res.get("uri")
-                            read_resp = await self._http_request(
-                                url, "resources/read", 
-                                params={"uri": uri}, 
-                                api_key=api_key
-                            )
-                            
-                            if read_resp.get("success"):
-                                contents = read_resp["result"].get("contents", [])
-                                for c in contents:
-                                    context_str.append(f"--- MCP Resource ({server_name}): {res.get('name')} ---\n{c.get('text', '')[:1000]}")
-            
-            except Exception as e:
-                logger.error(f"Error fetching resources from {server_name}: {e}")
-                continue
+        logger.info(f"🔧 [REST-PROXY] Executing: {target_server_name} → {resource_name}")
 
-        return "\n\n".join(context_str)
+        payload: Dict[str, Any] = {
+            "resource": resource_name,
+            "fields": arguments.get("fields", []),
+            "limit": arguments.get("limit", 50),
+        }
+        if arguments.get("filters"):
+            payload["filters"] = arguments["filters"]
+        if arguments.get("order_by"):
+            payload["order_by"] = arguments["order_by"]
+
+        response = await self._rest_request(
+            method="POST",
+            base_url=target_server["url"],
+            endpoint="/mcp/execute",
+            payload=payload,
+            api_key=target_server["api_key"],
+        )
+
+        if response.get("success"):
+            return {"status": "success", "output": json.dumps(response["data"])}
+        return {"status": "error", "output": response.get("error", "Unknown error")}
 
     # =========================================================
-    # 7. CONNECTION TESTER
+    # 5. CONNECTION TEST
     # =========================================================
-    async def test_connection(self, url: str, transport: str, api_key: str = None) -> Dict[str, Any]:
-        """Test MCP server connection by listing tools."""
-        try:
-            if transport.lower() == "sse":
-                # Use MCP SDK to test SSE connection
-                session = await self._get_or_create_session(url, "sse", api_key)
-                
-                if session:
-                    # Test by listing tools
-                    tools_result = await session.list_tools()
-                    tools = tools_result.tools if hasattr(tools_result, 'tools') else []
-                    
-                    caps = ["tools"]
-                    
-                    # Check if resources are supported
-                    try:
-                        await session.list_resources()
-                        caps.append("resources")
-                    except:
-                        pass
-                    
-                    return {
-                        "success": True,
-                        "status": "connected",
-                        "capabilities": caps,
-                        "tools_count": len(tools)
-                    }
-                else:
-                    return {"success": False, "status": "error", "error": "Failed to establish SSE session"}
-            
-            else:  # HTTP
-                # Test by calling tools/list
-                response = await self._http_request(url, "tools/list", api_key=api_key, timeout=5.0)
-                
-                if response.get("success"):
-                    result = response.get("result") or {}
-                    tools = result.get("tools", [])
-                    
-                    return {
-                        "success": True,
-                        "status": "connected",
-                        "capabilities": ["tools"],
-                        "tools_count": len(tools)
-                    }
-                else:
-                    return {"success": False, "status": "error", "error": str(response.get("error", "Unknown error"))}
-        
-        except Exception as e:
-            logger.error(f"Connection test failed: {e}")
-            return {"success": False, "status": "error", "error": str(e)}
-    
-    # =========================================================
-    # 8. CLEANUP
-    # =========================================================
-    async def close_all_sessions(self):
-        """Close all active MCP sessions."""
-        for session_key in list(self._sessions.keys()):
-            transport = session_key.split(":", 1)[0]
-            url = session_key.split(":", 1)[1]
-            await self._close_session(url, transport)
+    async def test_connection(self, url: str, transport: str = "http", api_key: str = None) -> Dict[str, Any]:
+        """
+        Tests connectivity by calling GET /mcp/resources.
+        Accepts 'transport' to satisfy the crm_agents.py caller, even though Palapa is purely HTTP.
+        """
+        logger.info(f"🧪 [REST-PROXY] Testing connection to {url}")
+        response = await self._rest_request("GET", url, "/mcp/resources", api_key=api_key, timeout=5.0)
+
+        if response.get("success"):
+            data = response["data"]
+            resources = data if isinstance(data, list) else data.get("resources", [])
+            logger.info(f"✅ [REST-PROXY] Connected. Found {len(resources)} tables.")
+            return {
+                "success": True,
+                "status": "connected",
+                "capabilities": ["resources/read", "tools/list"],
+                "tools_count": len(resources),
+            }
+
+        logger.error(f"❌ [REST-PROXY] Connection failed: {response.get('error')}")
+        return {
+            "success": False,
+            "status": "error",
+            "error": response.get("error", "Invalid Palapa AI endpoint"),
+        }
+
 
 # Singleton
 _mcp_service = MCPService()
-def get_mcp_service(): 
+
+
+def get_mcp_service() -> MCPService:
     return _mcp_service

@@ -1116,27 +1116,120 @@ async def update_agent_integration(
 			detail="Failed to update agent integration"
 		)
 
+
+# ============================================
+# MCP INTEGRATIONS ENDPOINTS
+# ============================================
+
 class MCPTestRequest(BaseModel):
     url: str
     transport: str
     apiKey: Optional[str] = None
 
 @router.post(
-    "/mcp/test-connection",
-    summary="Test MCP Connection (Handshake)",
-    description="Equivalent to WA 'Activate' or Tele 'Verify'. Validates the server connection."
+    "/{agent_id}/mcp/test-connection",
+    summary="Test MCP Connection (Secure)",
+    description="Securely tests the MCP connection by fetching the saved URL and API key directly from the database to prevent SSRF."
 )
 async def test_mcp_connection(
-    payload: MCPTestRequest,
+    agent_id: str,
     current_user: User = Depends(get_current_user)
 ):
     """
-    Performs a real-time handshake (JSON-RPC Initialize) with the MCP Server.
+    Secure Handshake. 
+    The FE no longer sends the URL/API key. The BE fetches it from the agent's integration record.
     """
-    service = get_mcp_service()
-    result = await service.test_connection(
-        url=payload.url,
-        transport=payload.transport,
-        api_key=payload.apiKey
-    )
-    return result
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+
+        # 1. Verify agent ownership
+        agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not agent_check.data:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Agent not found")
+
+        # 2. Fetch the secure integration config from DB
+        integration = supabase.table("agent_integrations").select("config").eq("agent_id", agent_id).eq("channel", "mcp").execute()
+        
+        if not integration.data:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="MCP integration not configured for this agent. Save it first.")
+            
+        config = integration.data[0].get("config", {})
+        servers = config.get("servers", [])
+        
+        if not servers:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="No servers found in the saved MCP configuration.")
+            
+        # Extract the first server (based on your current UI config structure)
+        target_server = servers[0]
+        url = target_server.get("url")
+        api_key = target_server.get("apiKey")
+        
+        if not url:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Server URL is missing in the database configuration.")
+
+        # 3. Test the connection securely
+        service = get_mcp_service()
+        result = await service.test_connection(
+            url=url,
+            transport="http",  # Hardcoded for Palapa REST architecture
+            api_key=api_key
+        )
+        
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Secure connection test failed for agent {agent_id}: {e}")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+@router.post(
+    "/{agent_id}/mcp/initialize",
+    summary="Initialize Palapa Tables as AI Tools",
+    description="Crawls the connected Palapa database, extracts schemas, and translates them into OpenAI tools."
+)
+async def init_mcp_tools(
+    agent_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    The 'initialize' process. Called by the frontend to fetch and translate Palapa schemas.
+    Currently set to log the output and return it to the FE.
+    """
+    import json
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
+        
+        # 1. Verify agent ownership
+        agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not agent_check.data:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Agent not found")
+            
+        # 2. Trigger the schema translator
+        service = get_mcp_service()
+        tools = await service.get_all_tools_schema(supabase, agent_id)
+        
+        # 3. LOG IT OUT FIRST (As requested)
+        logger.info(f"🛠️ [INIT] Successfully mapped {len(tools)} tools for Agent {agent_id}.")
+        logger.info(f"🛠️ [INIT] Payload sending to Frontend:\n{json.dumps(tools, indent=2)}")
+        
+        # 4. Return to FE so your HTML can use it
+        return {
+            "success": True,
+            "message": f"Successfully initialized {len(tools)} database tables as AI tools.",
+            "tools_count": len(tools),
+            "tools": tools
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to init tools for agent {agent_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"Schema initialization failed: {str(e)}"
+        )
+    
+    

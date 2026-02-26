@@ -471,10 +471,10 @@ class StorageService:
             folder_path: Optional parent folder path
 
         Returns:
-            Signed URL (valid for 1 hour)
+            Signed URL (valid for 1 year)
         """
         # Use get_file_url to get signed URL
-        return self.get_file_url(organization_id, file_id, folder_path, expires_in=3600)
+        return self.get_file_url(organization_id, file_id, folder_path, expires_in=31536000)
 
     def list_folder_contents(
         self,
