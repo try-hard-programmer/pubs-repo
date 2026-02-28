@@ -235,7 +235,9 @@ class TicketService:
 
         # 4. Activity Logging
         if payload.get("status") and str(payload["status"]) != str(old_ticket["status"]):
-            await self.log_activity(ticket_id, "status_change", f"Status changed to {payload['status']}", actor_id, actor_type)
+            clean_status = payload['status'].value if hasattr(payload['status'], 'value') else str(payload['status'])
+            log_desc = f"Status changed to {clean_status.upper()} by {actor_id}"
+            await self.log_activity(ticket_id, "status_change", log_desc, actor_id, actor_type)
         
         if payload.get("priority") and payload["priority"] != old_ticket["priority"]:
             await self.log_activity(ticket_id, "priority_change", f"Priority changed to {payload['priority']}", actor_id, actor_type)
