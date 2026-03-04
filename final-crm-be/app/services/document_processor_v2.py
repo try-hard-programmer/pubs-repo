@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import logging
 import requests
@@ -273,100 +274,102 @@ class DocumentProcessorV2:
     # ============================================
 
     def _extract_pdf(self, content: bytes) -> Tuple[str, DocumentQualityMetrics]:
-        """
-        PDF extraction pipeline:
-        1. Try unstructured hi_res (layout detection + table inference + image OCR)
-        2. Fallback to pdfplumber if hi_res fails
-
-        hi_res handles: multi-column layouts, complex tables, embedded images,
-        charts with text, scanned pages, merged cells, equations (as text).
-        """
         metrics = DocumentQualityMetrics()
 
         try:
             self.logger.info("📄 PDF: Using hi_res strategy (layout + tables + images)")
 
-            elements = partition_pdf(
-                file=io.BytesIO(content),
-                strategy="hi_res",
-                infer_table_structure=True,
-                extract_images_in_pdf=True,
-                extract_image_block_types=["Image", "Table"],
-                languages=["ind", "eng"],
-                max_partition=None,
-            )
+            # 1. OPEN THE SANDBOX
+            with tempfile.TemporaryDirectory() as tmpdir:
+                elements = partition_pdf(
+                    file=io.BytesIO(content),
+                    strategy="hi_res",
+                    infer_table_structure=False, 
+                    extract_images_in_pdf=True,
+                    extract_image_block_types=["Image"],
+                    extract_image_block_output_dir=tmpdir, 
+                    languages=["ind", "eng"],
+                    max_partition=None,
+                )
 
-            if not elements:
-                self.logger.warning("⚠️ hi_res returned no elements, falling back to pdfplumber")
-                return self._extract_pdf_pdfplumber(content)
+                if not elements:
+                    return self._extract_pdf_pdfplumber(content)
 
-            text_blocks = []
-            element_counts = {"text": 0, "table": 0, "image": 0, "title": 0, "other": 0}
+                text_blocks = []
+                element_counts = {"text": 0, "table": 0, "image": 0, "title": 0, "other": 0}
 
-            for el in elements:
-                category = getattr(el, "category", "").lower() if hasattr(el, "category") else ""
-                el_text = getattr(el, "text", "") or ""
-                el_metadata = getattr(el, "metadata", None)
+                # 2. THIS LOOP MUST BE INDENTED INSIDE THE 'WITH' BLOCK
+                for el in elements:
+                    category = getattr(el, "category", "").lower() if hasattr(el, "category") else ""
+                    el_text = getattr(el, "text", "") or ""
+                    el_metadata = getattr(el, "metadata", None)
 
-                # --- TITLE / HEADER ---
-                if category in ("title", "header"):
-                    element_counts["title"] += 1
-                    if el_text.strip():
-                        text_blocks.append(f"\n## {el_text.strip()}\n")
+                    if category in ("title", "header"):
+                        element_counts["title"] += 1
+                        if el_text.strip():
+                            text_blocks.append(f"\n## {el_text.strip()}\n")
 
-                # --- TABLE ---
-                elif category == "table":
-                    element_counts["table"] += 1
-                    metrics.has_tables = True
-
-                    html_table = None
-                    if el_metadata:
-                        html_table = getattr(el_metadata, "text_as_html", None)
-
-                    if html_table:
-                        readable = self._html_table_to_text(html_table)
-                        if readable.strip():
-                            text_blocks.append(f"\n[Table]\n{readable}\n")
-                        elif el_text.strip():
+                    elif category == "table":
+                        element_counts["table"] += 1
+                        metrics.has_tables = True
+                        if el_text.strip():
                             text_blocks.append(f"\n[Table]\n{el_text.strip()}\n")
-                    elif el_text.strip():
-                        text_blocks.append(f"\n[Table]\n{el_text.strip()}\n")
 
-                # --- IMAGE ---
-                elif category == "image":
-                    element_counts["image"] += 1
-                    metrics.has_images = True
+                    elif category == "image":
+                        element_counts["image"] += 1
+                        metrics.has_images = True
+                        
+                        # 3. GET THE IMAGE PATH
+                        image_path = getattr(el_metadata, "image_path", None) if el_metadata else None
+                        
+                        # 4. READ IT, ENCODE IT, AND SEND TO OCR PROXY
+                        if image_path and os.path.exists(image_path):
+                            with open(image_path, "rb") as img_file:
+                                img_bytes = img_file.read()
+                            
+                            mime, _ = mimetypes.guess_type(image_path)
+                            mime = mime or "image/png"
+                            b64 = base64.b64encode(img_bytes).decode("ascii")
+                            image_data_url = f"data:{mime};base64,{b64}"
 
-                    if el_text.strip() and len(el_text.strip()) > 5:
-                        text_blocks.append(f"\n[Figure: {el_text.strip()}]\n")
+                            try:
+                                api_url = f"{self.proxy_base_url}/image/ocr"
+                                headers = {"Content-Type": "application/json"}
+                                data = {"image_url": image_data_url}
 
-                # --- NARRATIVE TEXT / LIST / OTHER ---
-                else:
-                    if el_text.strip():
-                        element_counts["text"] += 1
-                        text_blocks.append(el_text.strip())
+                                resp = requests.post(api_url, headers=headers, json=data, timeout=60)
+                                resp.raise_for_status()
 
-            # Count pages
-            page_numbers = set()
-            for el in elements:
-                el_metadata = getattr(el, "metadata", None)
-                if el_metadata:
-                    pn = getattr(el_metadata, "page_number", None)
-                    if pn:
-                        page_numbers.add(pn)
+                                ocr_text = resp.json().get("content", "") or resp.json().get("text", "")
+                                if ocr_text.strip():
+                                    text_blocks.append(f"\n[Extracted Image Data]\n{ocr_text.strip()}\n")
+                            except Exception as ocr_err:
+                                self.logger.warning(f"⚠️ OCR proxy failed: {ocr_err}")
+                        
+                        # 5. FALLBACK IF NO IMAGE WAS SAVED
+                        elif el_text.strip() and len(el_text.strip()) > 5:
+                            text_blocks.append(f"\n[Figure: {el_text.strip()}]\n")
 
-            metrics.page_count = len(page_numbers) if page_numbers else 0
-            metrics.extraction_method = "unstructured_hi_res"
+                    else:
+                        if el_text.strip():
+                            element_counts["text"] += 1
+                            text_blocks.append(el_text.strip())
 
-            self.logger.info(
-                f"📄 PDF hi_res results: {metrics.page_count} pages, "
-                f"{element_counts['text']} text blocks, "
-                f"{element_counts['table']} tables, "
-                f"{element_counts['image']} images, "
-                f"{element_counts['title']} titles"
-            )
+                # Count pages
+                page_numbers = set()
+                for el in elements:
+                    el_metadata = getattr(el, "metadata", None)
+                    if el_metadata:
+                        pn = getattr(el_metadata, "page_number", None)
+                        if pn:
+                            page_numbers.add(pn)
 
-            result = "\n\n".join(text_blocks)
+                metrics.page_count = len(page_numbers) if page_numbers else 0
+                metrics.extraction_method = "unstructured_hi_res_with_ocr"
+
+                result = "\n\n".join(text_blocks)
+
+            # --- THE 'WITH' BLOCK ENDS HERE. THE TEMP DIR IS NOW AUTOMATICALLY DELETED. ---
 
             if len(result.strip()) < MIN_TEXT_LENGTH:
                 self.logger.warning(
@@ -381,53 +384,253 @@ class DocumentProcessorV2:
             self.logger.error(f"⚠️ hi_res extraction failed: {e}")
             self.logger.info("🔄 Falling back to pdfplumber...")
             return self._extract_pdf_pdfplumber(content)
-
+        
     def _extract_pdf_pdfplumber(self, content: bytes) -> Tuple[str, DocumentQualityMetrics]:
-        """Fallback PDF extraction using pdfplumber. No image/layout support."""
+        """
+        Improved fallback PDF extraction using pdfplumber.
+        """
         metrics = DocumentQualityMetrics()
-        metrics.extraction_method = "pdfplumber_fallback"
+        metrics.extraction_method = "pdfplumber_improved"
         text_blocks = []
+        current_section = ""        # Track section headers across pages
+        prev_table_headers = []     # For cross-page table continuation
+        extracted_images = []       # Collect base64 images
 
         try:
             with pdfplumber.open(io.BytesIO(content)) as pdf:
                 metrics.page_count = len(pdf.pages)
 
-                for page in pdf.pages:
+                for page_idx, page in enumerate(pdf.pages):
                     page_parts = []
+
+                    # ──────────────────────────────────
+                    # STEP 1: Extract & format tables
+                    # ──────────────────────────────────
+                    table_bboxes = []
+                    table_finder = page.find_tables()
+                    if table_finder:
+                        table_bboxes = [t.bbox for t in table_finder]
 
                     tables = page.extract_tables()
                     if tables:
-                        metrics.has_tables = True
                         for table in tables:
                             if not table:
                                 continue
-                            headers = table[0] if table[0] else []
-                            for row_idx, row in enumerate(table):
+
+                            # --- Skip single-column "wrapper" tables ---
+                            # pdfplumber sometimes wraps the entire page in a
+                            # 1-column table. These are layout artifacts.
+                            max_cols = max(len(row) for row in table if row)
+                            if max_cols <= 1:
+                                continue
+
+                            # --- Filter blob rows ---
+                            clean_rows = []
+                            for row in table:
                                 if not row:
                                     continue
-                                cells = [str(c).strip() if c else "" for c in row]
-                                if row_idx == 0:
-                                    page_parts.append(" | ".join(cells))
-                                else:
-                                    if headers and len(headers) == len(cells):
-                                        row_text = ", ".join(
-                                            f"{str(h).strip()}: {c}"
-                                            for h, c in zip(headers, cells) if c
-                                        )
-                                    else:
-                                        row_text = " | ".join(cells)
-                                    if row_text.strip():
-                                        page_parts.append(row_text)
+                                non_none = [c for c in row if c and c.strip()]
+                                is_blob = (
+                                    len(non_none) == 1
+                                    and max_cols > 1
+                                    and len(non_none[0]) > 200
+                                )
+                                if is_blob:
+                                    continue
+                                clean_rows.append(row)
 
-                    page_text = page.extract_text(layout=False)
+                            if not clean_rows:
+                                continue
+
+                            metrics.has_tables = True
+
+                            # --- Detect headers ---
+                            headers = []
+                            data_start = 0
+
+                            first_row = clean_rows[0]
+                            first_cells = [str(c).strip().replace('\n', ' ') if c else "" for c in first_row]
+
+                            # Check if this is a continuation table:
+                            # first cell is empty → data continues from previous page
+                            is_continuation = (
+                                not first_cells[0]
+                                and any(c for c in first_cells[1:])
+                                and prev_table_headers
+                                and len(prev_table_headers) == len(first_cells)
+                            )
+
+                            if is_continuation:
+                                headers = prev_table_headers
+                                data_start = 0  # All rows are data
+                            else:
+                                # Check if the first row looks like a header
+                                # (short text, no sentences, distinct from data rows)
+                                avg_header_len = sum(len(c) for c in first_cells if c) / max(len([c for c in first_cells if c]), 1)
+                                if avg_header_len < 60:  # Header cells are typically short
+                                    headers = first_cells
+                                    data_start = 1
+                                else:
+                                    data_start = 0
+
+                            # Save headers for potential cross-page continuation
+                            if headers:
+                                prev_table_headers = headers
+
+                            # --- Build formatted output ---
+                            table_lines = ["\n[Table]"]
+
+                            visible_headers = [h for h in headers if h]
+                            if visible_headers:
+                                table_lines.append(" | ".join(visible_headers))
+
+                            for row in clean_rows[data_start:]:
+                                cells = [
+                                    str(c).strip().replace('\n', ' ') if c else ""
+                                    for c in row
+                                ]
+
+                                # Deduplicate merged cells
+                                deduped = []
+                                for i, c in enumerate(cells):
+                                    if i == 0 or c != cells[i - 1]:
+                                        deduped.append(c)
+                                    else:
+                                        deduped.append("")
+                                cells = deduped
+
+                                # Key-value format when headers available
+                                if headers and len(headers) == len(cells):
+                                    parts = []
+                                    for h, c in zip(headers, cells):
+                                        if c and h:
+                                            parts.append(f"{h}: {c}")
+                                        elif c:
+                                            parts.append(c)
+                                    row_text = ". ".join(parts)
+                                else:
+                                    row_text = " | ".join(c for c in cells if c)
+
+                                if row_text.strip():
+                                    table_lines.append(row_text)
+
+                            if len(table_lines) > 1:
+                                page_parts.extend(table_lines)
+
+                    # ──────────────────────────────────
+                    # STEP 2: Extract text EXCLUDING table regions
+                    # ──────────────────────────────────
+                    if table_bboxes:
+                        def _not_in_table(obj):
+                            if obj.get("object_type") != "char":
+                                return True
+                            ox = obj.get("x0", 0)
+                            ot = obj.get("top", 0)
+                            for (x0, top, x1, bottom) in table_bboxes:
+                                if x0 - 2 <= ox <= x1 + 2 and top - 2 <= ot <= bottom + 2:
+                                    return False
+                            return True
+
+                        filtered_page = page.filter(_not_in_table)
+                        page_text = filtered_page.extract_text(layout=False)
+                    else:
+                        page_text = page.extract_text(layout=False)
+
                     if page_text and page_text.strip():
+                        # Track section headers
+                        for line in page_text.strip().split('\n'):
+                            stripped = line.strip()
+                            if re.match(r'^\d+\.\s+[A-Z]', stripped) and len(stripped) < 80:
+                                current_section = stripped
+
                         page_parts.append(page_text.strip())
+
+                    # ──────────────────────────────────
+                    # STEP 3: Extract images as base64
+                    # ──────────────────────────────────
+                    page_images = page.images
+                    if page_images:
+                        metrics.has_images = True
+
+                        for img_idx, img_meta in enumerate(page_images):
+                            try:
+                                x0 = img_meta.get("x0", 0)
+                                top_coord = img_meta.get("top", 0)
+                                x1 = img_meta.get("x1", 0)
+                                bottom_coord = img_meta.get("bottom", 0)
+
+                                width = x1 - x0
+                                height = bottom_coord - top_coord
+
+                                # Skip tiny images (icons, bullets, decorations)
+                                if width < 50 or height < 30:
+                                    continue
+
+                                # Crop with small padding and render at 200 DPI
+                                bbox = (
+                                    max(0, x0 - 5),
+                                    max(0, top_coord - 5),
+                                    min(page.width, x1 + 5),
+                                    min(page.height, bottom_coord + 5),
+                                )
+                                cropped = page.crop(bbox)
+                                rendered = cropped.to_image(resolution=200)
+
+                                buf = io.BytesIO()
+                                rendered.save(buf, format="PNG")
+                                buf.seek(0)
+                                img_bytes = buf.read()
+                                b64_str = base64.b64encode(img_bytes).decode("ascii")
+
+                                extracted_images.append({
+                                    "page": page_idx + 1,
+                                    "index": img_idx,
+                                    "width": int(width),
+                                    "height": int(height),
+                                    "mime_type": "image/png",
+                                    "base64": b64_str,
+                                })
+
+                                page_parts.append(
+                                    f"\n[Image on page {page_idx + 1}: "
+                                    f"diagram/figure {img_idx + 1}, "
+                                    f"{int(width)}x{int(height)}px — "
+                                    f"base64 image stored in metadata]\n"
+                                )
+
+                                self.logger.info(
+                                    f"📸 Extracted image p{page_idx + 1}: "
+                                    f"{int(width)}x{int(height)}px, "
+                                    f"{len(b64_str)} b64 chars"
+                                )
+
+                            except Exception as img_err:
+                                self.logger.warning(
+                                    f"⚠️ Image extract failed p{page_idx + 1}: {img_err}"
+                                )
+
+                    # ──────────────────────────────────
+                    # STEP 4: Cross-page section context
+                    # ──────────────────────────────────
+                    if page_parts and current_section and page_idx > 0:
+                        first_line = page_parts[0].strip().split('\n')[0] if page_parts else ""
+                        if not re.match(r'^\d+\.\s+[A-Z]', first_line):
+                            page_parts.insert(0, f"[Continued: {current_section}]")
 
                     if page_parts:
                         text_blocks.append("\n".join(page_parts))
 
-            self.logger.info(f"📄 pdfplumber fallback: {metrics.page_count} pages extracted")
-            return "\n\n".join(text_blocks), metrics
+            # Store images in metrics for downstream use (e.g., OCR, embedding)
+            if extracted_images:
+                metrics.extracted_images = extracted_images  # type: ignore[attr-defined]
+
+            result = "\n\n".join(text_blocks)
+
+            self.logger.info(
+                f"📄 pdfplumber improved: {metrics.page_count} pages, "
+                f"{len(extracted_images)} images extracted as base64"
+            )
+            return result, metrics
 
         except Exception as e:
             self.logger.error(f"PDF extraction failed: {e}")

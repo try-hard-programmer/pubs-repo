@@ -452,8 +452,8 @@ async def _upload_media_to_supabase(
                 logger.error(f"   ❌ FATAL: Retry failed: {retry_e}")
                 raise retry_e
 
-        # [FIX] Set Expiry to 3 Days (259200 seconds)
-        url_response = supabase.storage.from_(bucket_name).create_signed_url(filename, 259200)
+        # Set Expiry to 10 Years (315360000 seconds) for CRM permanence
+        url_response = supabase.storage.from_(bucket_name).create_signed_url(filename, 315360000)
         
         if isinstance(url_response, dict):
              public_url = url_response.get("signedURL") or url_response.get("signedUrl")
@@ -695,31 +695,77 @@ async def process_webhook_message_v2(
         if acquired:
             try:
                 active_ticket = None
+                # [FIX]: Add .eq("chat_id", chat_id) to the query
                 ticket_query = supabase.table("tickets").select("id, assigned_agent_id, priority")\
-                    .eq("customer_id", cust_id).in_("status", ["open", "in_progress"]).limit(1).execute()
+                    .eq("customer_id", cust_id)\
+                    .eq("chat_id", chat_id)\
+                    .in_("status", ["open", "in_progress"])\
+                    .limit(1).execute()
                 
                 if ticket_query.data:
                     # Case A: Existing Ticket Found
                     active_ticket = ticket_query.data[0]
+                    target_ticket_id = active_ticket.get("id")
+                    
+                    # SAFE JSONB MERGE: Preserve existing data, update flags
+                    current_metadata = active_ticket.get("metadata") or {}
+                    current_metadata.update({
+                        "is_group": message_metadata.get("is_group", False),
+                        "following_up": False  
+                    })
+
+                    supabase.table("tickets").update({
+                        "metadata": current_metadata
+                    }).eq("id", target_ticket_id).execute()
+
                     if active_ticket.get("assigned_agent_id"): 
                         return {**res, "handled_by": "human_ticket"}
                     
-                    ai_priority = str(active_ticket.get("priority")).lower() # its not only medium so lets data decide
-                    target_ticket_id = active_ticket.get("id")
+                    ai_priority = str(active_ticket.get("priority")).lower() 
                     ticket_ready = True
                 else:
-                    # Case B: Create New Ticket
-                    ticket_config = parse_agent_config(agent.get("ticketing_config"))
+                    # --- FIX START: Retrieve Config from the AI Agent, not the Gateway ---
+                    chat_info = supabase.table("chats").select("ai_agent_id").eq("id", chat_id).single().execute()
+                    
+                    # Target the AI Agent if available, otherwise fallback to the Gateway Agent
+                    target_agent_id = agent.get("id")
+                    if chat_info.data and chat_info.data.get("ai_agent_id"):
+                        target_agent_id = chat_info.data["ai_agent_id"]
+
+                    # Fetch the raw JSON settings explicitly for this agent
+                    settings_res = supabase.table("agent_settings").select("ticketing_config").eq("agent_id", target_agent_id).execute()
+                    
+                    raw_config = None
+                    if settings_res.data:
+                        raw_config = settings_res.data[0].get("ticketing_config")
+                    
+                    # Fallback to gateway agent if AI agent has no config
+                    if not raw_config:
+                        raw_config = agent.get("ticketing_config")
+
+                    ticket_config = parse_agent_config(raw_config)
+                    # --- FIX END ---
+                    
                     new_ticket_data = TicketCreate(
                         chat_id=chat_id, customer_id=cust_id,
                         title=f"[LOW] New Interaction - {message_content[:40]}",
                         description=f"First Message: {message_content}\n\n[Auto-created: Low Priority Default]",
                         priority=TicketPriority.LOW, category="General"
                     )
-                    # Create ticket returns the full Ticket object
-                    new_ticket = await ticket_svc.create_ticket(new_ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
                     
+                    logger.info(f"Loaded Ticketing Config for Agent {target_agent_id}: {ticket_config} <<<<<<")
+                    
+                    new_ticket = await ticket_svc.create_ticket(new_ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
                     target_ticket_id = new_ticket.id 
+                    
+                    # Inject metadata into the newly created ticket
+                    supabase.table("tickets").update({
+                        "metadata": {
+                            "is_group": message_metadata.get("is_group", False),
+                            "following_up": False
+                        }
+                    }).eq("id", target_ticket_id).execute()
+
                     ai_priority = "low"
                     ticket_ready = True
             except Exception as e:
@@ -746,7 +792,7 @@ async def process_webhook_message_v2(
 # ============================================
 
 @router.post("/wa-unofficial", response_model=WebhookRouteResponse)
-async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage, secret: str = Depends(get_webhook_secret)):
+async def whatsapp_unofficial_webhook( message: WhatsAppUnofficialWebhookMessage, secret: str = Depends(get_webhook_secret)):
     # [FIX] Import re at the very top of function to prevent UnboundLocalError
     import re 
     
@@ -758,6 +804,9 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
         system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
         if message.dataType in system_events:
             return JSONResponse(content={"success": True, "status": "processed_system_event"})
+
+        if message.dataType == "message_sent":
+            return JSONResponse(content={"success": True, "status": "logged_sent"})
 
         # Guard: data must be a non-null dict to proceed
         if not message.data or not isinstance(message.data, dict):
@@ -772,14 +821,13 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
              return JSONResponse(content={"status": "ignored", "reason": "malformed_structure"})
         
         if data_content.get("id", {}).get("fromMe", False) or data_content.get("fromMe", False):
-             # [OPTIONAL] You can comment this return out if you rely on fromMe events to update message status/content
-             # But usually for clean dashboard, we ignore fromMe or process it carefully.
              return JSONResponse(content={"status": "ignored", "reason": "from_me"})
 
         dedup_key = f"{whatsapp_id}_{message.dataType}"
         if await is_duplicate_message(dedup_key):
             return JSONResponse(content={"status": "ignored", "reason": "duplicate_redis_cache"})
-        
+
+        logger.info(f"[WEBHOOK CHECKPOINT] Passed all early guards. Proceeding to process WA ID: {whatsapp_id}")
 
         # =========================================================================
         # 2.5 THE TRUE LOOP SHIELD (Block outgoing echoes using Integration Data)
@@ -973,7 +1021,6 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
             if not is_mentioned_raw:
                 raw_caption = data_content.get("caption", "")
                 raw_body = data_content.get("body", "")
-                logger.info(f"[TRIPWIRE 6] 🛬 RAW PAYLOAD HIT PYTHON: {raw_body[:200]}...") # Only log first 200 chars to avoid Base64 spam
                 
                 raw_text = ""
                 if raw_caption:
@@ -1101,7 +1148,7 @@ async def whatsapp_unofficial_webhook(message: WhatsAppUnofficialWebhookMessage,
                 "is_lid": "@lid" in standard_message.phone_number,
                 "media_url": standard_message.media_url,
                 "is_group": is_group,
-                "participant": meta.get("group_participant"), 
+                "participant": final_participant_number,
                 "sender_display_name": meta.get("real_sender_name"),
                 "real_contact_number": final_participant_number,
             },

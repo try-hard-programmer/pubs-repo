@@ -28,10 +28,10 @@ class TicketService:
         Generates a unique ticket ID based on Time + Randomness.
         Format: TKT-YYMMDDHHMMSS-RAND (e.g., TKT-240118120001-A1B2)
         """
-        prefix = "TKT-"
+        prefix = "TKT-PLP-"
         if ticket_config and isinstance(ticket_config, dict):
-            prefix = ticket_config.get("ticketPrefix", "TKT-").strip()
-            
+            prefix = ticket_config.get("ticketPrefix", "TKT-PLP-").strip()
+
         # 1. Get compact timestamp (Year, Month, Day, Hour, Minute, Second)
         timestamp = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
         
@@ -50,7 +50,7 @@ class TicketService:
         actor_type: ActorType = ActorType.SYSTEM
     ) -> Ticket:
         
-        ticket_num = self._generate_ticket_number(ticket_config)
+        ticket_num = self._generate_ticket_number(organization_id, ticket_config)
         
         logger.info(f"🎫 Creating Ticket {ticket_num} for Chat {data.chat_id}")
 

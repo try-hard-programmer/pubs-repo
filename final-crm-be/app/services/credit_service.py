@@ -45,13 +45,11 @@ class CreditService:
     async def add_transaction(self, data: CreditTransactionCreate) -> CreditTransaction:
         """Record a credit transaction (maps to credit_usage table)."""
         try:
-            # ✅ Safe extraction with defaults
             metadata = data.metadata or {}
-            provider = metadata.get("provider") or "unknown"
-            model = metadata.get("model") or None
-            input_tokens = int(metadata.get("input_tokens") or 0)
-            output_tokens = int(metadata.get("output_tokens") or 0)
-            agent_id = metadata.get("agent_id") or None
+            
+            # Extract variables safely
+            input_tokens = int(metadata.get("input_tokens", 0))
+            output_tokens = int(metadata.get("output_tokens", 0))
             
             # ✅ Map your CreditTransactionCreate to credit_usage columns
             payload = {
@@ -61,11 +59,8 @@ class CreditService:
                 "credits_used": max(1, int(abs(data.amount or 0) * 1000000)),
                 "cost_usd": abs(data.amount or 0),
                 "status": "completed",
-                "provider": provider,
-                "model": model,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "agent_id": agent_id,
                 "metadata": metadata
             }
             

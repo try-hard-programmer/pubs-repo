@@ -2,6 +2,9 @@ import logging
 import aiohttp
 import asyncio
 import json
+import pytz
+
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from app.config import settings
 from app.services.mcp_service import get_mcp_service
@@ -115,19 +118,26 @@ class DynamicCRMAgentV2:
             language = persona.get("language", "english")
             custom_instructions = persona.get("customInstructions", "").strip()
             handoff = advanced.get("handoffTriggers", {})
-            lang_instruction = f"Reply ONLY in {language}."            
+            lang_instruction = f"Reply ONLY in {language}."    
+
+            tz = pytz.timezone("Asia/Jakarta")
+            now = datetime.now(tz)
+            current_time = now.strftime("%H:%M")
+            current_date = now.strftime("%Y-%m-%d")        
 
             use_custom = len(custom_instructions) > 10
 
             # ── SWITCH: custom instructions vs default persona ──────────────────────
             match use_custom:
                 case True:
-                    prompt = f"""
-        {custom_instructions}
-        """
+                    prompt = custom_instructions\
+                        .replace("{name_user}", name_user)\
+                        .replace("{current_time}", current_time)\
+                        .replace("{current_date}", current_date)
                 case False:
                     prompt = f"""
                     You are {name}. Tone: {tone}. User: {name_user}. LANGUAGE RULE: {lang_instruction}
+                    Current time: {current_time}. Current date: {current_date}.
                     ## CORE INSTRUCTION
                     Please answer the user's questions based on the provided **KNOWLEDGE BASE**. 
                     

@@ -135,10 +135,10 @@ class MCPService:
             data = schema_resp["data"]
 
             # Log the real raw output so you can verify the server response
-            logger.info(
-                f"📦 [REST-PROXY] RAW /mcp/schema from '{server_name}':\n"
-                + json.dumps(data, indent=2)
-            )
+            # logger.info(
+            #     f"📦 [REST-PROXY] RAW /mcp/schema from '{server_name}':\n"
+            #     + json.dumps(data, indent=2)
+            # )
 
             resources = data.get("resources", [])
             relationships = data.get("relationships", [])

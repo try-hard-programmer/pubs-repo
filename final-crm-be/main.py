@@ -18,7 +18,7 @@ from app.config import settings
 from app.services.llm_queue_service import get_llm_queue
 
 # Import API routers
-from app.api import documents, agents, chat, organizations, file_manager, crm_agents, crm_chats, whatsapp, webhook, websocket as ws_router, telegram
+from app.api import documents, agents, chat, jobs_scheduler, organizations, file_manager, crm_agents, crm_chats, whatsapp, webhook, websocket as ws_router, telegram
 
 # Import services
 from app.services import get_agent_service
@@ -206,6 +206,7 @@ app.include_router(whatsapp.router)  # WhatsApp Integration endpoints (/whatsapp
 app.include_router(webhook.router)  # Webhook endpoints for external services (/webhook/*)
 app.include_router(ws_router.router)  # WebSocket endpoint for real-time notifications (/ws/*)
 app.include_router(telegram.router)   # Telegram Integration endpoints (/telegram/*)
+app.include_router(jobs_scheduler.router)       # Job Integration endpoints (/jobs/*)
 
 # Custom OpenAPI schema with enhanced documentation
 def custom_openapi():
@@ -286,6 +287,10 @@ def custom_openapi():
         {
             "name": "websocket",
             "description": "⚡ **WebSocket** - Real-time notifications for chat updates and new messages. Frontend clients can connect to receive instant updates for their organization. Requires JWT authentication."
+        },
+        {
+            "name": "Jobs",
+            "description": "⚙️ **Automated Background Jobs** - Internal endpoints meant to be triggered by schedulers like Cronicle."
         }
     ]
 

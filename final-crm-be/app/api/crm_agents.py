@@ -1187,17 +1187,15 @@ async def test_mcp_connection(
 @router.post(
     "/{agent_id}/mcp/initialize",
     summary="Initialize Palapa Tables as AI Tools",
-    description="Crawls the connected Palapa database, extracts schemas, and translates them into OpenAI tools."
+    description="Crawls the connected Palapa database, extracts schemas, translates them into OpenAI tools, and permanently saves them to the DB."
 )
 async def init_mcp_tools(
     agent_id: str,
     current_user: User = Depends(get_current_user)
 ):
-    """
-    The 'initialize' process. Called by the frontend to fetch and translate Palapa schemas.
-    Currently set to log the output and return it to the FE.
-    """
-    import json
+    from datetime import datetime, timezone
+    from fastapi import HTTPException, status
+    
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
@@ -1211,14 +1209,42 @@ async def init_mcp_tools(
         service = get_mcp_service()
         tools = await service.get_all_tools_schema(supabase, agent_id)
         
-        # 3. LOG IT OUT FIRST (As requested)
-        logger.info(f"🛠️ [INIT] Successfully mapped {len(tools)} tools for Agent {agent_id}.")
-        logger.info(f"🛠️ [INIT] Payload sending to Frontend:\n{json.dumps(tools, indent=2)}")
-        
-        # 4. Return to FE so your HTML can use it
+        if not tools:
+            return {"success": False, "message": "No tables found to synchronize.", "tools_count": 0, "tools": []}
+
+        # 3. Format for Database Upsert
+        registry_data = []
+        for t in tools:
+            func = t.get("function", {})
+            name = func.get("name")
+            
+            # Extract the server name (e.g., "test_mcp" from "test_mcp__orders")
+            server_name = name.split("__")[0] if "__" in name else "unknown"
+            
+            registry_data.append({
+                "agent_id": agent_id,
+                "server_name": server_name,
+                "tool_name": name,
+                "description": func.get("description", ""),
+                "input_schema": func.get("parameters", {}),
+                "is_active": True,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+
+        # 4. Bulk Upsert into the Registry
+        # on_conflict="agent_id, tool_name" ensures we update schemas if tables change, rather than duplicating
+        db_response = supabase.table("mcp_tool_registry").upsert(
+            registry_data, 
+            on_conflict="agent_id, tool_name"
+        ).execute()
+
+        # Removed the massive JSON payload log, kept the success confirmation
+        logger.info(f"💾 [INIT] Successfully saved {len(registry_data)} tools to DB for Agent {agent_id}.")
+
+        # 5. Return to FE
         return {
             "success": True,
-            "message": f"Successfully initialized {len(tools)} database tables as AI tools.",
+            "message": f"Successfully initialized and saved {len(tools)} database tables as AI tools.",
             "tools_count": len(tools),
             "tools": tools
         }
@@ -1230,6 +1256,5 @@ async def init_mcp_tools(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail=f"Schema initialization failed: {str(e)}"
-        )
-    
+        )    
     
