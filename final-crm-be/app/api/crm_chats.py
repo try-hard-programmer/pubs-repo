@@ -356,7 +356,6 @@ async def create_ticket(
 # ============================================
 # CUSTOMER ENDPOINTS
 # ============================================
-
 @router.get(
     "/customers",
     response_model=CustomerListResponse,
@@ -365,6 +364,7 @@ async def create_ticket(
 )
 async def get_customers(
     search: Optional[str] = Query(None, description="Search by name, email, or phone"),
+    channel: Optional[str] = Query(None, description="Filter by integration channel (e.g., whatsapp)"),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
     current_user: User = Depends(get_current_user)
@@ -377,22 +377,28 @@ async def get_customers(
         # Build query
         query = supabase.table("customers").select("*", count="exact").eq("organization_id", organization_id)
 
-        # 🛑 1. THE GROUP EXCLUSION 🛑
-        # Exclude WhatsApp/Telegram groups directly in the database to preserve exact pagination limits.
-        # We must allow rows where 'is_group' is missing (null) OR explicitly false.
+        # 🛑 1. THE CHANNEL FILTER 🛑
+        if channel:
+            clean_channel = channel.strip().lower()
+            query = query.contains("metadata", {"channels_used": [clean_channel]})
+
+        # 🛑 2. THE GROUP EXCLUSION 🛑
         query = query.or_("metadata->>is_group.is.null,metadata->>is_group.eq.false")
 
-        # 🛑 2. THE SEARCH VALIDATION 🛑
+        # 🛑 3. THE SEARCH VALIDATION 🛑
         if search is not None:
             clean_search = search.strip()
-            if clean_search:  # Proceed only if not empty after stripping
+            if clean_search:  
                 if len(clean_search) < 3:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Search query must be at least 3 characters long."
-                    )
-                # Apply sanitized search filter
-                query = query.or_(f"name.ilike.%{clean_search}%,email.ilike.%{clean_search}%,phone.ilike.%{clean_search}%")
+                    raise HTTPException(status_code=400, detail="Search query must be at least 3 characters long.")
+                
+                search_filter = (
+                    f"name.ilike.%{clean_search}%,"
+                    f"email.ilike.%{clean_search}%,"
+                    f"phone.ilike.%{clean_search}%,"
+                    f"metadata->>whatsapp_name.ilike.%{clean_search}%"
+                )
+                query = query.or_(search_filter)
 
         # Apply pagination
         query = query.range(skip, skip + limit - 1).order("created_at", desc=True)
@@ -410,13 +416,13 @@ async def get_customers(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching customers: {e}")
+        import logging
+        logging.error(f"Error fetching customers: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch customers"
         )
-    
-    
+      
 @router.get(
     "/customers/{customer_id}",
     response_model=Customer,

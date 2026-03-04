@@ -26,14 +26,14 @@ class CreditService:
         return self._client
 
     async def get_balance(self, organization_id: str) -> CreditBalance:
-        """Calculate current balance by summing all cost_usd (negative = spent)."""
+        """Calculate current balance by summing all cost (negative = spent)."""
         try:
             response = self.client.table("credit_usage")\
-                .select("cost_usd")\
+                .select("cost")\
                 .eq("organization_id", organization_id)\
                 .execute()
             
-            total = -sum(float(item.get("cost_usd", 0) or 0) for item in response.data) if response.data else 0.0
+            total = -sum(float(item.get("cost", 0) or 0) for item in response.data) if response.data else 0.0
             
             logger.info(f"💰 Balance for org {organization_id}: ${total:.6f}")
             return CreditBalance(organization_id=organization_id, total_balance=total)
@@ -57,7 +57,7 @@ class CreditService:
                 "query_type": self._map_to_query_type(data.description or ""),
                 "query_text": (data.description or "")[:500],  # ✅ Truncate if too long
                 "credits_used": max(1, int(abs(data.amount or 0) * 1000000)),
-                "cost_usd": abs(data.amount or 0),
+                "cost": abs(data.amount or 0), # UPDATED: changed from cost_usd to cost
                 "status": "completed",
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -78,7 +78,7 @@ class CreditService:
             return CreditTransaction(
                 id=trx.get("id"),
                 organization_id=trx.get("organization_id"),
-                amount=-(trx.get("cost_usd") or 0),  # Negative for spending
+                amount=-(trx.get("cost") or 0),  # UPDATED: changed from cost_usd to cost
                 transaction_type=TransactionType.USAGE,
                 description=trx.get("query_text") or "",
                 metadata=trx.get("metadata") or {},
@@ -145,7 +145,7 @@ class CreditService:
                 transactions.append(CreditTransaction(
                     id=trx.get("id"),
                     organization_id=trx.get("organization_id"),
-                    amount=-(trx.get("cost_usd") or 0),
+                    amount=-(trx.get("cost") or 0), # UPDATED: changed from cost_usd to cost
                     transaction_type=TransactionType.USAGE,
                     description=trx.get("query_text") or "",
                     metadata=trx.get("metadata") or {},
@@ -162,8 +162,9 @@ class CreditService:
     async def get_usage_stats(self, organization_id: str) -> dict:
         """Get usage statistics for an organization."""
         try:
+            # UPDATED: removed 'provider' from select, changed 'cost_usd' to 'cost'
             response = self.client.table("credit_usage")\
-                .select("cost_usd, query_type, provider, created_at")\
+                .select("cost, query_type, created_at, metadata")\
                 .eq("organization_id", organization_id)\
                 .execute()
             
@@ -175,20 +176,21 @@ class CreditService:
                     "by_provider": {}
                 }
             
-            total_spent = sum(float(item.get("cost_usd", 0) or 0) for item in response.data)
+            total_spent = sum(float(item.get("cost", 0) or 0) for item in response.data)
             
             # Group by type
             by_type = {}
             for item in response.data:
                 qtype = item.get("query_type", "unknown")
-                cost = float(item.get("cost_usd", 0) or 0)
+                cost = float(item.get("cost", 0) or 0)
                 by_type[qtype] = by_type.get(qtype, 0.0) + cost
             
-            # Group by provider
+            # Group by provider (now fetched from metadata since it's removed from columns)
             by_provider = {}
             for item in response.data:
-                provider = item.get("provider", "unknown")
-                cost = float(item.get("cost_usd", 0) or 0)
+                metadata = item.get("metadata") or {}
+                provider = metadata.get("provider", "unknown")
+                cost = float(item.get("cost", 0) or 0)
                 by_provider[provider] = by_provider.get(provider, 0.0) + cost
             
             stats = {
