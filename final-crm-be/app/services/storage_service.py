@@ -153,6 +153,10 @@ class StorageService:
             storage_path = self._get_storage_path(file_id, folder_path)
 
             # Upload file
+            print("UPLOAD FILE")
+            print(bucket_name)
+            print(storage_path)
+            print(file_id)
             response = self.client.storage.from_(bucket_name).upload(
                 path=storage_path,
                 file=file_content,
@@ -169,11 +173,13 @@ class StorageService:
             public_url = self.get_file_url(organization_id, file_id, folder_path)
 
             return {
+                "id": file_id,
                 "bucket_name": bucket_name,
                 "storage_path": storage_path,
                 "public_url": public_url,
                 "size": len(file_content),
                 "filename": filename,
+                "organization_id": organization_id,
                 "status": "uploaded"
             }
 

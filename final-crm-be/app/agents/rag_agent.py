@@ -26,7 +26,7 @@ class RAGAgent(BaseAgent):
     def __init__(self):
         super().__init__()
         base = settings.PROXY_BASE_URL.rstrip("/")
-        self.proxy_url = f"{base}/chat"
+        self.proxy_url = f"{base}/chat/filemanager"
         self.http_timeout = aiohttp.ClientTimeout(total=120)
     def get_agent_name(self) -> str:
         """Get unique agent name"""
@@ -52,7 +52,7 @@ class RAGAgent(BaseAgent):
         if not base:
             raise RuntimeError("PROXY_BASE_URL is not set")
 
-        self.proxy_url = f"{base}/chat"
+        self.proxy_url = f"{base}/chat/filemanager"
         self.http_timeout = aiohttp.ClientTimeout(total=120)
         self._initialized = True
 
@@ -107,7 +107,6 @@ class RAGAgent(BaseAgent):
         reranked_docs = rr.get("documents", [])
         reranked_metas = rr.get("metas", [])
         scores = rr.get("scores", [])
-        print("RERANK      ", rr)
 
 
         top_score = scores[0] if scores else 0.0

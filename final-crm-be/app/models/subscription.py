@@ -34,7 +34,7 @@ class SubscriptionUpdate(BaseModel):
 
 class Subscription(SubscriptionBase):
     """Schema for returning subscription data"""
-    id: int
+    id: str
     organization_id: str
     created_at: datetime
     updated_at: datetime

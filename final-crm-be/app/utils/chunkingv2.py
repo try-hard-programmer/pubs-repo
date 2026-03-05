@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import tiktoken
@@ -277,21 +278,36 @@ def split_into_chunks_with_metadata(
             section_title = heading_match.group(1).strip()
         
         chunks.append(chunk_text)
-        metadatas.append({
-            "file_id": file_id,
-            "filename": filename,
-            "agent_id": agent_id,
-            "agent_name": agent_name,
-            "organization_id": organization_id,
-            "chunk_index": idx,
-            "total_chunks": len(raw_chunks),
-            "token_count": token_count,
-            "doc_id": file_id,
-            "processor": "v2",
-            "has_table": has_table,
-            "has_figure": has_figure,
-            "has_heading": has_heading,
-            "section_title": section_title,
-        })
+        if agent_id == "file_manager":
+            metadatas.append({
+                "file_id": file_id,
+                "organization_id": organization_id,
+                "collection_name": f"org_{organization_id}",
+                "chunks_count": len(chunks),
+                "embedding_model": "text-embedding-ada-002",
+                "embedded_at": datetime.utcnow().isoformat(),
+                "filename": filename,
+                "extension": filename.rsplit(".", 1)[-1].lower() if "." in filename else "",
+                "chunks_count": len(chunks),
+                'is_trashed': False,
+                "doc_id": file_id,
+            })
+        else:
+            metadatas.append({
+                "file_id": file_id,
+                "filename": filename,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "organization_id": organization_id,
+                "chunk_index": idx,
+                "total_chunks": len(raw_chunks),
+                "token_count": token_count,
+                "doc_id": file_id,
+                "processor": "v2",
+                "has_table": has_table,
+                "has_figure": has_figure,
+                "has_heading": has_heading,
+                "section_title": section_title,
+            })
     
     return chunks, metadatas

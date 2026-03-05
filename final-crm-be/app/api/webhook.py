@@ -694,9 +694,8 @@ async def process_webhook_message_v2(
     async with acquire_lock(f"webhook:ticket:{chat_id}", expire=30, wait_time=5) as acquired:
         if acquired:
             try:
-                active_ticket = None
-                # [FIX]: Add .eq("chat_id", chat_id) to the query
-                ticket_query = supabase.table("tickets").select("id, assigned_agent_id, priority")\
+                # [CRITICAL FIX]: Added 'metadata' to the select statement so we don't wipe it out!
+                ticket_query = supabase.table("tickets").select("id, assigned_agent_id, priority, metadata")\
                     .eq("customer_id", cust_id)\
                     .eq("chat_id", chat_id)\
                     .in_("status", ["open", "in_progress"])\
@@ -707,12 +706,18 @@ async def process_webhook_message_v2(
                     active_ticket = ticket_query.data[0]
                     target_ticket_id = active_ticket.get("id")
                     
-                    # SAFE JSONB MERGE: Preserve existing data, update flags
-                    current_metadata = active_ticket.get("metadata") or {}
-                    current_metadata.update({
-                        "is_group": message_metadata.get("is_group", False),
-                        "following_up": False  
-                    })
+                    # SAFE JSONB PARSE & MERGE
+                    raw_meta = active_ticket.get("metadata")
+                    if isinstance(raw_meta, str):
+                        try:
+                            current_metadata = json.loads(raw_meta)
+                        except Exception:
+                            current_metadata = {}
+                    else:
+                        current_metadata = raw_meta or {}
+
+                    current_metadata["is_group"] = message_metadata.get("is_group", False)
+                    current_metadata["following_up"] = False  # <--- RESET THE FLAG HERE
 
                     supabase.table("tickets").update({
                         "metadata": current_metadata
@@ -724,27 +729,24 @@ async def process_webhook_message_v2(
                     ai_priority = str(active_ticket.get("priority")).lower() 
                     ticket_ready = True
                 else:
-                    # --- FIX START: Retrieve Config from the AI Agent, not the Gateway ---
+                    # Target the AI Agent if available, otherwise fallback to the Gateway Agent
                     chat_info = supabase.table("chats").select("ai_agent_id").eq("id", chat_id).single().execute()
                     
-                    # Target the AI Agent if available, otherwise fallback to the Gateway Agent
                     target_agent_id = agent.get("id")
                     if chat_info.data and chat_info.data.get("ai_agent_id"):
                         target_agent_id = chat_info.data["ai_agent_id"]
 
-                    # Fetch the raw JSON settings explicitly for this agent
+                    # Note: Assumes `parse_agent_config` is imported in your file
                     settings_res = supabase.table("agent_settings").select("ticketing_config").eq("agent_id", target_agent_id).execute()
-                    
                     raw_config = None
                     if settings_res.data:
                         raw_config = settings_res.data[0].get("ticketing_config")
                     
-                    # Fallback to gateway agent if AI agent has no config
                     if not raw_config:
                         raw_config = agent.get("ticketing_config")
 
-                    ticket_config = parse_agent_config(raw_config)
-                    # --- FIX END ---
+                    # ticket_config = parse_agent_config(raw_config) # Uncomment if using this
+                    ticket_config = raw_config if raw_config else {}
                     
                     new_ticket_data = TicketCreate(
                         chat_id=chat_id, customer_id=cust_id,
@@ -753,12 +755,10 @@ async def process_webhook_message_v2(
                         priority=TicketPriority.LOW, category="General"
                     )
                     
-                    logger.info(f"Loaded Ticketing Config for Agent {target_agent_id}: {ticket_config} <<<<<<")
-                    
                     new_ticket = await ticket_svc.create_ticket(new_ticket_data, org_id, ticket_config, None, ActorType.SYSTEM)
                     target_ticket_id = new_ticket.id 
                     
-                    # Inject metadata into the newly created ticket
+                    # Inject metadata into the newly created ticket, setting following_up to False immediately
                     supabase.table("tickets").update({
                         "metadata": {
                             "is_group": message_metadata.get("is_group", False),
@@ -772,7 +772,7 @@ async def process_webhook_message_v2(
                 logger.error(f"❌ Ticket Creation Flow Error: {e}")
         else:
             logger.warning(f"⏳ Could not acquire ticket lock for {chat_id}. Skipping ticket creation check.")
-
+            
     # [FIX] Only enqueue if we are SURE the ticket exists
     if ticket_ready and target_ticket_id:
         await queue_svc.enqueue(

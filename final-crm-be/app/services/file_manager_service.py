@@ -13,6 +13,7 @@ from datetime import datetime
 from supabase import Client
 
 from app.services.storage_service import get_storage_service, StorageService
+from app.services.storage_usage_service import StorageService as StorageV2
 from app.services.chromadb_service import ChromaDBService
 from app.services.document_processor import DocumentProcessor
 from app.utils import split_into_chunks, to_clean_text_from_strs
@@ -169,7 +170,6 @@ class FileManagerService:
             }
 
             if name:
-                print("EDIT FOLDER NAME", name)
                 # Check for duplicate file
                 search_file = (
                     self.client.table("files")
@@ -868,7 +868,6 @@ class FileManagerService:
         Returns:
             Updated file object with new star status
         """
-        print("Favorite Service")
         try:
             # Get file data
             file_response = self.client.table("files")\
@@ -963,9 +962,24 @@ class FileManagerService:
                     logger.info(f"🗑️  Deleted {deleted_chunks} chunks from ChromaDB for file: {file_id}")
                 except Exception as chroma_error:
                     logger.warning(f"⚠️  ChromaDB deletion failed (non-critical): {chroma_error}")
+                
 
-                # 2. Delete from Supabase Storage
+                # 2. Count Storage Usage
                 try:
+                    storage_usage_service = StorageV2()
+                    storage_usage_service.track_file_usage(
+                        organization_id=organization_id,
+                        mime_type=file_data.get("mime_type"),
+                        file_bytes=file_data.get("size", 0),
+                        operation="remove"
+                    )
+                    logger.info(f"📊 Updated storage usage for file: {file_id}")
+                except Exception as usage_error:
+                    logger.warning(f"⚠️  Storage usage update failed (non-critical): {usage_error}")
+
+                # 3. Delete from Supabase Storage
+                try:
+                    storage_svc = StorageService()
                     self.storage_service.delete_file(
                         organization_id=organization_id,
                         file_id=file_id,
@@ -1213,7 +1227,6 @@ class FileManagerService:
         Returns:
             list: A list of matching file records or metadata dictionaries.
         """
-        print("QUERY" , query)
 
         response = self.client.table("files")\
             .select("*")\
@@ -1260,9 +1273,6 @@ class FileManagerService:
                 if len(pdf.pages) > 0:
                     # Extract dari halaman pertama
                     text = pdf.pages[0].extract_text()
-                    
-                    print(f"EXTRACT: {text[:200] if text else 'NONE'}")
-                    print(f"LENGTH: {len(text) if text else 0}")
                     
                     # Check apakah ada text
                     if text and len(text.strip()) > 10:
@@ -1322,8 +1332,6 @@ class FileManagerService:
 
             #  please clear text from emoji and entertain only plain text
             text = re.sub(r'[^\x00-\x7F]+', ' ', text)
-
-            print("Clear Text :", text)
 
             # 2. Split into chunks
             chunks = self._get_chunks_by_type(text, extension)

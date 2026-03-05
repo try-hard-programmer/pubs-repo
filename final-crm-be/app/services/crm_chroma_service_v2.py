@@ -96,6 +96,7 @@ class CRMChromaServiceV2:
         proxy_url = getattr(settings, "CRM_EMBEDDING_API_URL", None) or default_proxy_url
         
         self.embedding_fn = LocalProxyEmbeddingFunction(base_url=proxy_url)
+        
         self.credit_service = get_credit_service()
         
         # Lazy load reranker
@@ -222,7 +223,7 @@ class CRMChromaServiceV2:
                             amount=-cost, 
                             description=f"Knowledge Embedding ({len(texts)} chunks)",
                             transaction_type=TransactionType.USAGE,
-                            metadata={"agent_id": agent_id, "provider": "openai"}
+                            metadata={"agent_id": agent_id if agent_id != "file_manager" else None, "provider": "openai"}
                         ))
                         
                         logger.info(f"💰 Deduction successful. Transaction Object: {tx_result}")
@@ -233,9 +234,17 @@ class CRMChromaServiceV2:
                     logger.error(f"🚨 BILLING CRASHED (Money saved, but logic failed): {billing_err}")
 
             # 💾 STORAGE LOGIC
-            collection = self.get_or_create_collection(agent_id)
+            collection = self.get_or_create_collection(f"org_{organization_id}" if agent_id == "file_manager" else agent_id)
             ids = [f"{m.get('doc_id')}_{i}" for i, m in enumerate(metadatas)]
-            
+            print("COLLECTION ",collection)
+            if agent_id == "file_manager":
+                filename = metadatas[0].get("filename", "unknown.docx")
+                # Buat prefixed texts
+                prefixed_texts = [f"[File: {filename}]\n\n{text}" for text in texts]
+                # Overwrite texts
+                texts = prefixed_texts
+            print("TEXTS CLEANS ", texts)
+            print("METAS ", metadatas)
             collection.add(embeddings=embeddings, documents=texts, metadatas=metadatas, ids=ids)
             logger.info(f"✅ Successfully stored {len(texts)} chunks.")
             return True

@@ -1,6 +1,6 @@
 import logging
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase import create_client, Client
 
 from app.config import settings
@@ -23,21 +23,49 @@ class SubscriptionService:
             raise RuntimeError("Supabase not configured")
         return self._client
 
-    async def get_subscription(self, organization_id: str) -> Optional[Subscription]:
-        """Fetch the active subscription for an organization."""
+    async def get_subscription(self, organization_id: str) -> Optional[dict]:
+        """
+        Fetch the active subscription. 
+        If none exists, structurally enforce a default Free Tier via Lazy Initialization.
+        """
         try:
+            # 1. Attempt to fetch existing
             response = self.client.table("subscriptions")\
                 .select("*")\
                 .eq("organization_id", organization_id)\
                 .execute()
             
-            if not response.data:
+            if response.data:
+                return response.data[0]
+
+            # 2. No subscription exists? Auto-create the default tier immediately.
+            logger.info(f"🆕 No subscription found for Org {organization_id}. Auto-provisioning Free Tier.")
+            
+            now = datetime.utcnow()
+            default_subscription = {
+                "organization_id": organization_id,
+                "plan_name": "Free Tier",
+                "status": "active",  # Matches your SubscriptionStatus enum
+                "total_credits": 0,  
+                "used_credits": 0,
+                "total_cost": 0.0,
+                "start_date": now.isoformat(),
+                "end_date": (now + timedelta(days=30)).isoformat(), # 1 month expiry
+                "updated_at": now.isoformat()
+            }
+
+            # Insert safely
+            insert_response = self.client.table("subscriptions").insert(default_subscription).execute()
+            
+            if not insert_response.data:
+                logger.error(f"❌ Failed to auto-provision subscription for {organization_id}")
                 return None
                 
-            return Subscription(**response.data[0])
-            
+            logger.info(f"✅ Free Tier provisioned successfully for {organization_id}")
+            return insert_response.data[0]
+
         except Exception as e:
-            logger.error(f"❌ Failed to get subscription for org {organization_id}: {e}")
+            logger.error(f"❌ Error fetching/creating subscription for {organization_id}: {e}")
             return None
 
     async def upsert_subscription(self, data: SubscriptionCreate) -> Subscription:

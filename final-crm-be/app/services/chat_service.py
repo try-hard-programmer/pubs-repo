@@ -310,7 +310,8 @@ class ChatService:
         user_message: str,
         assistant_message: str,
         agent_name: str,
-        reference_documents: Optional[List[Dict[str, Any]]] = None
+        reference_documents: Optional[List[Dict[str, Any]]] = None,
+        structured_data: Optional[Dict[str, Any]] = None 
     ) -> tuple[ChatMessage, ChatMessage]:
         """
         Save a complete conversation turn (user question + assistant answer).
@@ -341,6 +342,16 @@ class ChatService:
                 )
             )
 
+            # Assistant message + METADATA untuk TABLE FE
+            assistant_metadata = {
+                "agent_name": agent_name,
+                "reference_documents": reference_documents or [],
+            }
+            
+            # TAMBAH structured data (narrative, ref_docs terstruktur, dll)
+            if structured_data:
+                assistant_metadata.update(structured_data)
+
             # Create assistant message
             assistant_msg = await self.create_message(
                 user_id=user_id,
@@ -350,7 +361,7 @@ class ChatService:
                     content=assistant_message,
                     agent_name=agent_name,
                     reference_documents=reference_documents or [],
-                    metadata={}
+                    metadata=assistant_metadata
                 )
             )
 

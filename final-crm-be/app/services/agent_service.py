@@ -117,6 +117,7 @@ class AgentService:
             query=query,
             **kwargs
         )
+        print("HASIL AGENT: ", result)
 
         logger.info(f"Agent '{agent_name}' completed execution")
 

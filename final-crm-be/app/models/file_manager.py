@@ -3,7 +3,7 @@ Pydantic models for File Manager API
 """
 from typing import Optional, Dict, Any, List
 from datetime import datetime
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, computed_field, validator
 from enum import Enum
 
 
@@ -50,6 +50,55 @@ class FileActivityAction(str, Enum):
     RENAMED = "renamed"
     PERMISSION_CHANGED = "permission_changed"
     EMBEDDED = "embedded"
+
+class Bucket(BaseModel):
+    total: int = Field(default=0, ge=0)
+    size: int = Field(default=0, ge=0)  
+
+# =====================================================
+# STORAGE USE MODELS
+# =====================================================
+
+class StorageUsageResponse(BaseModel):
+    """Response model for storage usage"""
+    id: str
+    organization_id: str
+
+    # sumber utama dari DB
+    documents_storage: Dict[str, Any] = Field(default_factory=dict)
+
+    # bentuk API yang kamu mau
+    document: Bucket = Field(default_factory=Bucket)
+    image: Bucket = Field(default_factory=Bucket)
+    audio: Bucket = Field(default_factory=Bucket)
+    video: Bucket = Field(default_factory=Bucket)
+
+    total_file: int = Field(default=0, ge=0)
+
+    # DB: total_storage_usage, API: total_use
+    total_use: int = Field(
+        default=0,
+        ge=0,
+        validation_alias="total_storage_usage",
+        serialization_alias="total_use",
+        description="Total pemakaian storage (bytes)"
+    )
+
+    quota_size: Optional[int] = Field(default=None, ge=0, description="Kuota (bytes)")
+
+    created_at: datetime
+    updated_at: datetime
+
+    @computed_field
+    @property
+    def volume_percentage(self) -> Optional[float]:
+        if not self.quota_size:
+            return None
+        return round((self.total_use / self.quota_size) * 100, 2)
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
 
 
 # =====================================================

@@ -10,7 +10,9 @@ Provides comprehensive file and folder management with:
 - Activity logs
 """
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Query, Request
+from datetime import datetime
+from uuid import uuid4
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
 from typing import Optional, List
 import logging
@@ -35,13 +37,18 @@ from app.models.file_manager import (
     # Statistics
     StorageStatsResponse, FileTypeStatsResponse,
     # Errors
-    ErrorResponse
+    ErrorResponse, StorageUsageResponse
 )
+from app.services import storage_service
+from app.services.document_queue_service import get_document_queue_service
 from app.services.file_manager_service import get_file_manager_service
 from app.services.permission_service import get_permission_service
 from app.services.sharing_service import get_sharing_service
+from app.services.storage_service import get_storage_service
 from app.auth.dependencies import get_current_user
 from app.models.user import User
+from app.config import settings as app_settings
+from app.services.storage_usage_service import StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +90,6 @@ def _add_file_url(item: dict) -> dict:
             else:
                 # File is in root
                 folder_path = "/"
-
             # Generate signed URL (valid for 1 hour)
             url = storage_service.get_file_url(
                 organization_id=item["organization_id"],
@@ -100,6 +106,96 @@ def _add_file_url(item: dict) -> dict:
         item["url"] = None
 
     return item
+
+def get_supabase_client():
+	"""Get Supabase client from settings"""
+	from supabase import create_client
+
+	if not app_settings.is_supabase_configured:
+		raise HTTPException(
+			status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+			detail="Supabase is not configured"
+		)
+
+	return create_client(app_settings.SUPABASE_URL, app_settings.SUPABASE_SERVICE_KEY)
+
+# =====================================================
+# STORAGE USED ENDPOINTS
+# =====================================================
+
+def _bucket(doc_storage: dict, key: str) -> dict:
+    raw = doc_storage.get(key) or {}
+    return {
+        "total": int(raw.get("total", 0) or 0),
+        "size": int(raw.get("size", 0) or 0),
+    }
+
+@router.get("/storage", response_model=StorageUsageResponse, response_model_exclude_none=True)
+async def get_storage_use(
+    organization_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get storage use details
+
+    **Permissions Required:** view
+    """
+    logger.info(f"Get storage use by {current_user.email}")
+
+    try:
+        # Get storage use
+        from supabase import create_client
+        from app.config import settings
+        client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+        response_storage = client.table("storage_usages")\
+            .select("*")\
+            .eq("organization_id", organization_id)\
+            .execute()
+
+        if not response_storage.data:
+            storage_svc = StorageService()
+            storage_svc.recalculate_from_files(
+                organization_id=organization_id
+            )
+            response_storage = (
+                client.table("storage_usages")
+                .select("*")
+                .eq("organization_id", organization_id)
+                .execute()
+            )
+
+        row = response_storage.data[0]
+        doc_storage = row.get("documents_storage") or {}
+
+        document = _bucket(doc_storage, "document")
+        image = _bucket(doc_storage, "image")
+        audio = _bucket(doc_storage, "audio")
+        video = _bucket(doc_storage, "video")
+
+        computed_total_use = document["size"] + image["size"] + audio["size"] + video["size"]
+        computed_total_file = document["total"] + image["total"] + audio["total"] + video["total"]
+
+        # quota_size: ambil dari tempat kamu simpan kuota (mis. table organizations / plan), atau None dulu
+        quota_size = 10_000_000
+
+        payload = {
+            **row,
+            "document": document,
+            "image": image,
+            "audio": audio,
+            "video": video,
+            "total_storage_usage": computed_total_use,  # masuk ke model via validation_alias
+            "total_file": computed_total_file,
+            "quota_size": quota_size,
+        }
+
+        return StorageUsageResponse(**payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get storage use: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # =====================================================
@@ -481,6 +577,40 @@ async def upload_file(
         from app.services.organization_service import get_organization_service
         org_service = get_organization_service()
         user_org = await org_service.get_user_organization(current_user.user_id)
+        organization_id = user_org.id
+        file_id = str(uuid4())
+        filename = file.filename
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        supabase = get_supabase_client()
+        db = get_storage_service(supabase)
+        # Read file content
+        file_content = await file.read()
+        fileable_extensions = {
+            "pdf", "docx", "doc", "txt", "md", "markdown", "pptx", "ppt",
+            "csv", "xlsx", "xls", "json",
+            "mp3", "wav", "m4a",  # Audio
+            "jpg", "jpeg", "png", "webp", "bmp", "gif",  # Images
+            "mp4", "mov", "avi", "mkv" #Video
+        }
+
+        def get_parent_path(folder_id: Optional[str]) -> str:
+            """Get full path of parent folder"""
+            if not folder_id:
+                return "/"
+
+            response = supabase.table("files")\
+                .select("parent_path, name")\
+                .eq("id", folder_id)\
+                .eq("is_folder", True)\
+                .execute()
+
+            if response.data:
+                folder = response.data[0]
+                parent = folder.get("parent_path", "/")
+                name = folder["name"]
+                return f"{parent.rstrip('/')}/{name}/"
+
+            return "/"
 
         if not user_org:
             raise HTTPException(
@@ -488,44 +618,199 @@ async def upload_file(
                 detail="User must belong to an organization"
             )
 
-        # Read file content
-        file_content = await file.read()
+        # =========================================================
+        # STEP 1: VALIDATING FILE
+        # =========================================================
 
-        # Parse metadata if provided
-        file_metadata = {}
-        if metadata:
-            import json
-            try:
-                file_metadata = json.loads(metadata)
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=400, detail="Invalid JSON metadata")
+        # VALIDASTI EXT FILE
+        if not ext:
+            raise HTTPException(
+                status_code=400,
+                detail="Tidak dapat mendeteksi ekstensi file."
+            )
+        if ext not in fileable_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Format file tidak didukung."
+            )
 
-        # Upload file
-        fm_service = get_file_manager_service()
-        file_data, error = fm_service.create_file(
-            user_id=current_user.user_id,
-            organization_id=user_org.id,
-            name=file.filename,
-            file_content=file_content,
-            mime_type=file.content_type or "application/octet-stream",
-            parent_folder_id=parent_folder_id,
-            metadata=file_metadata,
-            enable_embedding=enable_embedding
+        # VALIDATING Max Size
+        MAX_STORAGE_KB = 10_000_000
+
+        def bytes_to_kb(bytes_value: int) -> int:
+            return bytes_value // 1000
+
+        get_storage_use = ( supabase.table("storage_usages").select().eq("organization_id",organization_id).execute())
+
+        # hitung usage sekarang
+        storage_row = get_storage_use.data[0] if get_storage_use.data else None
+        current_usage_kb = int(storage_row["total_storage_usage"]) if storage_row else 0
+
+        # ukuran file baru (dalam kB)
+        incoming_size_kb = bytes_to_kb(len(file_content))
+        
+        # KONDISI UTAMA: jika melebihi 10 juta KB → error
+        if current_usage_kb + incoming_size_kb > MAX_STORAGE_KB:
+            raise HTTPException(
+                status_code=413,
+                detail="Kuota storage 10 GB sudah penuh. Hapus file untuk membuat ruang.",
+            )
+
+        # VALIDATING Duplicat
+        get_file = (
+            supabase.table("files")
+            .select("id,parent_path,is_trashed")
+            .eq("name", filename)
+            .eq("organization_id", organization_id)
+            .execute()
         )
 
-        if error:
-            raise HTTPException(status_code=400, detail=error)
+        if get_file.data:
+            record = get_file.data[0]
+            parent_path = record["parent_path"]
 
+            if record["is_trashed"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="File sudah ada di Trash.",
+                )
+
+            if parent_path == "/":
+                raise HTTPException(
+                    status_code=409,
+                    detail="File sudah ada di root folder My Drive.",
+                )
+
+            if parent_path and parent_path.startswith("/") and parent_path.strip("/") != "":
+                folder_name = parent_path.strip("/").split("/")[-1]
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"File sudah ada di root folder '{folder_name}'.",
+                )
+
+            # penjagaan lain kalau kosong/unset
+            raise HTTPException(
+                status_code=409,
+                detail="File sudah ada di root folder My Drive.",
+            )
+        # =========================================================
+        # STEP 2: SYNCHRONOUS STORAGE UPLOAD (Backup raw file)
+        # =========================================================
+        try:
+            buckets = supabase.storage.list_buckets()
+            if not any(b.name == f"org_{organization_id}" for b in buckets):
+                supabase.storage.create_bucket(f"org_{organization_id}", options={"public": False})
+        except Exception:
+            pass
+        
+        # =========================================================
+        # STEP 3: CREATE "PENDING" DB RECORD & RETURN TO FRONTEND
+        # =========================================================
+        doc_data = {
+            "name": filename,
+            "file_url": f"storage://org_{organization_id}/{file_id}",
+            "file_type": file.content_type or "application/octet-stream",
+            "file_size_kb": len(file_content),
+            "metadata": {
+                "file_id": file_id,
+                "bucket": f"org_{organization_id}",
+                "status": "pending", 
+                "chunks": 0
+            }
+        }
+
+        try:
+            parent_path = get_parent_path(parent_folder_id) if parent_folder_id else "/"
+            db_responses = db.upload_file(   
+                organization_id=organization_id,
+                file_id=file_id,
+                file_content=file_content,
+                filename=file.filename,
+                folder_path=parent_path,
+                mime_type=file.content_type or "application/octet-stream"
+            )
+            storage_uploaded = True
+            storage_path = db_responses["storage_path"]
+            file_size = db_responses["size"]
+        except Exception as storage_error:
+            supabase.storage.from_(f"org_{organization_id}").remove([file_id])
+            raise HTTPException(500, detail="Database insert failed")
+
+        file_data = {
+                "id": file_id,
+                "user_id": current_user.user_id,
+                "organization_id": organization_id,
+                "name": filename,
+                "type": file.content_type or "application/octet-stream",
+                "mime_type": file.content_type or "application/octet-stream",
+                "extension": filename.rsplit(".", 1)[-1].lower() if "." in filename else "",
+                "size": file_size,
+                "storage_path": storage_path,
+                "is_folder": False,
+                "folder_id": parent_folder_id,
+                "parent_path": parent_path,
+                "created_by": current_user.user_id,
+                "updated_by": current_user.user_id,
+                "metadata": {
+                "file_id": file_id,
+                "bucket": f"org_{organization_id}",
+                "status": "pending",  
+                "chunks": 0
+            },
+                "embedding_status": "pending" if enable_embedding else "skipped",
+                "file_version": 1,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }
+        db_response = supabase.table("files").insert(file_data).execute()
+        if not db_response.data:
+            supabase.storage.from_(f"org_{organization_id}").remove([file_id])
+            raise HTTPException(500, detail="Database insert failed")
+        
+        # =========================================================
+        # STEP 4: COUNT NEW STORAGE USAGE
+        # =========================================================
+        storage_svc = StorageService()
+        storage_svc.track_file_usage(
+            organization_id=organization_id,
+            mime_type=file.content_type,  
+            file_bytes=len(file_content), 
+            operation="add"  
+        )
         # Add signed URL
-        file_data_with_url = _add_file_url(file_data)
+        file_data_with_url = _add_file_url(db_response.data[0])
+        created_doc = FileResponse(**file_data_with_url)
 
-        return FileResponse(**file_data_with_url)
+        # =========================================================
+        # STEP 5: PUSH TO REDIS QUEUE (instead of BackgroundTasks)
+        # =========================================================
+        queue = get_document_queue_service()
+        queued = queue.enqueue(
+            doc_id=file_data_with_url["id"],
+            agent_id="file_manager",              
+            agent_name="File Manager", 
+            organization_id=organization_id,
+            file_id=file_id,
+            filename=filename,
+            bucket_name=f"org_{organization_id}",
+        )
+
+        if not queued:
+            logger.error(f"⚠️ Redis queue failed for {filename}, file safe in storage.")
+            error_meta = {**doc_data["metadata"], "status": "queue_failed"}
+            supabase.table("files") \
+                .update({"metadata": error_meta}) \
+                .eq("id", file_data_with_url["id"]).execute()
+
+        logger.info(f"🚀 Queued background processing for {filename}. Unblocking UI.")
+        # response.status_code = status.HTTP_202_ACCEPTED
+        return created_doc
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to upload file: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str("Internal server error"))
 
 
 @router.get("/files/{file_id}", response_model=FileWithPermissions)
@@ -757,7 +1042,6 @@ async def update_file(
     except Exception as e:
         logger.error(f"Failed to update file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/files/{file_id}/move", response_model=FileResponse)
 async def move_file(
@@ -1161,7 +1445,6 @@ async def update_share(
     **Returns:**
     - Updated share data
     """
-    print(share_id,share_data)
     logger.info(f"Update share {share_id} by {current_user.email}")
 
     try:
@@ -1367,15 +1650,6 @@ async def browse_folder(
             item["is_shared"] = len(file_shares) > 0
             item["shared"] = file_shares if file_shares else None
             enriched_items.append(item)
-        print(BrowseResponse(
-            folder_id=folder_id,
-            folder_path=folder_path,
-            items=[FileResponse(**item) for item in enriched_items],
-            total_items=total_items,
-            page=page,
-            page_size=page_size,
-            total_pages=total_pages,
-        ))
 
         # === Return final result ===
         return BrowseResponse(

@@ -138,6 +138,75 @@ class ChromaDBServiceV2:
 
         logger.info(f"✅ [V2] Added {len(chunks)} chunks to {organization_id}")
         return file_id
+    
+    def query_documents(
+        self,
+        query: str,
+        organization_id: str,
+        email: str,
+        top_k: int = 5,
+        where: Optional[Dict[str, Any]] = None,
+        include_distances: bool = True,
+        include_embeddings: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Query documents from organization-specific ChromaDB collection.
+
+        Auto-creates collection if it doesn't exist (returns empty results for new collections).
+
+        Args:
+            query: Search query
+            organization_id: Organization UUID (REQUIRED)
+            email: User email for filtering
+            top_k: Number of results to return
+            where: Additional filter conditions
+            include_distances: Include distance scores
+            include_embeddings: Include embeddings
+
+        Returns:
+            Query results (empty if collection is new)
+
+        Raises:
+            ValueError: If organization_id is missing
+            RuntimeError: If collection creation fails
+        """
+        if not organization_id:
+            raise ValueError("organization_id is required for querying documents")
+
+        collection = self.get_or_create_organization_collection(organization_id)
+        print("COLLECTION ", collection)
+        filters_list = [
+            {"organization_id": {"$eq": organization_id}},
+            {"is_trashed": {"$eq": False}}
+        ]
+
+        if where:
+            filters_list.append(where)
+
+        final_where = { "$and": filters_list }
+
+        logger.info(f"🔎 Final Query filter: {final_where}, organization_id: {organization_id}")
+
+        include = ["metadatas", "documents"]
+        if include_distances:
+            include.append("distances")
+        if include_embeddings:
+            include.append("embeddings")
+
+        q_emb = self.embedding_function([query])
+
+        results = collection.query(
+            query_embeddings=q_emb,
+            n_results=top_k,
+            where=final_where, 
+            include=include,
+        )
+
+        num_results = len(results.get('documents', [[]])[0])
+        logger.info(f"✅ Queried org_{organization_id}: found {num_results} results")
+
+        return results
+
 
     def delete_documents_by_file_id(self, organization_id: str, file_id: str) -> Dict[str, Any]:
         collection = self.get_or_create_organization_collection(organization_id)

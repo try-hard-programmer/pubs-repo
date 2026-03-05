@@ -228,155 +228,180 @@ class DocumentProcessingWorker:
         from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
         from app.utils.chunkingv2 import split_into_chunks_with_metadata
         from supabase import create_client
+        from app.services.file_manager_service import get_file_manager_service  # ← BARU!
         
+        # Extract job data
         doc_id = job["doc_id"]
-        agent_id = job["agent_id"]
-        agent_name = job["agent_name"]
         organization_id = job["organization_id"]
         file_id = job["file_id"]
         filename = job["filename"]
         bucket_name = job["bucket_name"]
+        agent_id = job.get("agent_id")  # None untuk files
         
-        # Fresh Supabase client for this thread
+        # Detect table type
+        table_name = "knowledge_documents" if (agent_id and agent_id != "file_manager") else "files"
+        is_knowledge_doc = table_name == "knowledge_documents"
+        
+        logger.info(f"⚙️ [DocWorker] Processing {table_name}: {filename} (doc_id={doc_id})")
+        
+        # Fresh clients
         key = settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_KEY
         supabase = create_client(settings.SUPABASE_URL, key)
         doc_processor = DocumentProcessorV2()
         
         try:
-            logger.info(f"⚙️ [DocWorker] Processing started for {filename}")
-            
             # =============================================
-            # STEP 0: DOWNLOAD FILE FROM SUPABASE STORAGE
+            # STEP 0: DOWNLOAD FILE
             # =============================================
-            try:
-                file_content = supabase.storage.from_(bucket_name).download(file_id)
-            except Exception as dl_err:
-                raise RuntimeError(f"Failed to download file from storage: {dl_err}")
-            
+            file_content = supabase.storage.from_(bucket_name).download(file_id)
             if not file_content:
                 raise RuntimeError("Downloaded file is empty")
             
-            logger.info(f"📥 [DocWorker] Downloaded {filename} ({len(file_content) // 1024}KB)")
+            logger.info(f"📥 Downloaded {filename} ({len(file_content)//1024}KB)")
             
             # =============================================
-            # STEP 1: EXTRACT & QUALITY CHECK
-            # (synchronous — fine because we're in our own thread)
+            # STEP 1: COMMON PROCESSING (extract + quality)
             # =============================================
             clean_text, metrics = doc_processor.process_document(
                 file_content, filename, bucket_name, organization_id, file_id
             )
+            print("TEXT ", clean_text)
+            print("METRICS ", metrics)
+
+            if not clean_text :
+               raise ValueError("No text extracted")
             
-            if not clean_text:
-                raise ValueError("No text could be extracted from the document.")
-            
-            doc_processor.validate_quality(clean_text, metrics, filename)
+            if is_knowledge_doc:
+                doc_processor.validate_quality(clean_text, metrics, filename)
             
             # =============================================
-            # STEP 2: DUPLICATE CHECK
+            # STEP 2: DUPLICATE CHECK (hanya untuk knowledge_docs)
             # =============================================
-            existing_doc = await doc_processor.check_duplicate(
-                content_hash=metrics.content_hash,
-                agent_id=agent_id,
-                supabase=supabase,
-            )
-            if existing_doc:
-                raise ValueError(f"Duplicate content. Already uploaded as '{existing_doc}'.")
+            if is_knowledge_doc:
+                existing_doc = await doc_processor.check_duplicate(
+                    content_hash=metrics.content_hash,
+                    agent_id=agent_id,
+                    supabase=supabase,
+                )
+                if existing_doc:
+                    raise ValueError(f"Duplicate: '{existing_doc}'")
             
             # =============================================
             # STEP 3: CHUNKING
             # =============================================
+            agent_name = job.get("agent_name", "File Manager")
             chunks, chunk_metas = split_into_chunks_with_metadata(
                 text=clean_text, filename=filename, file_id=file_id,
                 agent_id=agent_id, agent_name=agent_name, 
                 organization_id=organization_id,
                 size=512, overlap=100
             )
-            if not chunks:
-                raise ValueError("No valid chunks generated from document.")
+            if not chunks and agent_id != "file_manager":
+                raise ValueError("No chunks generated")
             
             # =============================================
-            # STEP 4: EMBEDDING + CHROMADB STORAGE
+            # STEP 4: EMBEDDING + STORAGE
             # =============================================
             chroma_service = get_crm_chroma_service_v2()
             success = await chroma_service.add_documents(
-                agent_id=agent_id, texts=chunks, metadatas=chunk_metas, 
+                agent_id=agent_id,  # None OK untuk files?
+                texts=chunks, metadatas=chunk_metas, 
                 organization_id=organization_id
             )
-            if not success:
-                raise Exception("ChromaDB failed to save vectors.")
+            if not success and agent_id != "file_manager":
+                raise Exception("ChromaDB failed")
             
             # =============================================
-            # STEP 5: MARK AS COMPLETED IN POSTGRES
+            # STEP 5: UPDATE DB (table-specific)
             # =============================================
             updated_meta = {
                 "file_id": file_id,
                 "bucket": bucket_name,
                 "processor_version": "v2",
-                "status": "completed",
                 "chunks": len(chunks),
                 "content_hash": metrics.content_hash,
                 "word_count": metrics.word_count,
                 "token_count": metrics.token_count,
                 "has_tables": metrics.has_tables,
             }
-            supabase.table("knowledge_documents")\
-                .update({"metadata": updated_meta})\
-                .eq("id", doc_id)\
-                .execute()
             
-            logger.info(f"✅ [DocWorker] Done: {filename} → {len(chunks)} chunks embedded")
-
-            try:
-                notification = {
-                    "type": "document_upload_completed",
-                    "organization_id": organization_id,
-                    "agent_id": agent_id,
-                    "doc_id": doc_id,
-                    "filename": filename,
-                    "status": "completed"
-                }
-                channel = f"ws_org_{organization_id}"
-                self.client.publish(channel, json.dumps(notification))
-                logger.info(f"📢 Notification published to {channel}")
-            except Exception as pub_err:
-                logger.error(f"⚠️ Failed to publish success notification: {pub_err}")
-        
+            if is_knowledge_doc:
+                # Knowledge documents: update metadata.status
+                supabase.table("knowledge_documents").update({
+                    "metadata": updated_meta
+                }).eq("id", doc_id).execute()
+            else:
+                # Files: update embedding_status + metadata
+                supabase.table("files").update({
+                    "embedding_status": "completed",
+                    "embedded_at": datetime.utcnow().isoformat(),
+                    "metadata": updated_meta if chunks and agent_id == "file_manager" else {}
+                }).eq("id", doc_id).execute()
+            
+            logger.info(f"✅ [{table_name}] {filename} → {len(chunks)} chunks")
+            
+            # =============================================
+            # STEP 6: NOTIFICATION (table-specific type)
+            # =============================================
+            notification_type = (
+                "document_upload_completed" if is_knowledge_doc 
+                else "file_upload_completed"
+            )
+            notification = {
+                "type": notification_type,
+                "organization_id": organization_id,
+                "agent_id": agent_id,
+                "doc_id": doc_id,
+                "filename": filename,
+                "status": "completed",
+                "table": table_name
+            }
+            channel = f"ws_org_{organization_id}"
+            self.client.publish(channel, json.dumps(notification))
+            logger.info(f"📢 Published {notification_type} to {channel}")
+            
         except Exception as e:
-            logger.error(f"❌ [DocWorker] Failed: {filename} — {e}")
+            logger.error(f"❌ [{table_name}] {filename}: {e}")
             
-            # Update DB state to failed
+            # Error metadata
             error_meta = {
                 "file_id": file_id,
                 "bucket": bucket_name,
-                "processor_version": "v2",
                 "status": "failed",
                 "error_detail": str(e)[:500],
             }
+            
             try:
-                supabase.table("knowledge_documents")\
-                    .update({"metadata": error_meta})\
-                    .eq("id", doc_id)\
-                    .execute()
+                if is_knowledge_doc:
+                    supabase.table("knowledge_documents").update({
+                        "metadata": error_meta
+                    }).eq("id", doc_id).execute()
+                else:
+                    supabase.table("files").update({
+                        "embedding_status": "failed",
+                        "embedding_error": str(e)[:500],
+                        "metadata": error_meta
+                    }).eq("id", doc_id).execute()
             except Exception:
                 pass
             
-            # 📢 NEW: BROADCAST FAILURE VIA REDIS PUB/SUB
+            # Error notification
+            notification = {
+                "type": "document_upload_failed" if is_knowledge_doc else "file_upload_failed",
+                "organization_id": organization_id,
+                "agent_id": agent_id,
+                "doc_id": doc_id,
+                "filename": filename,
+                "status": "failed",
+                "error": str(e)[:200],
+                "table": table_name
+            }
             try:
-                notification = {
-                    "type": "document_upload_failed",
-                    "organization_id": organization_id,
-                    "agent_id": agent_id,
-                    "doc_id": doc_id,
-                    "filename": filename,
-                    "status": "failed",
-                    "error": str(e)[:200]
-                }
-                channel = f"ws_org_{organization_id}"
-                self.client.publish(channel, json.dumps(notification))
+                self.client.publish(f"ws_org_{organization_id}", json.dumps(notification))
             except Exception as pub_err:
-                logger.error(f"⚠️ Failed to publish error notification: {pub_err}")
+                logger.error(f"⚠️ Publish failed: {pub_err}")
             
-            # Cleanup orphaned storage file
+            # Cleanup storage
             try:
                 supabase.storage.from_(bucket_name).remove([file_id])
             except Exception:

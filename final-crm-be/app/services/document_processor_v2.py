@@ -1,5 +1,6 @@
 import io
 import os
+import subprocess
 import tempfile
 import logging
 import requests
@@ -213,7 +214,130 @@ class DocumentProcessorV2:
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         metrics = DocumentQualityMetrics()
 
-        if ext in ("mp3", "wav", "m4a", "ogg", "flac", "jpg", "jpeg", "png", "webp"):
+        if ext in ("mp3", "wav", "m4a", "ogg", "flac", "jpg", "jpeg", "png", "webp","mp4", "avi", "mov", "mkv", "webm"):
+            if ext in ("jpg","jpeg","png","webp"):
+                mime = mimetypes.guess_type(filename)[0] or "image/png"
+                b64 = base64.b64encode(content).decode("ascii")
+                image_data_url = f"data:{mime};base64,{b64}"
+                headers = {"Content-Type": "application/json"}
+                data = {"image_url": image_data_url}
+                api_url = f"{self.proxy_base_url}/image/ocr"
+
+                resp = requests.post(api_url, headers=headers, json=data, timeout=60)
+                resp.raise_for_status()
+
+                ocr_text = resp.json().get("content", "") or resp.json().get("text", "")
+
+                # **CRUCIAL: Hitung metrics seperti PDF**
+                normalized_text = self._normalize_text(ocr_text)
+                metrics.char_count = len(normalized_text)
+                metrics.word_count = len(normalized_text.split())
+                try:
+                    metrics.token_count = len(self.tokenizer.encode(normalized_text))
+                except Exception:
+                    metrics.token_count = metrics.word_count
+                metrics.content_hash = self.generate_content_hash(normalized_text)
+                metrics.extraction_method = "ocr_vision"
+                
+                self.logger.info(
+                    f"✅ OCR '{filename}': {metrics.word_count} words, "
+                    f"{metrics.token_count} tokens"
+                )
+                return normalized_text, metrics 
+
+            if ext in ("mp3", "wav", "m4a", "ogg", "flac"):
+                mime = mimetypes.guess_type(filename)[0] or "audio/mpeg"
+                b64 = base64.b64encode(content).decode("ascii")
+                audio_data_url = f"data:{mime};base64,{b64}"
+                
+                headers = {"Content-Type": "application/json"}
+                data = {"url": audio_data_url}
+                api_url = f"{self.proxy_base_url}/audio"
+                
+                resp = requests.post(api_url, headers=headers, json=data, timeout=300)
+                resp.raise_for_status()
+                
+                transcription = resp.json()["output"]["result"]
+                normalized_text = self._normalize_text(transcription)
+                
+                # Sama metrics calculation
+                metrics.char_count = len(normalized_text)
+                metrics.word_count = len(normalized_text.split())
+                try:
+                    metrics.token_count = len(self.tokenizer.encode(normalized_text))
+                except:
+                    metrics.token_count = metrics.word_count
+                metrics.content_hash = self.generate_content_hash(normalized_text)
+                metrics.extraction_method = "whisper_transcription"
+                
+                return normalized_text, metrics
+            
+            if ext in ("mp4", "avi", "mov", "mkv", "webm"):
+                try:
+                    # 1. Buat temp files
+                    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as video_file:
+                        video_path = video_file.name
+                        video_file.write(content)
+                    
+                    audio_path = video_path.rsplit(".", 1)[0] + ".mp3"
+                    
+                    # 2. FFmpeg convert VIDEO → MP3 (silent, fast)
+                    cmd = [
+                        "ffmpeg", "-y", "-i", video_path, 
+                        "-vn", "-acodec", "mp3", "-ar", "16000", 
+                        audio_path, "-loglevel", "quiet"
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, timeout=120)
+                    result.check_returncode()
+                    
+                    # 3. Baca audio bytes → kirim ke /audio
+                    with open(audio_path, "rb") as audio_file:
+                        audio_bytes = audio_file.read()
+                    
+                    mime = "audio/mpeg"
+                    b64 = base64.b64encode(audio_bytes).decode("ascii")
+                    audio_data_url = f"data:{mime};base64,{b64}"
+                    
+                    # 4. Proxy /audio (pakai route yang SUDAH ADA!)
+                    headers = {"Content-Type": "application/json"}
+                    data = {"url": audio_data_url}
+                    api_url = f"{self.proxy_base_url}/audio"
+                    
+                    resp = requests.post(api_url, headers=headers, json=data, timeout=300)
+                    resp.raise_for_status()
+                    
+                    transcription = resp.json()["output"]["result"]
+                    
+                    # 5. Metrics
+                    normalized_text = self._normalize_text(transcription)
+                    metrics.char_count = len(normalized_text)
+                    metrics.word_count = len(normalized_text.split())
+                    try:
+                        metrics.token_count = len(self.tokenizer.encode(normalized_text))
+                    except:
+                        metrics.token_count = metrics.word_count
+                    metrics.content_hash = self.generate_content_hash(normalized_text)
+                    metrics.extraction_method = "video_to_audio_whisper"
+                    
+                    self.logger.info(
+                        f"✅ Video '{filename}' → Audio → Whisper: {metrics.word_count} words"
+                    )
+                    
+                    # 6. Cleanup
+                    os.unlink(video_path)
+                    os.unlink(audio_path)
+                    
+                    return normalized_text, metrics
+                except subprocess.CalledProcessError as e:
+                    self.logger.error(f"❌ FFmpeg failed for {filename}: {e}")
+                    return "[Video conversion failed]", metrics
+                except Exception as e:
+                    self.logger.error(f"❌ Video processing error: {e}")
+                    if 'video_path' in locals():
+                        os.unlink(video_path)
+                    if 'audio_path' in locals() and os.path.exists(audio_path):
+                        os.unlink(audio_path)
+                    return f"[Error: {str(e)}]", metrics
             return "", metrics
 
         if ext in ("pdf", "docx", "csv", "txt"):

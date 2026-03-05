@@ -7,7 +7,7 @@ Supports both main orchestrator and direct agent access.
 
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from typing import Literal, Optional, Dict, Any, List, Union
 import logging
 
 from app.services import get_agent_service
@@ -15,6 +15,7 @@ from app.services.chat_service import get_chat_service
 from app.agents.tools import get_retrieved_file_ids
 from app.auth.dependencies import get_current_user, get_optional_user
 from app.models.user import User
+from app.services.ui_formatter_proxy import UIFormatResult, UIResponse, format_to_ui_via_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +130,20 @@ class AgentFileResponse(BaseModel):
     session_id: Optional[str] = None
 
 
+
+class AgentResponseV2(BaseModel):
+    success: bool = True
+    agent: str
+    query: str
+    response: UIResponse
+    narrative: Optional[str] = None
+    reference_documents: list = Field(default_factory=list)
+    session_id: Optional[str] = None
+
+
 # Endpoints
 
-@router.post("/", response_model=AgentResponse)
+@router.post("/", response_model=AgentResponseV2)
 async def main_agent(
     request: AgentRequest,
     current_user: User = Depends(get_current_user)
@@ -156,7 +168,7 @@ async def main_agent(
     return await run_rag_agent(request, current_user)
 
 
-@router.post("/rag", response_model=AgentResponse)
+@router.post("/rag", response_model=AgentResponseV2)
 async def run_rag_agent(
     request: AgentRequest,
     current_user: User = Depends(get_current_user)
@@ -190,7 +202,7 @@ async def run_rag_agent(
             detail="Query is required"
         )
 
-    # ⭐ Get user's organization
+    #  Get user's organization
     from app.services.organization_service import get_organization_service
     org_service = get_organization_service()
     user_org = await org_service.get_user_organization(current_user.user_id)
@@ -212,7 +224,7 @@ async def run_rag_agent(
             agent_name="rag_agent",
             user_id=current_user.user_id,
             query=request.query,
-            email=current_user.email,
+            email=current_user.email,   
             organization_id=organization_id,  # ⭐ Organization-specific query
             session_id=request.session_id,
             topic_id=request.topic_id,
@@ -223,18 +235,30 @@ async def run_rag_agent(
             answer = result.get("answer", "Maaf, tidak ada respons.")
             ref_docs_raw = result.get("reference_documents", [])
             result_session_id = result.get("session_id", request.session_id)
-
-            # Convert to DocumentMetadata objects
-            ref_docs = [
-                DocumentMetadata(**doc) if isinstance(doc, dict) else doc
-                for doc in ref_docs_raw
-            ]
         else:
             answer = result
             ref_docs = []
             result_session_id = request.session_id
 
+        # Convert to DocumentMetadata objects
+        ref_docs = [
+            DocumentMetadata(**doc) if isinstance(doc, dict) else doc
+            for doc in ref_docs_raw
+        ]
+
+        # format to structured UI via proxy (OpenAI JSON mode)
+        formatted: UIFormatResult = await format_to_ui_via_proxy(
+            user_query=request.query,
+            raw_answer=answer,
+            organization_id=str(organization_id),
+            preferred_title=None,
+            timeout_total=60,
+            max_retries=1,
+        )
+        
+
         logger.info(f"RAG agent completed for {current_user.email} with {len(ref_docs)} references")
+        
 
         # Save to chat history if topic_id provided and save_history is True
         if request.topic_id and request.save_history:
@@ -250,26 +274,40 @@ async def run_rag_agent(
                     }
                     for doc in ref_docs
                 ]
+
+                structured_datas = {
+                    "narrative": formatted.narrative.dict() if hasattr(formatted.narrative, 'dict') else str(formatted.narrative),
+                    "response": formatted.response.dict() if hasattr(formatted.response, 'dict') else str(formatted.response),
+                    "reference_documents": ref_docs_data,
+                    "session_id": result_session_id,
+                    "agent": "rag_agent",
+                    "organization_id": str(organization_id),
+                    "num_references": len(ref_docs)
+                }
+               
                 await chat_service.save_conversation(
                     topic_id=request.topic_id,
                     user_id=current_user.user_id,
                     user_message=request.query,
                     assistant_message=answer,
                     agent_name="rag_agent",
-                    reference_documents=ref_docs_data
+                    reference_documents=ref_docs_data,
+                    structured_data=structured_datas
                 )
                 logger.info(f"Saved conversation to topic {request.topic_id}")
             except Exception as e:
                 # Log error but don't fail the request
                 logger.error(f"Failed to save chat history: {e}")
 
-        return AgentResponse(
-            email=current_user.email,
+        
+        return AgentResponseV2(
+            success=True,
+            agent="rag_agent",
             query=request.query,
-            answer=answer,
+            response=formatted.response,  
+            narrative=formatted.narrative,
             reference_documents=ref_docs,
-            agent_name="rag_agent",
-            session_id=result_session_id
+            session_id=result_session_id,
         )
 
     except ValueError as e:
