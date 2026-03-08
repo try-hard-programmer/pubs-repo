@@ -309,7 +309,7 @@ class TicketingConfig(BaseModel):
     """Ticketing system configuration"""
     enabled: bool = Field(default=False, description="Enable ticketing")
     autoCreateTicket: bool = Field(default=True, description="Auto-create ticket on chat start")
-    ticketPrefix: str = Field(default="TKT-", description="Ticket number prefix")
+    ticketPrefix: str = Field(default="TKT-PLP-", description="Ticket number prefix")
     requireCategory: bool = Field(default=True, description="Require category selection")
     requirePriority: bool = Field(default=False, description="Require priority selection")
     autoCloseAfterResolved: bool = Field(default=True, description="Auto-close after resolved")
@@ -321,7 +321,7 @@ class TicketingConfig(BaseModel):
             "example": {
                 "enabled": True,
                 "autoCreateTicket": True,
-                "ticketPrefix": "TKT-",
+                "ticketPrefix": "TKT-PLP-",
                 "requireCategory": True,
                 "requirePriority": False,
                 "autoCloseAfterResolved": True,

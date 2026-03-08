@@ -347,6 +347,11 @@ class MessageRouterService:
                 chat_id = active_chat["id"]
                 status = active_chat["status"]
                 handled_by = active_chat.get("handled_by", "unassigned")
+
+                # [FIX] Extract assignment data
+                ai_agent_id = active_chat.get("ai_agent_id")
+                human_agent_id = active_chat.get("human_agent_id")
+                assigned_agent_id = active_chat.get("assigned_agent_id")
                 
                 # Validation: Assigned but no ID? Recover to AI.
                 if status == "assigned" and not active_chat.get("assigned_agent_id"):
@@ -392,6 +397,11 @@ class MessageRouterService:
             else:
                 # NEW CHAT
                 handled_by = "ai" if is_ai_agent else "human"
+
+                # [FIX] Extract assignment data for new chats
+                ai_agent_id = agent_id if is_ai_agent else None
+                human_agent_id = agent_id if not is_ai_agent else None
+                assigned_agent_id = agent_id if not is_ai_agent else None
                 
                 c_res = self.supabase.table("chats").insert({
                     "organization_id": organization_id, "customer_id": customer_id, "channel": channel,
@@ -421,7 +431,10 @@ class MessageRouterService:
                 "success": True, "chat_id": chat_id, "message_id": message_id, "customer_id": customer_id,
                 "is_new_chat": is_new_chat, "was_reopened": was_reopened, "handled_by": handled_by,
                 "status": status, "channel": channel, "agent_id": agent_id,
-                "is_merged_event": is_merged_event # <--- Needed by Webhook to prevent double broadcast
+                "is_merged_event": is_merged_event,
+                "ai_agent_id": ai_agent_id,
+                "human_agent_id": human_agent_id,
+                "assigned_agent_id": assigned_agent_id
             }
 
         except Exception as e:

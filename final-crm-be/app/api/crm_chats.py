@@ -666,9 +666,19 @@ async def get_chats(
                 .limit(1) \
                 .execute()
 
-            # Add last_message to chat data
+            # Add last_message to chat data safely
             if last_message_response.data:
-                chat_data["last_message"] = last_message_response.data[0]
+                msg_obj = last_message_response.data[0]
+                
+                # [ROBUST FIX] Handle stringified JSON from historical cron jobs
+                raw_msg_meta = msg_obj.get("metadata")
+                if isinstance(raw_msg_meta, str):
+                    try:
+                        msg_obj["metadata"] = json.loads(raw_msg_meta)
+                    except Exception:
+                        msg_obj["metadata"] = {}
+                        
+                chat_data["last_message"] = msg_obj
             else:
                 chat_data["last_message"] = None
 
@@ -829,9 +839,19 @@ async def get_chat(
             .limit(1) \
             .execute()
 
-        # Add last_message to chat data
+        # Add last_message to chat data safely
         if last_message_response.data:
-            chat_data["last_message"] = last_message_response.data[0]
+            msg_obj = last_message_response.data[0]
+            
+            # [ROBUST FIX] Handle stringified JSON from historical cron jobs
+            raw_msg_meta = msg_obj.get("metadata")
+            if isinstance(raw_msg_meta, str):
+                try:
+                    msg_obj["metadata"] = json.loads(raw_msg_meta)
+                except Exception:
+                    msg_obj["metadata"] = {}
+                    
+            chat_data["last_message"] = msg_obj
         else:
             chat_data["last_message"] = None
 
@@ -1048,7 +1068,7 @@ async def create_chat(
                 if new_cust.data: customer_id = new_cust.data[0]["id"]
                 else: raise HTTPException(500, "Failed to create customer")
 
-       # ==============================================================================
+        # ==============================================================================
         # 3. REUSE OR CREATE CHAT
         # ==============================================================================
         chat_obj = None
@@ -1058,36 +1078,45 @@ async def create_chat(
             if not acquired:
                 raise HTTPException(429, "Concurrent creation detected. Please retry.")
 
+            # [FIX 1] Removed the .neq("status", "resolved") filter so we can reopen it.
+            # Added order and limit to ensure we always get the most recent thread.
             active_chat = supabase.table("chats")\
                 .select("*")\
                 .eq("customer_id", customer_id)\
                 .eq("channel", channel_val)\
                 .eq("sender_agent_id", sender_agent_id) \
-                .neq("status", "resolved")\
                 .neq("status", "closed")\
+                .order("last_message_at", desc=True)\
+                .limit(1)\
                 .execute()
             
             if active_chat.data:
                 chat_obj = active_chat.data[0]
                 
-                # 🛑 THE NEW VALIDATION 🛑
-                # If the chat is already handled by a human or explicitly assigned, throw an error.
-                is_already_assigned = chat_obj.get("handled_by") == "human" or chat_obj.get("assigned_agent_id") is not None
+                # [FIX 2] Contextual Hijack & Reopen Logic
+                is_resolved = chat_obj.get("status") == "resolved"
+                existing_assignee = chat_obj.get("assigned_agent_id")
+                
+                # If it's resolved, it's free to be claimed. If it's active, check who owns it.
+                is_already_assigned = not is_resolved and (chat_obj.get("handled_by") == "human" or existing_assignee is not None)
                 
                 if is_already_assigned:
-                    logger.warning(f"⛔ Blocked attempt to hijack assigned chat {chat_obj['id']}")
-                    raise HTTPException(
-                        status_code=409, # 409 Conflict is the correct semantic status here
-                        detail="This customer already has an active chat assigned to an agent."
-                    )
+                    # Allow the same agent to reuse their own chat. Block DIFFERENT agents from stealing active chats.
+                    if assigned_agent_id and existing_assignee and existing_assignee != assigned_agent_id:
+                        logger.warning(f"⛔ Blocked attempt to hijack assigned chat {chat_obj['id']}")
+                        raise HTTPException(
+                            status_code=409, 
+                            detail="This customer already has an active chat assigned to another agent."
+                        )
 
-                logger.info(f"♻️ Reusing unassigned Chat {chat_obj['id']}")
+                logger.info(f"♻️ Reusing (and reopening) Chat {chat_obj['id']}")
                 
                 upd = {"sender_agent_id": sender_agent_id}
                 
+                # Apply new status, effectively waking it up from 'resolved' if necessary
                 if assigned_agent_id:
                     upd.update({
-                        "status": status_value,
+                        "status": status_value, # Uses the state assigned earlier in the function
                         "handled_by": handled_by,
                         "assigned_agent_id": assigned_agent_id
                     })
@@ -1104,6 +1133,7 @@ async def create_chat(
                 supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
                 chat_obj.update(upd)
             else:
+                # CREATION LOGIC REMAINS THE SAME
                 new_chat_data = {
                     "organization_id": organization_id, "customer_id": customer_id, "channel": channel_val,
                     "assigned_agent_id": assigned_agent_id, "ai_agent_id": ai_agent_id, "human_agent_id": human_agent_id,
@@ -1123,25 +1153,48 @@ async def create_chat(
             try:
                 conn = get_connection_manager()
                 if chat.initial_message:
-                    sender_name = "AI Assistant"
-                    if handled_by == "human": sender_name = "Human Agent"
+                    # --- [FIX] RESOLVE TRUE SYSTEM NAMES FOR THE PAYLOAD ---
+                    real_ai_name = None
+                    real_human_name = None
                     
+                    if ai_agent_id:
+                        ai_res = supabase.table("agents").select("name").eq("id", ai_agent_id).execute()
+                        if ai_res.data and ai_res.data[0].get("name"): real_ai_name = ai_res.data[0]["name"]
+                        
+                    if human_agent_id:
+                        hu_res = supabase.table("agents").select("name").eq("id", human_agent_id).execute()
+                        if hu_res.data and hu_res.data[0].get("name"): real_human_name = hu_res.data[0]["name"]
+
+                    # [NEW] The author of the message is the logged-in human (current_user)
+                    sender_name = "Human Agent"
+                    me_res = supabase.table("agents").select("name").eq("user_id", current_user.user_id).execute()
+                    if me_res.data and me_res.data[0].get("name"):
+                        sender_name = me_res.data[0]["name"]
+                    # -------------------------------------------------------
+
                     await conn.broadcast_new_message(
                         organization_id=organization_id,
                         chat_id=chat_obj["id"],
-                        message_id=uuid4().hex,
+                        message_id=str(uuid4()), 
                         customer_id=customer_id,
                         customer_name=chat.customer_name or "Customer",
                         message_content=chat.initial_message,
                         channel=channel_val,
                         handled_by=handled_by,
                         sender_type="agent",
-                        sender_id=sender_agent_id or current_user.user_id,
-                        sender_name=sender_name,
+                        sender_id=current_user.user_id,   # <--- Forces the message to belong to the human
+                        sender_name=sender_name,          # <--- Uses "Kurnia Massidik"
                         is_new_chat=True,
-                        was_reopened=False
+                        was_reopened=False,
+                        ai_agent_id=ai_agent_id,
+                        ai_agent_name=real_ai_name,
+                        assigned_agent_id=assigned_agent_id,
+                        human_agent_id=human_agent_id,
+                        human_agent_name=real_human_name,
+                        chat_status=chat_obj.get("status", "open")
                     )
                 else:
+                    # If no initial message, broadcast the raw chat update
                     await conn.broadcast_chat_update(
                         organization_id=organization_id,
                         chat_id=chat_obj["id"],
@@ -1240,12 +1293,14 @@ async def assign_chat(
         target_agent = agent_check.data[0]
 
         # 4. Prepare Update Data
-        # IMPORTANT: We do NOT update sender_agent_id. We keep the gateway.
         handle_by = "human" if target_agent.get("user_id") else "ai"
         
+        # [FIX] Enforce Rule: AI cannot be in the assigned_agent_id column
+        final_assignee = target_agent_id if handle_by == "human" else None
+        
         update_data = {
-            "assigned_agent_id": target_agent_id,
-            "status": "assigned",
+            "assigned_agent_id": final_assignee, 
+            "status": "assigned" if handle_by == "human" else "open", # Keep it open if AI
             "handled_by": handle_by,
         }
         
@@ -1388,9 +1443,19 @@ async def escalate_chat(
             .limit(1) \
             .execute()
 
-        # Add last_message to chat data
+        # Add last_message to chat data safely
         if last_message_response.data:
-            chat_data["last_message"] = last_message_response.data[0]
+            msg_obj = last_message_response.data[0]
+            
+            raw_msg_meta = msg_obj.get("metadata")
+            if isinstance(raw_msg_meta, str):
+                import json
+                try:
+                    msg_obj["metadata"] = json.loads(raw_msg_meta)
+                except Exception:
+                    msg_obj["metadata"] = {}
+                    
+            chat_data["last_message"] = msg_obj
         else:
             chat_data["last_message"] = None
 
@@ -1575,26 +1640,19 @@ async def get_chat_messages(
     sort_order: str = Query("desc", description="Sort order: 'desc' (newest first) or 'asc' (oldest first)"),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get messages for a chat.
-    
-    [FIX] Default sort changed to 'desc' (Newest First).
-    This ensures that fetching the first page (skip=0) returns the LATEST conversation.
-    Frontend should reverse this list if displaying chronological (Top->Bottom).
-    """
     try:
         organization_id = await get_user_organization_id(current_user)
         supabase = get_supabase_client()
 
-        # Verify chat exists
-        chat_check = supabase.table("chats").select("id").eq("id", chat_id).eq("organization_id", organization_id).execute()
+        # 1. Fetch Chat Context
+        chat_check = supabase.table("chats").select("customer_id").eq("id", chat_id).eq("organization_id", organization_id).execute()
         if not chat_check.data: 
             raise HTTPException(404, f"Chat {chat_id} not found")
-
-        # [FIX] Dynamic Sorting
+        
+        chat_customer_id = chat_check.data[0].get("customer_id")
+        
+        # 2. Fetch Messages 
         is_descending = sort_order.lower() == "desc"
-
-        # Execute Query
         response = supabase.table("messages") \
             .select("*", count="exact") \
             .eq("chat_id", chat_id) \
@@ -1602,40 +1660,65 @@ async def get_chat_messages(
             .order("created_at", desc=is_descending) \
             .execute()
 
-        # Enrich messages
-        messages_with_sender = []
-        for message_data in response.data:
-            sender_name = None
-            sender_id = message_data.get("sender_id")
-            sender_type = message_data.get("sender_type")
+        messages_data = response.data or []
 
-            # [OPTIMIZATION] Basic name resolution logic
-            # You can keep your existing logic here for resolving names based on sender_type
-            if sender_type == "ai":
-                sender_name = "AI Assistant"
-            elif sender_type == "agent":
-                sender_name = "Human Agent" # Simplify or fetch real name
-            elif sender_type == "customer":
-                sender_name = "Customer"    # Simplify or fetch real name
+        # 3. Extract Customer IDs from Messages (Single Loop)
+        customer_ids = {chat_customer_id} if chat_customer_id else set()
+        
+        for msg in messages_data:
+            if msg.get("sender_type") == "customer" and msg.get("sender_id"):
+                customer_ids.add(msg.get("sender_id"))
+                
+        # 4. Fetch Customer Names
+        customer_map = {}
+        if customer_ids:
+            cust_res = supabase.table("customers").select("id, name").in_("id", list(customer_ids)).execute()
+            if cust_res.data:
+                customer_map = {c["id"]: c["name"] for c in cust_res.data}
+
+        # 5. Fetch ALL Agents & Double-Index the Map
+        agent_map = {}
+        agents_res = supabase.table("agents").select("id, user_id, name").eq("organization_id", organization_id).execute()
+        
+        if agents_res.data:
+            for a in agents_res.data:
+                agent_name = a.get("name")
+                if a.get("id"):
+                    agent_map[str(a["id"])] = agent_name
+                if a.get("user_id"):
+                    agent_map[str(a["user_id"])] = agent_name
+
+        # 6. Map Identities and Secure Metadata
+        messages_with_sender = []
+        for message_data in messages_data:
+            sender_type = message_data.get("sender_type")
+            sender_id = message_data.get("sender_id")
+
+            if sender_type == "customer":
+                message_data["sender_name"] = customer_map.get(sender_id, "Customer")
+            elif sender_type in ["agent", "ai"]:
+                fallback = "AI Assistant" if sender_type == "ai" else "Human Agent"
+                message_data["sender_name"] = agent_map.get(str(sender_id), fallback)
+            else:
+                message_data["sender_name"] = "System"
             
-            message_data["sender_name"] = sender_name
+            # Secure the payload to satisfy Pydantic dict validation
+            message_data["metadata"] = {}
+            
             messages_with_sender.append(Message(**message_data))
 
-        # [NOTE] If sort_order was 'desc', the API returns [Newest, ..., Oldest].
-        # If your UI needs [Oldest, ..., Newest], simply reverse the list on the Frontend
-        # OR reverse it here before returning (only if you want pagination from end but order chronological).
-        # Usually, raw API returns pagination order.
+        total_count = response.count if response.count is not None else len(messages_with_sender)
         
         return MessageListResponse(
             messages=messages_with_sender,
-            total=response.count if response.count else len(messages_with_sender)
+            total=total_count
         )
 
     except HTTPException: raise
     except Exception as e:
         logger.error(f"Error fetching messages: {e}")
         raise HTTPException(500, "Failed to fetch messages")
-
+         
 @router.post(
     "/chats/{chat_id}/messages",
     response_model=Message,
@@ -1911,9 +1994,14 @@ async def create_message(
                     handled_by=chat_data.get("handled_by"),
                     sender_type=sender_type,
                     sender_id=sender_id,
+                    sender_name=sender_name, # [FIX] Make sure sender_name is passed
                     attachment=created_message.get("attachment").model_dump() if created_message.get("attachment") else None,
                     metadata=created_message.get("metadata"),
-                    created_at=created_message.get("created_at")
+                    created_at=created_message.get("created_at"),
+                    # [FIX] Added missing assignment parameters
+                    ai_agent_id=chat_data.get("ai_agent_id"),
+                    assigned_agent_id=chat_data.get("assigned_agent_id"),
+                    human_agent_id=chat_data.get("human_agent_id")
                 )
             except Exception as e:
                 logger.warning(f"WS Broadcast failed: {e}")
@@ -2098,7 +2186,7 @@ async def create_ticket_client(
         new_ticket = await ticket_service.create_ticket(
             data=data,
             organization_id=organization_id,
-            ticket_config=None,  # Service defaults to "TKT-" if None
+            ticket_config=None,  # Service defaults to "TKT-PLP-" if None
             actor_id=current_user.user_id,
             actor_type=ActorType.HUMAN
         )

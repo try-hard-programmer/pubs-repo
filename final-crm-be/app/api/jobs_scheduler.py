@@ -9,7 +9,9 @@ from app.config import settings
 from app.services.ticket_service import get_ticket_service
 from app.models.ticket import TicketUpdate, TicketStatus, ActorType
 from app.services.whatsapp_service import get_whatsapp_service 
-from app.services.telegram_service import get_telegram_service # <-- Telegram Import
+from app.services.telegram_service import get_telegram_service 
+from app.services.websocket_service import get_connection_manager
+from app.services.webhook_callback_service import get_webhook_callback_service
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +35,18 @@ async def auto_close_stale_tickets(api_key: str = Depends(verify_internal_secret
     supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
     ticket_service = get_ticket_service()
     wa_service = get_whatsapp_service() 
-    tg_service = get_telegram_service() # <-- Initialize Telegram Service
+    # [REMOVED] tg_service initialization
 
-    # We sync this to 15 minutes to match the exact promise in the DM text
-    threshold_time = datetime.now(timezone.utc) - timedelta(minutes=1)
+    threshold_time = datetime.now(timezone.utc) - timedelta(minutes=15)
 
     closed_count = 0
+    followed_up_count = 0
     followed_up_count = 0
     errors = []
 
     # 1. Grab candidates
     res = supabase.table("tickets") \
-        .select("id, chat_id, customer_id, status, ticket_number, metadata") \
+        .select("id, chat_id, customer_id, status, ticket_number, metadata, organization_id") \
         .in_("status", ["open", "in_progress", "resolved"]) \
         .execute()
 
@@ -82,6 +84,7 @@ async def auto_close_stale_tickets(api_key: str = Depends(verify_internal_secret
     # 3. Execute State Machine Logic
     for t in tickets_to_process:
         try:
+            # --- PARSE METADATA ---
             meta = t.get("metadata", {})
             if isinstance(meta, str):
                 try: meta = json.loads(meta)
@@ -90,69 +93,140 @@ async def auto_close_stale_tickets(api_key: str = Depends(verify_internal_secret
             is_group = meta.get("is_group", False)
             is_following_up = meta.get("following_up", False)
 
-            # STAGE 1: THE WARNING
-            if not is_following_up:
-                if not is_group and t.get("chat_id") and t.get("customer_id"):
+            # ==========================================
+            # STAGE 2: THE EXECUTION (TIMEOUT REACHED)
+            # ==========================================
+            if is_following_up:
+                # [RESTORED] Explicit check to protect group chats from instant closure
+                follow_up_at_str = meta.get("follow_up_at")
+                if follow_up_at_str:
                     try:
-                        chat_res = supabase.table("chats").select("channel, sender_agent_id").eq("id", t["chat_id"]).single().execute()
-                        cust_res = supabase.table("customers").select("phone, metadata").eq("id", t["customer_id"]).single().execute()
+                        fu_time_str = follow_up_at_str.replace("Z", "+00:00")
+                        if fu_time_str.endswith("+00"): fu_time_str = fu_time_str.replace("+00", "+00:00")
+                        follow_up_at = datetime.fromisoformat(fu_time_str)
                         
-                        if chat_res.data and cust_res.data:
-                            channel = chat_res.data.get("channel")
-                            session_id = chat_res.data.get("sender_agent_id")
-                            
-                            # Standardized phone/contact extraction
-                            phone = cust_res.data.get("phone")
-                            if not phone and cust_res.data.get("metadata"):
-                                phone = cust_res.data["metadata"].get("whatsapp_lid") or cust_res.data["metadata"].get("telegram_id")
+                        if follow_up_at > threshold_time:
+                            logger.info(f"⏳ Ticket {t['ticket_number']} is still in its grace period. Waiting.")
+                            continue
+                    except Exception as time_err:
+                        logger.warning(f"⚠️ Could not parse follow_up_at for ticket {t['ticket_number']}: {time_err}")
 
-                            if session_id and phone:
-                                dm_text = f"Dear Customer, apabila tidak ada problem lagi maka kami akan menutup sesi chat ini dengan nomer ticket {t['ticket_number']} pada waktu 15 menit kedepan."
-                                message_sent = False
-                                
-                                # Route based on channel
-                                if channel == "whatsapp":
-                                    await wa_service.send_text_message(session_id=session_id, phone_number=phone, message=dm_text)
-                                    message_sent = True
-                                    logger.info(f"📤 Sent WA Follow-Up to {phone} for ticket {t['ticket_number']}")
-                                
-                                elif channel == "telegram":
-                                    # Ensure send_text_message exists in TelegramService!
-                                    await tg_service.send_text_message(agent_id=session_id, chat_id=phone, message=dm_text)
-                                    message_sent = True
-                                    logger.info(f"📤 Sent TG Follow-Up to {phone} for ticket {t['ticket_number']}")
-
-                                # Log to DB to reset the 15-minute timer
-                                if message_sent:
-                                    supabase.table("messages").insert({
-                                        "chat_id": t["chat_id"],
-                                        "sender_type": "system",
-                                        "sender_id": "SYSTEM_CRON",
-                                        "content": dm_text,
-                                        "metadata": {"type": "follow_up_dm", "ticket_number": t["ticket_number"]}
-                                    }).execute()
-
-                    except Exception as dm_err:
-                        logger.error(f"⚠️ Failed to send Follow-Up DM for ticket {t['ticket_number']}: {dm_err}")
-
-                # Update metadata to mark that we sent the warning. DO NOT CLOSE YET.
-                meta["following_up"] = True
-                supabase.table("tickets").update({"metadata": meta}).eq("id", t["id"]).execute()
-                followed_up_count += 1
-                
-            # STAGE 2: THE EXECUTION
-            else:
-                # 15 minutes have passed since the warning. They ignored it. Shut it down.
+                # 15 minutes have passed since the warning. Shut it down.
                 await ticket_service.update_ticket(
                     ticket_id=t["id"],
                     update_data=TicketUpdate(status=TicketStatus.CLOSED),
-                    actor_id="SYSTEM_CRON",
+                    actor_id="SYSTEM_CRON", 
                     actor_type=ActorType.SYSTEM
                 )
-                
                 closed_count += 1
                 logger.info(f"🔒 Closed ticket {t['ticket_number']} after follow-up timeout.")
+                continue
 
+            # ==========================================
+            # STAGE 1: THE WARNING
+            # ==========================================
+            should_send_dm = not is_group and t.get("chat_id") and t.get("customer_id")
+
+            if should_send_dm:
+                try:
+                    chat_res = supabase.table("chats").select("channel, sender_agent_id, handled_by, assigned_agent_id, ai_agent_id").eq("id", t["chat_id"]).single().execute()
+                    cust_res = supabase.table("customers").select("name, phone, metadata").eq("id", t["customer_id"]).single().execute()
+                    
+                    if chat_res.data and cust_res.data:
+                        channel = chat_res.data.get("channel")
+                        session_id = chat_res.data.get("sender_agent_id")
+                        handled_by = chat_res.data.get("handled_by", "ai")
+                        
+                        if handled_by == "human":
+                            msg_sender_type = "agent"
+                            msg_sender_id = chat_res.data.get("assigned_agent_id") or session_id
+                        else:
+                            msg_sender_type = "ai"
+                            msg_sender_id = chat_res.data.get("ai_agent_id") or session_id
+
+                        phone = cust_res.data.get("phone")
+                        if not phone and cust_res.data.get("metadata"):
+                            phone = cust_res.data["metadata"].get("whatsapp_lid") or cust_res.data["metadata"].get("telegram_id")
+
+                        raw_name = cust_res.data.get("name")
+                        customer_name = raw_name.strip() if raw_name and raw_name.strip() else "Customer"
+                        if customer_name.lower() in ["new customer", "unknown customer", "null", "none"]:
+                            customer_name = "Customer"
+
+                        if session_id and phone and msg_sender_id:
+                            dm_text = f"Dear {customer_name}, apabila tidak ada problem lagi maka kami akan menutup sesi chat ini dengan nomer ticket {t['ticket_number']} pada waktu 15 menit kedepan."
+                            message_sent = False
+                            
+                            if channel == "whatsapp":
+                                await wa_service.send_text_message(session_id=session_id, phone_number=phone, message=dm_text)
+                                message_sent = True
+                            elif channel == "telegram":
+                                from app.services.webhook_callback_service import get_webhook_callback_service
+                                webhook_service = get_webhook_callback_service()
+                                mock_chat = {
+                                    "id": t["chat_id"],
+                                    "customer_id": t["customer_id"],
+                                    "sender_agent_id": session_id,
+                                    "ai_agent_id": None
+                                }
+                                tg_res = await webhook_service.send_telegram_callback(
+                                    chat=mock_chat,
+                                    message_content=dm_text,
+                                    supabase=supabase
+                                )
+                                if tg_res.get("success"):
+                                    message_sent = True
+                                else:
+                                    logger.error(f"Telegram sending failed: {tg_res.get('error')}")
+                                
+                            if message_sent:
+                                logger.info(f"📤 Sent {channel.upper()} Follow-Up to {phone} for ticket {t['ticket_number']}")
+                                
+                                msg_meta_payload = json.dumps({"type": "follow_up_dm", "ticket_number": t["ticket_number"]})
+                                
+                                msg_insert = supabase.table("messages").insert({
+                                    "chat_id": t["chat_id"],
+                                    "sender_type": msg_sender_type,
+                                    "sender_id": msg_sender_id,
+                                    "content": dm_text,
+                                    "metadata": msg_meta_payload 
+                                }).execute()
+
+                                if msg_insert.data and getattr(settings, "WEBSOCKET_ENABLED", True):
+                                    created_msg = msg_insert.data[0]
+                                    try:
+                                        from app.services.websocket_service import get_connection_manager
+                                        conn = get_connection_manager()
+                                        await conn.broadcast_new_message(
+                                            organization_id=t.get("organization_id"),
+                                            chat_id=t["chat_id"],
+                                            message_id=created_msg["id"],
+                                            customer_id=t["customer_id"],
+                                            customer_name="System", 
+                                            message_content=created_msg.get("content", ""),
+                                            channel=channel,
+                                            handled_by=handled_by,
+                                            sender_type=msg_sender_type,
+                                            sender_id=msg_sender_id,
+                                            created_at=created_msg.get("created_at"),
+                                            metadata=created_msg.get("metadata")
+                                        )
+                                        logger.info(f"📡 Broadcasted system message to WS for chat {t['chat_id']}")
+                                    except Exception as ws_e:
+                                        logger.warning(f"⚠️ WS Broadcast failed for cron job: {ws_e}")
+
+                except Exception as dm_err:
+                    logger.error(f"⚠️ Failed to send Follow-Up DM for ticket {t['ticket_number']}: {dm_err}")
+
+            # 7. Update Ticket State 
+            meta["following_up"] = True
+            meta["follow_up_at"] = datetime.now(timezone.utc).isoformat()
+            
+            ticket_meta_payload = json.dumps(meta) if isinstance(t.get("metadata"), str) else meta
+            
+            supabase.table("tickets").update({"metadata": ticket_meta_payload}).eq("id", t["id"]).execute()
+            followed_up_count += 1
+                
         except Exception as e:
             logger.error(f"Failed to process ticket {t['ticket_number']}: {e}")
             errors.append({"ticket": t["ticket_number"], "error": str(e)})

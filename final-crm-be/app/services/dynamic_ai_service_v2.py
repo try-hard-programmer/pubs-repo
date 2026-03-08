@@ -33,7 +33,7 @@ class DynamicAIServiceV2:
         self.credit_service = get_credit_service()
         self.mcp_service = get_mcp_service()
 
-    async def _broadcast_response(self, chat: Dict, message_db_record: Dict, agent_name: str):
+    async def _broadcast_response(self, chat: Dict, message_db_record: Dict, agent_name: str, real_agent_name: str = None):
         """
         Helper to send updates to WebSocket and Webhook.
         """
@@ -53,14 +53,20 @@ class DynamicAIServiceV2:
                     handled_by=chat.get("handled_by", "ai"),
                     sender_type="ai",
                     sender_id=message_db_record["sender_id"],
-                    sender_name=agent_name,
+                    sender_name=agent_name,         # <--- UNCHANGED (Preserves old behavior)
                     is_new_chat=False,
                     was_reopened=False,
                     metadata=message_db_record.get("metadata", {}),
-                    attachment=None
+                    attachment=None,
+                    # --- NEW OBJECTS ADDED BELOW ---
+                    ai_agent_id=chat.get("ai_agent_id"),
+                    ai_agent_name=real_agent_name,  # <--- NEW KEY gets the real DB name
+                    assigned_agent_id=chat.get("assigned_agent_id"),
+                    human_agent_id=chat.get("human_agent_id"),
+                    chat_status=chat.get("status", "open")
                 )
 
-            # 2. Webhook (WhatsApp/Telegram)
+            # 2. Webhook (WhatsApp/Telegram) 
             content = message_db_record.get("content", "")
             if content:
                 asyncio.create_task(
@@ -72,7 +78,7 @@ class DynamicAIServiceV2:
                 )
         except Exception as e:
             logger.error(f"⚠️ Broadcast failed: {e}")
-
+            
     def _check_and_update_alert_cooldown(self, chat_id: str) -> bool:
         now = time.time()
         last_time = self._alert_tracker.get(chat_id, 0)
@@ -109,6 +115,7 @@ class DynamicAIServiceV2:
             chat = None
             agent_id = None
             agent_name = "AI Assistant"
+            real_agent_name = None
 
             try:
                 # 1. Fetch Chat Data
@@ -124,19 +131,35 @@ class DynamicAIServiceV2:
                         if cust_res.data: real_customer_name = cust_res.data.get("name", "Customer")
                     except: pass
 
-                # 2. Fetch Agent Settings
+                # 2. Fetch Agent Settings & System Identity
                 agent_id = chat.get("sender_agent_id") 
-                if not agent_id:
-                    agent_res = await asyncio.to_thread(lambda: self.supabase.table("agents").select("id").eq("organization_id", chat["organization_id"]).limit(1).execute())
-                    if agent_res.data: agent_id = agent_res.data[0]["id"]
                 
+                # We need to resolve the real_agent_name from the database
+                if not agent_id:
+                    # Fallback: Get the first agent for the org, and grab both ID and Name
+                    agent_res = await asyncio.to_thread(lambda: self.supabase.table("agents").select("id, name").eq("organization_id", chat["organization_id"]).limit(1).execute())
+                    if agent_res.data: 
+                        agent_id = agent_res.data[0]["id"]
+                        real_agent_name = agent_res.data[0].get("name")
+                else:
+                    # We have the ID from the chat, but we need to fetch the real name
+                    try:
+                        agent_name_res = await asyncio.to_thread(lambda: self.supabase.table("agents").select("name").eq("id", agent_id).single().execute())
+                        if agent_name_res.data:
+                            real_agent_name = agent_name_res.data.get("name")
+                    except: pass
+                
+                # Provide a safe default if the DB lookup fails entirely
+                if not real_agent_name:
+                    real_agent_name = "AI Assistant"
+
                 agent_settings = {}
                 if agent_id:
                     settings_res = await asyncio.to_thread(lambda: self.supabase.table("agent_settings").select("*").eq("agent_id", agent_id).execute())
                     if settings_res.data: 
                         agent_settings = settings_res.data[0]
                         # [CRITICAL FIX] Inject agent_id so the Agent class can use it for tool execution later
-                        agent_settings["agent_id"] = agent_id 
+                        agent_settings["agent_id"] = agent_id
                 
                 def parse_cfg(key):
                     val = agent_settings.get(key, {})
@@ -294,7 +317,7 @@ class DynamicAIServiceV2:
 
                 res = await asyncio.to_thread(lambda: self.supabase.table("messages").insert(ai_msg).execute())
                 full_db_record = res.data[0]
-                await self._broadcast_response(chat, full_db_record, agent_name)
+                await self._broadcast_response(chat, full_db_record, agent_name, real_agent_name)
 
                 # Billing
                 if usage and chat.get("organization_id") and not metadata.get("is_error", False):

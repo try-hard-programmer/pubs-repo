@@ -196,7 +196,7 @@ class ConnectionManager:
         - Fixes argument order (org_id first, then message).
         """
         await self.broadcast_to_organization(message, organization_id)
-    # [FIX] Added 'attachment' parameter
+    
     async def broadcast_new_message(
         self,
         organization_id: str,
@@ -212,17 +212,31 @@ class ConnectionManager:
         sender_name: str = None,
         is_new_chat: bool = False,
         was_reopened: bool = False,
-        metadata: Dict[str, Any] = None,  # <--- Added missing parameter
+        metadata: Dict[str, Any] = None,
         attachment: Dict[str, Any] = None,
-        created_at: str = None
+        created_at: str = None,
+        ai_agent_id: str = None,
+        ai_agent_name: str = None,
+        assigned_agent_id: str = None,
+        human_agent_id: str = None,
+        human_agent_name: str = None,
+        chat_status: str = "open" # [FIX] Additive parameter for Chat API parity
     ):
         """
-        Broadcast new incoming message notification to all organization members.
+        Broadcast new incoming message notification.
+        Preserves legacy flat structure while adding the new nested Chat API structure.
         """
+        from datetime import datetime
+        now_iso = datetime.utcnow().isoformat()
+        msg_created_at = created_at or now_iso
+
         notification = {
             "type": "new_message",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": now_iso,
             "data": {
+                # ==========================================================
+                # 1. LEGACY FLAT STRUCTURE (Preserved to prevent UI breaks)
+                # ==========================================================
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "customer_id": customer_id,
@@ -235,13 +249,38 @@ class ConnectionManager:
                 "sender_name": sender_name,
                 "is_new_chat": is_new_chat,
                 "was_reopened": was_reopened,
-                "metadata": metadata,  # <--- Include metadata in payload
+                "metadata": metadata,
                 "attachment": attachment,
-                "created_at": created_at
+                "created_at": msg_created_at,
+                "ai_agent_id": ai_agent_id,
+                "ai_agent_name": ai_agent_name,
+                "assigned_agent_id": assigned_agent_id,
+                "human_agent_id": human_agent_id,
+                "human_agent_name": human_agent_name,
+
+                # ==========================================================
+                # 2. NEW NESTED STRUCTURE (Matches REST API Chat model)
+                # ==========================================================
+                "id": chat_id, # Standardizes root ID
+                "status": chat_status,
+                "unread_count": 1,
+                "last_message_at": msg_created_at,
+                "last_message": {
+                    "id": message_id,
+                    "chat_id": chat_id,
+                    "sender_type": sender_type,
+                    "sender_id": sender_id,
+                    "sender_name": sender_name,
+                    "content": message_content,
+                    "metadata": metadata or {},
+                    "attachment": attachment,
+                    "created_at": msg_created_at,
+                    "updated_at": msg_created_at
+                }
             }
         }
 
-        await self.broadcast_to_organization(notification, organization_id)          
+        await self.broadcast_to_organization(notification, organization_id)  
 
     async def broadcast_chat_update(
         self,

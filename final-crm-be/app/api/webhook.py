@@ -645,16 +645,53 @@ async def process_webhook_message_v2(
                     "name": "Media Attachment"
                 }
 
-            sender_display = customer_name
+            sender_display = customer_name or "Unknown"
 
+            # --- [FIX] RESOLVE AGENT NAMES FOR NEW CHATS ---
+            ai_agent_name = None
+            ai_agent_id = res.get("ai_agent_id")
+            if ai_agent_id:
+                if ai_agent_id == agent["id"]: # Fast path: The webhook agent IS the AI agent
+                    ai_agent_name = agent.get("name")
+                else: 
+                    try:
+                        ai_res = supabase.table("agents").select("name").eq("id", ai_agent_id).execute()
+                        if ai_res.data: ai_agent_name = ai_res.data[0].get("name")
+                    except Exception: pass
+
+            human_agent_name = None
+            human_agent_id = res.get("human_agent_id")
+            if human_agent_id:
+                if human_agent_id == agent["id"]:
+                    human_agent_name = agent.get("name")
+                else:
+                    try:
+                        hum_res = supabase.table("agents").select("name").eq("id", human_agent_id).execute()
+                        if hum_res.data: human_agent_name = hum_res.data[0].get("name")
+                    except Exception: pass
+            
+            # [FIXED SYNTAX ERROR - ADDED COMMAS]
             await get_connection_manager().broadcast_new_message(
-                organization_id=org_id, chat_id=chat_id, message_id=msg_id,
-                customer_id=cust_id, customer_name=sender_display or "Unknown",
-                message_content=message_content, channel=channel, handled_by=res["handled_by"],
-                sender_type="customer", sender_id=cust_id, is_new_chat=res["is_new_chat"],
+                organization_id=org_id, 
+                chat_id=chat_id, 
+                message_id=msg_id,
+                customer_id=cust_id, 
+                customer_name=sender_display,
+                message_content=message_content, 
+                channel=channel, 
+                handled_by=res["handled_by"],
+                sender_type="customer", 
+                sender_id=cust_id, 
+                sender_name=sender_display, 
+                is_new_chat=res["is_new_chat"],
                 was_reopened=res.get("was_reopened", False), 
                 metadata=fresh_metadata,
-                attachment=attachment_data
+                attachment=attachment_data, 
+                ai_agent_id=ai_agent_id,
+                ai_agent_name=ai_agent_name,
+                assigned_agent_id=res.get("assigned_agent_id"),
+                human_agent_id=human_agent_id,
+                human_agent_name=human_agent_name
             )
         except Exception as e:
             logger.error(f"❌ WS Broadcast Failed: {e}")
