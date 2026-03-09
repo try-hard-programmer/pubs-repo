@@ -352,7 +352,7 @@ class DynamicCRMAgentV2:
                     payload["tools"] = external_tools
                     payload["tool_choice"] = "auto"
 
-                # logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
+                logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
                 
                 # === 5. CALL PROXY ===
                 async with aiohttp.ClientSession(timeout=timeout) as session:
