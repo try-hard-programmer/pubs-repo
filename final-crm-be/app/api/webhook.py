@@ -837,12 +837,20 @@ async def whatsapp_unofficial_webhook( message: WhatsAppUnofficialWebhookMessage
         supabase = get_supabase_client()
         agent_id = message.sessionId
 
-        # 1. System Events
-        system_events = ["qr", "authenticated", "ready", "disconnected", "loading_screen", "message_ack", "message_revoke", "status_find_partner"]
-        if message.dataType in system_events:
-            return JSONResponse(content={"success": True, "status": "processed_system_event"})
+        # 1. System Events (EXPANDED BLACKLIST)
+        system_events = [
+            "qr", "authenticated", "ready", "disconnected", "loading_screen", 
+            "message_ack", "message_revoke", "status_find_partner",
+            "e2e_notification", "notification_template", "protocolMessage", "call_log", "gp2"
+        ]
+        
+        # Lowercase for safe comparison
+        safe_data_type = str(message.dataType).strip().lower()
+        
+        if safe_data_type in system_events:
+            return JSONResponse(content={"success": True, "status": f"processed_system_event_{safe_data_type}"})
 
-        if message.dataType == "message_sent":
+        if safe_data_type == "message_sent":
             return JSONResponse(content={"success": True, "status": "logged_sent"})
 
         # Guard: data must be a non-null dict to proceed
@@ -852,6 +860,21 @@ async def whatsapp_unofficial_webhook( message: WhatsAppUnofficialWebhookMessage
         # 2. Structure & Dedup
         data_wrapper = message.data.get("message", {}) or message.data.get("messageMedia", {})
         data_content = data_wrapper.get("_data", {}) or data_wrapper 
+        
+        # --- THE NEW SHIELD: Inspect Internal Message Types & Empty Bodies ---
+        internal_type = str(data_content.get("type", "")).strip().lower()
+        if internal_type in system_events or internal_type == "protocolmessage":
+            logger.info(f"🛡️ Blocked internal protocol message: {internal_type}")
+            return JSONResponse(content={"status": "ignored", "reason": f"internal_system_type_{internal_type}"})
+
+        # Aggressive Body Check: Drop the "[media/empty]" ghosts
+        raw_body = str(data_content.get("body", "")).strip()
+        if raw_body == "[media/empty]" or raw_body == "":
+            # Only drop if it's truly empty AND has no attached media data
+            if not data_content.get("mimetype") and not data_wrapper.get("mimetype"):
+                logger.info(f"🛡️ Blocked empty/ghost message payload.")
+                return JSONResponse(content={"status": "ignored", "reason": "ghost_empty_payload"})
+
         whatsapp_id = data_content.get("id", {}).get("id") or message.data.get("id", {}).get("id")
 
         if not whatsapp_id and message.dataType not in ["ready", "authenticated"]:

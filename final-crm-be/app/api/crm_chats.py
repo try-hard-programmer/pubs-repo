@@ -1078,13 +1078,10 @@ async def create_chat(
             if not acquired:
                 raise HTTPException(429, "Concurrent creation detected. Please retry.")
 
-            # [FIX 1] Removed the .neq("status", "resolved") filter so we can reopen it.
-            # Added order and limit to ensure we always get the most recent thread.
             active_chat = supabase.table("chats")\
                 .select("*")\
                 .eq("customer_id", customer_id)\
                 .eq("channel", channel_val)\
-                .eq("sender_agent_id", sender_agent_id) \
                 .neq("status", "closed")\
                 .order("last_message_at", desc=True)\
                 .limit(1)\
@@ -1093,47 +1090,40 @@ async def create_chat(
             if active_chat.data:
                 chat_obj = active_chat.data[0]
                 
-                # [FIX 2] Contextual Hijack & Reopen Logic
-                is_resolved = chat_obj.get("status") == "resolved"
+                current_status = chat_obj.get("status")
                 existing_assignee = chat_obj.get("assigned_agent_id")
                 
-                # If it's resolved, it's free to be claimed. If it's active, check who owns it.
-                is_already_assigned = not is_resolved and (chat_obj.get("handled_by") == "human" or existing_assignee is not None)
-                
-                if is_already_assigned:
-                    # Allow the same agent to reuse their own chat. Block DIFFERENT agents from stealing active chats.
-                    if assigned_agent_id and existing_assignee and existing_assignee != assigned_agent_id:
-                        logger.warning(f"⛔ Blocked attempt to hijack assigned chat {chat_obj['id']}")
-                        raise HTTPException(
-                            status_code=409, 
-                            detail="This customer already has an active chat assigned to another agent."
-                        )
-
-                logger.info(f"♻️ Reusing (and reopening) Chat {chat_obj['id']}")
+                is_claimable_state = current_status in ["resolved", "open"]
+                is_already_assigned = not is_claimable_state and (chat_obj.get("handled_by") == "human" or existing_assignee is not None)
                 
                 upd = {"sender_agent_id": sender_agent_id}
-                
-                # Apply new status, effectively waking it up from 'resolved' if necessary
-                if assigned_agent_id:
-                    upd.update({
-                        "status": status_value, # Uses the state assigned earlier in the function
-                        "handled_by": handled_by,
-                        "assigned_agent_id": assigned_agent_id
-                    })
-                    if human_agent_id: upd["human_agent_id"] = human_agent_id
-                    if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
-                elif handled_by == "ai":
-                    upd.update({
-                        "status": "open",
-                        "handled_by": "ai",
-                        "assigned_agent_id": None,
-                        "human_agent_id": None
-                    })
-                
+
+                if is_already_assigned:
+                    # Guard 1: Block explicit hijacks by a different agent
+                    if assigned_agent_id and existing_assignee and existing_assignee != assigned_agent_id:
+                        logger.warning(f"⛔ Blocked attempt to hijack assigned chat {chat_obj['id']}")
+                        raise HTTPException(409, "This customer already has an active chat assigned to another agent.")
+                    
+                    # Guard 2: Prevent implicit downgrades from wiping the human assignment
+                    if assigned_agent_id:
+                        upd.update({"status": status_value, "handled_by": handled_by, "assigned_agent_id": assigned_agent_id})
+                        if human_agent_id: upd["human_agent_id"] = human_agent_id
+                        if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
+                    elif not assigned_agent_id and existing_assignee:
+                        upd.update({"status": "assigned", "handled_by": "human"})
+                else:
+                    # Chat is claimable; safe to apply new state
+                    if assigned_agent_id:
+                        upd.update({"status": status_value, "handled_by": handled_by, "assigned_agent_id": assigned_agent_id})
+                        if human_agent_id: upd["human_agent_id"] = human_agent_id
+                        if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
+                    elif handled_by == "ai":
+                        upd.update({"status": "open", "handled_by": "ai", "assigned_agent_id": None, "human_agent_id": None})
+
+                logger.info(f"♻️ Reusing (and reopening) Chat {chat_obj['id']}")
                 supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
                 chat_obj.update(upd)
             else:
-                # CREATION LOGIC REMAINS THE SAME
                 new_chat_data = {
                     "organization_id": organization_id, "customer_id": customer_id, "channel": channel_val,
                     "assigned_agent_id": assigned_agent_id, "ai_agent_id": ai_agent_id, "human_agent_id": human_agent_id,

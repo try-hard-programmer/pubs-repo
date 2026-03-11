@@ -164,10 +164,10 @@ class DynamicCRMAgentV2:
                     tool_descriptions.append(f"• {tool_name}: {tool_desc}")
                 
                 prompt += f"""
-            ## AVAILABLE TOOLS
-            You have access to these tools to help users:
-            {chr(10).join(tool_descriptions)}
-            """
+                ## AVAILABLE TOOLS
+                You have access to these tools. You MUST use them to answer questions that require real data. Never answer from memory or assumptions.
+                {chr(10).join(tool_descriptions)}
+                """
 
             if not use_custom:
                 if rag_context and rag_context.strip():
@@ -328,7 +328,7 @@ class DynamicCRMAgentV2:
             
             # === 4. EXECUTION LOOP (MCP SUPPORT) ===
             current_turn = 0
-            max_turns = 5 
+            max_turns = 10  # Increased: multi-step MCP queries need more turns (e.g. operator→produk→produk = 3 turns)
             final_usage = {"total_tokens": 0}
             timeout = aiohttp.ClientTimeout(total=300)
 
@@ -352,7 +352,7 @@ class DynamicCRMAgentV2:
                     payload["tools"] = external_tools
                     payload["tool_choice"] = "auto"
 
-                logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
+                # logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
                 
                 # === 5. CALL PROXY ===
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -362,11 +362,17 @@ class DynamicCRMAgentV2:
                         headers={"Content-Type": "application/json"}
                     ) as response:
                         
+                        if response.status == 429:
+                            # Rate limit — wait and retry once
+                            logger.warning(f"⚠️ [AGENT] 429 Rate Limit on turn {current_turn}. Waiting 3s then retrying...")
+                            await asyncio.sleep(3)
+                            continue
+
                         if response.status != 200:
                             error_text = await response.text()
                             logger.error(f"❌ Proxy Error {response.status}: {error_text}")
                             return {
-                                "content": "Sorry, the system is currently busy. Please try again in a moment.",
+                                "content": "Maaf, sistem sedang sibuk. Silakan coba lagi dalam beberapa detik.",
                                 "metadata": {"error": f"Proxy {response.status}", "is_error": True},
                                 "usage": final_usage
                             }
@@ -385,6 +391,7 @@ class DynamicCRMAgentV2:
                         tool_calls = message.get("tool_calls")
                         
                         if tool_calls:
+                            logger.info(f"🔄 [AGENT] Turn {current_turn}/{max_turns} — {len(tool_calls)} tool call(s): {[t['function']['name'].split('__')[-1] for t in tool_calls]}")
                             # A. Append AI's intent to history
                             messages.append(message) 
                             
@@ -403,6 +410,22 @@ class DynamicCRMAgentV2:
                                 )
                                 
                                 tool_output = tool_result.get("output", "Error executing tool")
+
+                                # Truncate large tool outputs to prevent context window overflow (429)
+                                # A produk query with limit=1000 can return ~150KB of JSON
+                                MAX_TOOL_OUTPUT_CHARS = 12000  # ~3000 tokens
+                                if len(tool_output) > MAX_TOOL_OUTPUT_CHARS:
+                                    # Parse and summarize instead of raw dump
+                                    try:
+                                        parsed = json.loads(tool_output)
+                                        count = parsed.get("count", 0)
+                                        data = parsed.get("data", [])
+                                        # Keep first 50 rows only
+                                        truncated = {"resource": parsed.get("resource"), "count": count, "data": data[:50], "_truncated": True, "_total_available": count}
+                                        tool_output = json.dumps(truncated)
+                                        logger.info(f"✂️ [AGENT] Tool output truncated: {count} rows → kept first 50 to avoid context overflow")
+                                    except Exception:
+                                        tool_output = tool_output[:MAX_TOOL_OUTPUT_CHARS] + "...[TRUNCATED]"
                                 
                                 # C. Append Result to history
                                 messages.append({
@@ -435,7 +458,8 @@ class DynamicCRMAgentV2:
                             "usage": final_usage
                         }
 
-            return {"content": "Loop limit reached.", "metadata": {"is_error": True}, "usage": final_usage}
+            logger.warning(f"⚠️ [AGENT] Loop limit reached after {max_turns} turns. Last tool calls may not have completed.")
+            return {"content": "Maaf, permintaan ini membutuhkan terlalu banyak langkah. Coba perjelas pertanyaanmu.", "metadata": {"is_error": True}, "usage": final_usage}
 
         # [ERROR BLOCK 1] Connection Failed (Offline)
         except aiohttp.ClientConnectorError:

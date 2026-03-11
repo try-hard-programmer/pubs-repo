@@ -129,20 +129,43 @@ class MessageRouterService:
         
     def _update_customer_name_if_needed(self, customer: Dict[str, Any], new_name: Optional[str]) -> Dict[str, Any]:
         """
-        Helper to update 'Unknown' names if we get a better name later.
+        Progressive enrichment: Replaces low-quality names (IDs, numbers) with real names.
+        Protects high-quality names from being overwritten by raw IDs.
         """
         try:
-            current_name = customer.get("name", "")
-            # If we have a new name, and the current one is "Unknown" or empty
-            if new_name and (not current_name or "Unknown" in current_name):
+            current_name = str(customer.get("name", "")).strip()
+            
+            # Guard 1: Reject empty payloads immediately
+            if not new_name or not str(new_name).strip():
+                return customer
                 
+            new_name_clean = str(new_name).strip()
+            
+            # Guard 2: THE BLOCK. Reject inbound low-quality data.
+            # If the incoming "name" is just a number or an LID, it cannot overwrite anything.
+            if new_name_clean.isdigit() or "@" in new_name_clean:
+                return customer
+
+            # State Interrogation: Is the database holding replaceable data?
+            is_replaceable_state = (
+                not current_name 
+                or "Unknown" in current_name 
+                or "WhatsApp" in current_name 
+                or current_name.isdigit() 
+                or current_name == str(customer.get("phone", ""))
+                or "@" in current_name
+            )
+
+            # Execute Upgrade
+            if is_replaceable_state and current_name != new_name_clean:
                 # Update DB
                 self.supabase.table("customers").update({
-                    "name": new_name
+                    "name": new_name_clean
                 }).eq("id", customer["id"]).execute()
                 
-                # Return updated object locally
-                customer["name"] = new_name
+                # Update local reference
+                customer["name"] = new_name_clean
+                
         except Exception as e:
             logger.warning(f"⚠️ Failed to update customer name: {e}")
             
