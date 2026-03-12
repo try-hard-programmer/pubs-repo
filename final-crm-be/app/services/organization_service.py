@@ -105,15 +105,7 @@ class OrganizationService:
             raise RuntimeError(f"Failed to create organization: {str(e)}")
 
     async def get_user_organization(self, user_id: str) -> Optional[OrganizationWithOwnership]:
-        """
-        Get organization for a specific user.
-
-        Args:
-            user_id: UUID of the user
-
-        Returns:
-            Organization with ownership flag if found, None otherwise
-        """
+        """Get organization for a specific user."""
         try:
             # Call database function to get user's organization
             response = self.client.rpc(
@@ -125,6 +117,19 @@ class OrganizationService:
                 return None
 
             org_data = response.data[0]
+            
+            # [NEW] Fetch exact member count for the frontend UI
+            try:
+                count_res = self.client.table("organization_members")\
+                    .select("user_id", count="exact")\
+                    .eq("organization_id", org_data["id"])\
+                    .limit(1)\
+                    .execute()
+                org_data["member_count"] = count_res.count or 0
+            except Exception as e:
+                logger.warning(f"Failed to fetch member count for org {org_data['id']}: {e}")
+                org_data["member_count"] = 0
+
             return OrganizationWithOwnership(**org_data)
 
         except Exception as e:
@@ -132,22 +137,28 @@ class OrganizationService:
             return None
 
     async def get_organization_by_id(self, org_id: str) -> Optional[Organization]:
-        """
-        Get organization by ID.
-
-        Args:
-            org_id: UUID of the organization
-
-        Returns:
-            Organization if found, None otherwise
-        """
+        """Get organization by ID."""
         try:
             response = self.client.table("organizations").select("*").eq("id", org_id).execute()
 
             if not response.data or len(response.data) == 0:
                 return None
 
-            return Organization(**response.data[0])
+            org_data = response.data[0]
+
+            # [NEW] Fetch exact member count for the frontend UI
+            try:
+                count_res = self.client.table("organization_members")\
+                    .select("user_id", count="exact")\
+                    .eq("organization_id", org_id)\
+                    .limit(1)\
+                    .execute()
+                org_data["member_count"] = count_res.count or 0
+            except Exception as e:
+                logger.warning(f"Failed to fetch member count for org {org_id}: {e}")
+                org_data["member_count"] = 0
+
+            return Organization(**org_data)
 
         except Exception as e:
             logger.error(f"Error fetching organization {org_id}: {e}")
@@ -360,25 +371,15 @@ class OrganizationService:
         user_id: str
     ) -> List[OrganizationMemberWithRole]:
         """
-        Get all members of an organization with their roles.
-
-        Args:
-            org_id: UUID of the organization
-            user_id: UUID of the requesting user (must be member)
-
-        Returns:
-            List of organization members with role information
-
-        Raises:
-            RuntimeError: If user is not a member
+        MIDDLEMAN: Validates if user belongs to org, then delegates to role_service.
         """
         try:
-            # Verify user is member of organization
+            # 1. Verify user is member of organization
             user_org = await self.get_user_organization(user_id)
             if not user_org or user_org.id != org_id:
                 raise RuntimeError("User is not a member of this organization")
 
-            # Use role service to get members with roles
+            # 2. Delegate to Role Service
             role_service = get_role_service()
             members = await role_service.get_organization_members_with_roles(org_id)
 
@@ -455,7 +456,87 @@ class OrganizationService:
             logger.error(f"Error fetching children for user {user_id}: {e}")
             return []
 
+    async def remove_member_from_organization(
+        self,
+        org_id: str,
+        target_user_id: str
+    ) -> bool:
+        """
+        Safely orchestrates the removal of a member by tearing down 
+        their roles, agent profiles, active assignments, and membership.
+        """
+        try:
+            # 1. Bouncer: Verify target is actually a member and NOT the owner
+            member_check = self.client.table("organization_members")\
+                .select("is_owner")\
+                .eq("organization_id", org_id)\
+                .eq("user_id", target_user_id)\
+                .execute()
 
+            if not member_check.data:
+                raise RuntimeError("User is not a member of this organization.")
+            
+            if member_check.data[0].get("is_owner"):
+                raise RuntimeError("Cannot remove the organization owner. Transfer ownership first.")
+
+            # 2. Teardown A: Revoke Custom Roles
+            self.client.table("user_roles")\
+                .delete()\
+                .eq("organization_id", org_id)\
+                .eq("user_id", target_user_id)\
+                .execute()
+
+            # 3. Teardown B: Archive Agent & Unassign Operational Data
+            agent_check = self.client.table("agents")\
+                .select("id")\
+                .eq("organization_id", org_id)\
+                .eq("user_id", target_user_id)\
+                .execute()
+
+            if agent_check.data:
+                agent_id = agent_check.data[0]["id"]
+                from datetime import timezone
+                
+                # Soft delete the agent profile
+                self.client.table("agents").update({
+                    "status": "archived",
+                    "user_id": None,
+                    "last_active_at": datetime.now(timezone.utc).isoformat()
+                }).eq("id", agent_id).execute()
+
+                # Unassign Active Chats
+                active_statuses = ["open", "assigned", "pending"]
+                
+                self.client.table("chats") \
+                    .update({"assigned_agent_id": None, "status": "open"}) \
+                    .eq("assigned_agent_id", agent_id) \
+                    .in_("status", active_statuses) \
+                    .execute()
+                    
+                self.client.table("chats") \
+                    .update({
+                        "human_agent_id": None, 
+                        "handled_by": "unassigned", 
+                        "status": "open"
+                    }) \
+                    .eq("human_agent_id", agent_id) \
+                    .in_("status", active_statuses) \
+                    .execute()
+
+            # 4. Final Teardown: Remove Organization Membership
+            self.client.table("organization_members")\
+                .delete()\
+                .eq("organization_id", org_id)\
+                .eq("user_id", target_user_id)\
+                .execute()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Offboarding orchestration failed for {target_user_id} in {org_id}: {e}")
+            raise RuntimeError(str(e))
+
+            
 # Global organization service instance
 _organization_service: Optional[OrganizationService] = None
 

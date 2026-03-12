@@ -739,50 +739,53 @@ async def create_knowledge_document(
         supabase = get_supabase_client()
 
         # =========================================================
-        # STEP 1: FAST VALIDATION & SETUP
+        # STEP 1: STRICT SYNCHRONOUS VALIDATION
         # =========================================================
         filename = file.filename
-        file_content = await file.read() # Read into memory instantly before connection closes
+        file_content = await file.read() 
         doc_processor = DocumentProcessorV2()
 
+        # Applies the "Mendukung PDF..." rules and empty file check
         try:
             ext = doc_processor.validate_knowledge_file(filename, file_content)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+        # Verify agent ownership
+        agent_check = supabase.table("agents").select("id, name").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        if not agent_check.data:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent_name = agent_check.data[0]["name"]
+        
+        # [NEW] Check for duplicate document names
+        existing_doc = supabase.table("knowledge_documents").select("id").eq("agent_id", agent_id).eq("name", filename).execute()
+        if existing_doc.data:
+            raise HTTPException(status_code=409, detail=f"Dokumen dengan nama '{filename}' sudah ada.")
 
         file_size_kb = len(file_content) // 1024
         file_type = ext.upper()
         file_id = str(uuid4())
         agent_bucket_name = f"agent_{agent_id}"
 
-        # Verify agent ownership
-        agent_check = supabase.table("agents").select("id, name").eq("id", agent_id).eq("organization_id", organization_id).execute()
-        if not agent_check.data:
-            raise HTTPException(404, detail="Agent not found")
-        agent_name = agent_check.data[0]["name"]
-
         # =========================================================
-        # STEP 2: SYNCHRONOUS STORAGE UPLOAD (Backup raw file)
+        # STEP 2: STORAGE UPLOAD
         # =========================================================
         try:
             buckets = supabase.storage.list_buckets()
             if not any(b.name == agent_bucket_name for b in buckets):
                 supabase.storage.create_bucket(agent_bucket_name, options={"public": False})
-        except Exception:
-            pass
-
-        try:
+                
             supabase.storage.from_(agent_bucket_name).upload(
                 path=file_id,
                 file=file_content,
                 file_options={"content-type": file.content_type, "upsert": "false"}
             )
         except Exception as e:
-            logger.error(f"❌ Fast storage upload failed: {e}")
-            raise HTTPException(500, detail="Failed to save file to storage.")
+            logger.error(f"❌ Storage upload failed: {e}")
+            raise HTTPException(status_code=500, detail="Gagal mengunggah file ke penyimpanan.")
 
         # =========================================================
-        # STEP 3: CREATE "PENDING" DB RECORD & RETURN TO FRONTEND
+        # STEP 3: DATABASE INSERT
         # =========================================================
         doc_data = {
             "agent_id": agent_id,
@@ -794,7 +797,7 @@ async def create_knowledge_document(
                 "file_id": file_id,
                 "bucket": agent_bucket_name,
                 "processor_version": "v2",
-                "status": "pending",  # STATE MACHINE IS CRITICAL HERE
+                "status": "pending",  
                 "chunks": 0
             }
         }
@@ -802,12 +805,12 @@ async def create_knowledge_document(
         db_response = supabase.table("knowledge_documents").insert(doc_data).execute()
         if not db_response.data:
             supabase.storage.from_(agent_bucket_name).remove([file_id])
-            raise HTTPException(500, detail="Database insert failed")
+            raise HTTPException(status_code=500, detail="Gagal menyimpan data dokumen.")
 
         created_doc = KnowledgeDocument(**db_response.data[0])
 
         # =========================================================
-        # STEP 4: PUSH TO REDIS QUEUE (instead of BackgroundTasks)
+        # STEP 4: PUSH TO QUEUE WITH ROLLBACK
         # =========================================================
         queue = get_document_queue_service()
         queued = queue.enqueue(
@@ -821,13 +824,13 @@ async def create_knowledge_document(
         )
 
         if not queued:
-            logger.error(f"⚠️ Redis queue failed for {filename}, file safe in storage.")
-            error_meta = {**doc_data["metadata"], "status": "queue_failed"}
-            supabase.table("knowledge_documents") \
-                .update({"metadata": error_meta}) \
-                .eq("id", created_doc.id).execute()
+            logger.error(f"⚠️ Redis queue failed for {filename}, rolling back.")
+            # [CRITICAL FIX] Delete file and DB record so it doesn't fail silently
+            supabase.storage.from_(agent_bucket_name).remove([file_id])
+            supabase.table("knowledge_documents").delete().eq("id", created_doc.id).execute()
+            raise HTTPException(status_code=500, detail="Sistem sedang sibuk. Gagal memproses dokumen.")
 
-        logger.info(f"🚀 Queued background processing for {filename}. Unblocking UI.")
+        logger.info(f"🚀 Queued background processing for {filename}.")
         response.status_code = status.HTTP_202_ACCEPTED
         return created_doc
 
@@ -835,8 +838,7 @@ async def create_knowledge_document(
         raise
     except Exception as e:
         logger.error(f"❌ Upload initialization failed: {e}", exc_info=True)
-        raise HTTPException(500, detail="An unexpected system error occurred.")
-
+        raise HTTPException(status_code=500, detail="Terjadi kesalahan sistem.")
 
 @router.delete(
     "/{agent_id}/knowledge-documents/{doc_id}",

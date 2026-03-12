@@ -1076,7 +1076,7 @@ async def create_chat(
         
         async with acquire_lock(lock_key, expire=5) as acquired:
             if not acquired:
-                raise HTTPException(429, "Concurrent creation detected. Please retry.")
+                raise HTTPException(status_code=429, detail="Concurrent creation detected. Please retry.")
 
             active_chat = supabase.table("chats")\
                 .select("*")\
@@ -1096,29 +1096,30 @@ async def create_chat(
                 is_claimable_state = current_status in ["resolved", "open"]
                 is_already_assigned = not is_claimable_state and (chat_obj.get("handled_by") == "human" or existing_assignee is not None)
                 
-                upd = {"sender_agent_id": sender_agent_id}
+                # -------------------------------------------------------------
+                # GUARD 1: STRICT LOCK (Flattened)
+                # -------------------------------------------------------------
+                # Is it routed to AI (None) or a different human?
+                is_hijack_attempt = not assigned_agent_id or (assigned_agent_id and existing_assignee != assigned_agent_id)
+                
+                if is_already_assigned and is_hijack_attempt:
+                    logger.warning(f"⛔ Blocked attempt to hijack human-assigned chat {chat_obj['id']}.")
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, 
+                        detail="Pelanggan ini sedang dalam percakapan aktif dengan agen lain. Harap selesaikan terlebih dahulu."
+                    )
 
-                if is_already_assigned:
-                    # Guard 1: Block explicit hijacks by a different agent
-                    if assigned_agent_id and existing_assignee and existing_assignee != assigned_agent_id:
-                        logger.warning(f"⛔ Blocked attempt to hijack assigned chat {chat_obj['id']}")
-                        raise HTTPException(409, "This customer already has an active chat assigned to another agent.")
-                    
-                    # Guard 2: Prevent implicit downgrades from wiping the human assignment
-                    if assigned_agent_id:
-                        upd.update({"status": status_value, "handled_by": handled_by, "assigned_agent_id": assigned_agent_id})
-                        if human_agent_id: upd["human_agent_id"] = human_agent_id
-                        if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
-                    elif not assigned_agent_id and existing_assignee:
-                        upd.update({"status": "assigned", "handled_by": "human"})
-                else:
-                    # Chat is claimable; safe to apply new state
-                    if assigned_agent_id:
-                        upd.update({"status": status_value, "handled_by": handled_by, "assigned_agent_id": assigned_agent_id})
-                        if human_agent_id: upd["human_agent_id"] = human_agent_id
-                        if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
-                    elif handled_by == "ai":
-                        upd.update({"status": "open", "handled_by": "ai", "assigned_agent_id": None, "human_agent_id": None})
+                # -------------------------------------------------------------
+                # STATE UPDATE PREPARATION (Flattened)
+                # -------------------------------------------------------------
+                upd = {"sender_agent_id": sender_agent_id}
+                
+                if assigned_agent_id:
+                    upd.update({"status": status_value, "handled_by": handled_by, "assigned_agent_id": assigned_agent_id})
+                    if human_agent_id: upd["human_agent_id"] = human_agent_id
+                    if ai_agent_id: upd["ai_agent_id"] = ai_agent_id
+                elif handled_by == "ai":
+                    upd.update({"status": "open", "handled_by": "ai", "assigned_agent_id": None, "human_agent_id": None})
 
                 logger.info(f"♻️ Reusing (and reopening) Chat {chat_obj['id']}")
                 supabase.table("chats").update(upd).eq("id", chat_obj["id"]).execute()
@@ -1364,11 +1365,18 @@ async def escalate_chat(
 
         existing_chat = chat_check.data[0]
 
-        # Check if chat is already handled by human
-        if existing_chat.get("handled_by") == "human":
+        # 1. Prevent escalating dead chats
+        if existing_chat.get("status") in ["resolved", "closed"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Chat is already being handled by a human agent"
+                detail="Percakapan sudah diselesaikan. Tidak dapat melakukan eskalasi pada chat yang sudah selesai."
+            )
+
+        # 2. Strict Human Check (Covers both modern 'handled_by' and legacy 'assigned_agent_id')
+        if existing_chat.get("handled_by") == "human" or existing_chat.get("assigned_agent_id") is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Percakapan ini sudah ditugaskan kepada agen manusia."
             )
 
         # Verify human agent exists and is actually a human (user_id NOT NULL)
@@ -1679,6 +1687,7 @@ async def get_chat_messages(
                     agent_map[str(a["user_id"])] = agent_name
 
         # 6. Map Identities and Secure Metadata
+        # 6. Map Identities and Secure Metadata
         messages_with_sender = []
         for message_data in messages_data:
             sender_type = message_data.get("sender_type")
@@ -1692,8 +1701,18 @@ async def get_chat_messages(
             else:
                 message_data["sender_name"] = "System"
             
-            # Secure the payload to satisfy Pydantic dict validation
-            message_data["metadata"] = {}
+            # [FIX] Safely parse the metadata instead of destroying it
+            raw_meta = message_data.get("metadata")
+            if isinstance(raw_meta, str):
+                try:
+                    message_data["metadata"] = json.loads(raw_meta)
+                except Exception:
+                    message_data["metadata"] = {}
+            elif not raw_meta:
+                message_data["metadata"] = {}
+                
+            # [FIX] Extract the attachment for the frontend
+            message_data["attachment"] = _extract_attachment(message_data.get("metadata"))
             
             messages_with_sender.append(Message(**message_data))
 

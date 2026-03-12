@@ -154,91 +154,81 @@ async def resolve_lid_to_real_number(
 async def _handle_message_content(message_data: dict, data_type: str) -> Tuple[str, str, Optional[str]]:
     """
     DRY Helper: Analyzes message body/media, uploads content if needed.
-    [FIX] Aggressively sanitizes Base64 from captions and auto-detects image types.
+    Safely separates Base64 media from text captions.
     """
     content = ""
     msg_type = "text"
     media_url = None
     
-    if data_type == "media":
-        # Handle Media
+    media_types = ["media", "image", "video", "audio", "document", "ptt", "sticker", "voice"]
+    
+    if data_type in media_types:
         media_obj = message_data.get("messageMedia", {}) or message_data
-        base64_data = media_obj.get("data") or media_obj.get("body", "")
+        msg_obj = message_data.get("message", {})  # 🛡️ THE FIX: Grab the message wrapper!
         
-        if not base64_data: 
-            # Last resort: check if 'body' in the root message_data has the base64
-            base64_data = message_data.get("body", "")
-
-        if not base64_data: 
-            raise ValueError("Media data missing")
+        # 1. SAFELY EXTRACT BASE64
+        base64_candidates = [
+            media_obj.get("data"), media_obj.get("mediaData"), message_data.get("data"),
+            media_obj.get("body"), message_data.get("body"), msg_obj.get("body")
+        ]
         
-        mime = media_obj.get("mimetype", "application/octet-stream")
-        raw_type = media_obj.get("type", "file")
-        
-        # [FIX] Smart Type Detection (Check headers if MIME is generic)
-        if "image" in mime:
-            msg_type = "image"
-        elif base64_data.startswith("/9j/") or base64_data.startswith("iVBORw0KGgo"):
-            msg_type = "image" # Force image for JPEG/PNG signatures
-            if "octet" in mime: mime = "image/jpeg" # Correct MIME
-        elif "video" in mime:
-            msg_type = "video"
-        elif "audio" in mime:
-            msg_type = "audio"
-        elif "pdf" in mime:
-            msg_type = "document"
-        else:
-            msg_type = "file"
+        base64_data = None
+        for candidate in base64_candidates:
+            if candidate and isinstance(candidate, str) and len(candidate) > 200 and " " not in candidate[:100]:
+                base64_data = candidate
+                break
+                
+        if base64_data:
+            if "," in base64_data: base64_data = base64_data.split(",")[1]
+            base64_data = base64_data.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+            mime = media_obj.get("mimetype", "application/octet-stream")
             
-        # [FIX] Improved Extension Logic
-        ext = "bin"
-        if "/" in mime and "octet" not in mime:
-            ext = mime.split("/")[-1].replace("jpeg", "jpg")
-        else:
-            # Fallback extension based on type
-            if msg_type == "image": ext = "jpg"
-            elif msg_type == "audio": ext = "mp3"
-            elif msg_type == "video": ext = "mp4"
-        
-        media_url = await _upload_media_to_supabase(base64_data, mime, ext)
-        
-        # [FIX] Extract Caption & Sanitize Base64 bleeding
-        # 1. Try explicit caption
-        content = media_obj.get("caption", "")
-        
-        # 2. Fallback to body (common in WA), BUT check if it's Base64 first
-        if not content:
-            msg_structure = message_data.get("message", {})
-            potential_content = msg_structure.get("body", "") or msg_structure.get("_data", {}).get("body", "")
+            if "image" in mime: msg_type = "image"
+            elif "video" in mime: msg_type = "video"
+            elif "audio" in mime: msg_type = "audio"
+            elif "pdf" in mime: msg_type = "document"
+            else: msg_type = "file"
+                
+            ext = "bin"
+            if "/" in mime and "octet" not in mime: ext = mime.split("/")[-1].replace("jpeg", "jpg")
+            else: ext = "jpg" if msg_type == "image" else "mp4" if msg_type == "video" else "mp3"
             
-            # Only use if it does NOT look like Base64
-            if potential_content and len(str(potential_content)) < 500:
-                content = potential_content
-            elif potential_content and " " in str(potential_content)[:50]:
-                content = potential_content
+            media_url = await _upload_media_to_supabase(base64_data, mime, ext)
 
-        # 3. Final Sanity Check: If content is actually the Base64 string, kill it.
-        if content and (str(content).startswith("/9j/") or len(str(content)) > 1000):
-            logger.warning("🧹 Sanitized Base64 string from caption field.")
-            content = ""
+        # 2. SAFELY EXTRACT CAPTION 
+        possible_captions = [
+            msg_obj.get("caption"),                   # 👈 Look inside 'message' first
+            msg_obj.get("body"),                      # 👈 Look inside 'message' second
+            msg_obj.get("_data", {}).get("caption"),  # 👈 Deep check 'message'
+            msg_obj.get("_data", {}).get("body"),     # 👈 Deep check 'message'
+            media_obj.get("caption"),
+            message_data.get("caption"),
+            media_obj.get("body"),
+            message_data.get("body")
+        ]
+        
+        for cap in possible_captions:
+            if cap and isinstance(cap, str) and cap != "[media/empty]":
+                is_base64_like = (len(cap) > 100 and " " not in cap[:100]) or cap.startswith("/9j/") or cap.startswith("iVBOR")
+                if not is_base64_like:
+                    content = cap.strip()
+                    break
 
     else:
         # Handle Text
-        body = message_data.get("body") or message_data.get("_data", {}).get("body", "")
+        msg_obj = message_data.get("message", {})
+        body = msg_obj.get("body") or message_data.get("body") or msg_obj.get("_data", {}).get("body", "")
         
-        # Check for Base64 sneaking in as text (No-Caption Image)
-        if body and isinstance(body, str) and (body.startswith("/9j/") or (len(body) > 500 and " " not in body[:50])):
+        if body and isinstance(body, str) and len(body) > 500 and " " not in body[:50]:
             try:
-                # Treat as Image upload
                 media_url = await _upload_media_to_supabase(body, "image/jpeg", "jpg")
-                content = "" # Clear text content
+                content = "" 
                 msg_type = "image"
-            except Exception as e:
-                logger.error(f"❌ Failed to process Base64 text: {e}")
+            except Exception:
                 content = "[⚠️ Error: Image could not be processed]" 
                 msg_type = "text"
         else:
-            content = body
+            content = body if body != "[media/empty]" else ""
             
     return content, msg_type, media_url
 
@@ -537,7 +527,9 @@ async def _convert_unofficial_to_standard(unofficial: WhatsAppUnofficialWebhookM
     ts = datetime.fromtimestamp(identity_source.get("t")).isoformat() if identity_source.get("t") else None
     
     # 2. EXTRACT CONTENT
-    if unofficial.dataType == "media":
+    media_types = ["media", "image", "video", "audio", "document", "ptt", "sticker", "voice"]
+    
+    if unofficial.dataType in media_types:
         content_source = raw_payload
     else:
         content_source = identity_source
@@ -598,6 +590,7 @@ async def process_webhook_message_v2(
     chat_id, cust_id, msg_id = res["chat_id"], res["customer_id"], res["message_id"]
 
     # 2. UPDATE CUSTOMER DATA (Phone & Metadata)
+    # 2. UPDATE CUSTOMER DATA (Phone & Metadata)
     if cust_id and customer_metadata:
         try:
             cust_res = supabase.table("customers").select("metadata").eq("id", cust_id).single().execute()
@@ -607,7 +600,12 @@ async def process_webhook_message_v2(
                 if raw:
                     current = json.loads(raw) if isinstance(raw, str) else raw
             
-            merged = {**current, **customer_metadata}
+            # 🛡️ THE FIX: Safe Merge for Customer Data
+            merged = current.copy()
+            for k, v in customer_metadata.items():
+                if v is not None and v != "":
+                    merged[k] = v
+                    
             supabase.table("customers").update({"metadata": merged}).eq("id", cust_id).execute()
         except Exception as e:
             logger.warning(f"⚠️ Failed to update customer metadata: {e}")

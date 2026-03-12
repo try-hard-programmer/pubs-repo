@@ -1,12 +1,14 @@
 """
 Credit Service - ASYNC VERSION with Safe Defaults
-Manages organization credits, ledger transactions, and balance calculations.
+Records AI and file processing usage strictly into the credit_usage ledger.
 """
 import logging
 from typing import List, Optional
 from supabase import create_client, Client
 from app.config import settings
-from app.models.credit import CreditTransaction, CreditTransactionCreate, CreditBalance, TransactionType
+
+# Import the NEW models we just created
+from app.models.credit import CreditUsageCreate, CreditUsage
 
 logger = logging.getLogger(__name__)
 
@@ -25,109 +27,46 @@ class CreditService:
             raise RuntimeError("Supabase not configured")
         return self._client
 
-    async def get_balance(self, organization_id: str) -> CreditBalance:
-        """Calculate current balance by summing all cost (negative = spent)."""
+    async def log_usage(self, usage_data: CreditUsageCreate) -> CreditUsage:
+        """
+        Records an AI action or file upload strictly into the credit_usage ledger.
+        """
         try:
-            response = self.client.table("credit_usage")\
-                .select("cost")\
-                .eq("organization_id", organization_id)\
-                .execute()
-            
-            total = -sum(float(item.get("cost", 0) or 0) for item in response.data) if response.data else 0.0
-            
-            logger.info(f"💰 Balance for org {organization_id}: ${total:.6f}")
-            return CreditBalance(organization_id=organization_id, total_balance=total)
-            
-        except Exception as e:
-            logger.error(f"Failed to get balance for {organization_id}: {e}", exc_info=True)
-            raise RuntimeError(f"Balance check failed: {str(e)}")
-
-    async def add_transaction(self, data: CreditTransactionCreate) -> CreditTransaction:
-        """Record a credit transaction (maps to credit_usage table)."""
-        try:
-            metadata = data.metadata or {}
-            
-            # Extract variables safely
-            input_tokens = int(metadata.get("input_tokens", 0))
-            output_tokens = int(metadata.get("output_tokens", 0))
-            
-            # ✅ Map your CreditTransactionCreate to credit_usage columns
+            # Map the exact fields from the Pydantic model to the database columns
             payload = {
-                "organization_id": data.organization_id,
-                "query_type": self._map_to_query_type(data.description or ""),
-                "query_text": (data.description or "")[:500],  # ✅ Truncate if too long
-                "credits_used": max(1, int(abs(data.amount or 0) * 1000000)),
-                "cost": abs(data.amount or 0), # UPDATED: changed from cost_usd to cost
-                "status": "completed",
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "metadata": metadata
+                "organization_id": usage_data.organization_id,
+                "query_type": usage_data.query_type.value,
+                "query_text": usage_data.query_text,
+                "credits_used": usage_data.credits_used,
+                "status": usage_data.status.value,
+                "input_tokens": usage_data.input_tokens,
+                "output_tokens": usage_data.output_tokens,
+                "cost": usage_data.cost,
+                "metadata": usage_data.metadata or {}
             }
             
-            logger.info(f"💳 Recording transaction: ${abs(data.amount or 0):.6f} for org {data.organization_id}")
+            logger.info(f"💳 Recording usage: {usage_data.credits_used} credits for org {usage_data.organization_id}")
             
             response = self.client.table("credit_usage").insert(payload).execute()
             
             if not response.data:
-                raise RuntimeError("Transaction insert returned no data")
+                raise RuntimeError("Usage insert returned no data")
             
-            trx = response.data[0]
-            logger.info(f"✅ Credit transaction recorded: ${data.amount or 0:.6f} for Org {data.organization_id}")
+            logger.info(f"✅ Usage recorded: {usage_data.credits_used} credits for Org {usage_data.organization_id}")
             
-            # ✅ Safe return with defaults
-            return CreditTransaction(
-                id=trx.get("id"),
-                organization_id=trx.get("organization_id"),
-                amount=-(trx.get("cost") or 0),  # UPDATED: changed from cost_usd to cost
-                transaction_type=TransactionType.USAGE,
-                description=trx.get("query_text") or "",
-                metadata=trx.get("metadata") or {},
-                created_at=trx.get("created_at")
-            )
+            return CreditUsage(**response.data[0])
 
         except Exception as e:
-            logger.error(f"❌ Credit transaction failed: {e}", exc_info=True)
-            raise RuntimeError(f"Transaction failed: {str(e)}")
+            logger.error(f"❌ Usage logging failed: {e}", exc_info=True)
+            raise RuntimeError(f"Logging failed: {str(e)}")
 
-    def _map_to_query_type(self, description: str) -> str:
-        """Map description to valid query_type enum."""
-        desc_lower = (description or "").lower()
-        
-        if "embedding" in desc_lower or "knowledge" in desc_lower:
-            return "document_analysis"
-        elif "image" in desc_lower:
-            return "image_analysis"
-        elif "search" in desc_lower:
-            return "file_search"
-        elif "complex" in desc_lower:
-            return "complex_query"
-        else:
-            return "basic_query"
-
-    async def check_sufficient_funds(self, organization_id: str, cost: float) -> bool:
-        """Check if org has enough credits before running AI."""
-        try:
-            balance = await self.get_balance(organization_id)
-            logger.info(f"💰 Org {organization_id} balance: ${balance.total_balance:.6f}, Required: ${cost:.6f}")
-            
-            # ✅ Actually check if sufficient (can disable in dev)
-            if balance.total_balance < cost:
-                logger.warning(f"⚠️ Insufficient funds: ${balance.total_balance:.6f} < ${cost:.6f}")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Balance check failed: {e}")
-            return True  # ✅ Allow on error to avoid blocking
-
-    async def get_transactions(
+    async def get_usage_history(
         self, 
         organization_id: str, 
-        limit: int = 100,
+        limit: int = 20,
         offset: int = 0
-    ) -> List[CreditTransaction]:
-        """Get transaction history for an organization."""
+    ) -> List[CreditUsage]:
+        """Get consumption history for an organization."""
         try:
             response = self.client.table("credit_usage")\
                 .select("*")\
@@ -140,52 +79,35 @@ class CreditService:
             if not response.data:
                 return []
             
-            transactions = []
-            for trx in response.data:
-                transactions.append(CreditTransaction(
-                    id=trx.get("id"),
-                    organization_id=trx.get("organization_id"),
-                    amount=-(trx.get("cost") or 0), # UPDATED: changed from cost_usd to cost
-                    transaction_type=TransactionType.USAGE,
-                    description=trx.get("query_text") or "",
-                    metadata=trx.get("metadata") or {},
-                    created_at=trx.get("created_at")
-                ))
-            
-            logger.info(f"📜 Retrieved {len(transactions)} transactions for org {organization_id}")
+            transactions = [CreditUsage(**row) for row in response.data]
+            logger.info(f"📜 Retrieved {len(transactions)} usage logs for org {organization_id}")
             return transactions
             
         except Exception as e:
-            logger.error(f"❌ Failed to get transactions: {e}", exc_info=True)
+            logger.error(f"❌ Failed to get usage history: {e}", exc_info=True)
             return []
 
     async def get_usage_stats(self, organization_id: str) -> dict:
         """Get usage statistics for an organization."""
         try:
-            # UPDATED: removed 'provider' from select, changed 'cost_usd' to 'cost'
             response = self.client.table("credit_usage")\
                 .select("cost, query_type, created_at, metadata")\
                 .eq("organization_id", organization_id)\
                 .execute()
             
             if not response.data:
-                return {
-                    "total_spent": 0.0,
-                    "total_transactions": 0,
-                    "by_type": {},
-                    "by_provider": {}
-                }
+                return {"total_spent": 0.0, "total_transactions": 0, "by_type": {}, "by_provider": {}}
             
             total_spent = sum(float(item.get("cost", 0) or 0) for item in response.data)
             
-            # Group by type
+            # Group by our specific Enums
             by_type = {}
             for item in response.data:
                 qtype = item.get("query_type", "unknown")
                 cost = float(item.get("cost", 0) or 0)
                 by_type[qtype] = by_type.get(qtype, 0.0) + cost
             
-            # Group by provider (now fetched from metadata since it's removed from columns)
+            # Group by provider from metadata
             by_provider = {}
             for item in response.data:
                 metadata = item.get("metadata") or {}
@@ -193,25 +115,16 @@ class CreditService:
                 cost = float(item.get("cost", 0) or 0)
                 by_provider[provider] = by_provider.get(provider, 0.0) + cost
             
-            stats = {
+            return {
                 "total_spent": total_spent,
                 "total_transactions": len(response.data),
                 "by_type": by_type,
                 "by_provider": by_provider
             }
             
-            logger.info(f"📊 Usage stats for org {organization_id}: ${total_spent:.6f} across {len(response.data)} txns")
-            return stats
-            
         except Exception as e:
             logger.error(f"❌ Failed to get usage stats: {e}", exc_info=True)
-            return {
-                "total_spent": 0.0,
-                "total_transactions": 0,
-                "by_type": {},
-                "by_provider": {}
-            }
-
+            return {"total_spent": 0.0, "total_transactions": 0, "by_type": {}, "by_provider": {}}
 
 # ==========================================
 # SINGLETON INSTANCE

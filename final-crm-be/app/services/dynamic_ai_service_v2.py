@@ -319,22 +319,53 @@ class DynamicAIServiceV2:
                 full_db_record = res.data[0]
                 await self._broadcast_response(chat, full_db_record, agent_name, real_agent_name)
 
-                # Billing
+                # ---------------------------------------------------------
+                # Billing & Credit Exchange Rate (1 Sub Credit = 250 Tokens)
+                # ---------------------------------------------------------
                 if usage and chat.get("organization_id") and not metadata.get("is_error", False):
                     try:
+                        import math
+                        from app.models.credit import CreditUsageCreate, QueryType, QueryStatus
+                        from app.services.subscription_service import get_subscription_service
+                        
                         total_tokens = usage.get("total_tokens", 0)
-                        cost = total_tokens * 0.000002
-                        if cost > 0:
-                            await self.credit_service.add_transaction(CreditTransactionCreate(
+                        input_tokens = usage.get("prompt_tokens", 0)
+                        output_tokens = usage.get("completion_tokens", 0)
+                        
+                        # Actual internal cost for your analytics
+                        cost_usd = total_tokens * 0.000002 
+                        
+                        if total_tokens > 0:
+                            # 1. APPLY THE EXCHANGE RATE: 1 Subscription Credit = 250 Tokens
+                            # Divide by 250 and round UP (e.g., 251 tokens = 2 Credits)
+                            credits_to_deduct = math.ceil(total_tokens / 250)
+                            
+                            # 2. Construct the strict Pydantic payload
+                            usage_payload = CreditUsageCreate(
                                 organization_id=chat["organization_id"],
-                                amount=-cost, 
-                                description=f"AI Response (Tokens: {total_tokens})",
-                                transaction_type=TransactionType.USAGE,
-                                metadata={"chat_id": chat_id, "message_id": full_db_record["id"]}
-                            ))
-                    except: pass
+                                query_type=QueryType.TEXT_QUERY,
+                                query_text=f"AI Chat Response",
+                                credits_used=credits_to_deduct,
+                                status=QueryStatus.COMPLETED,
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                cost=cost_usd,
+                                metadata={
+                                    "chat_id": chat_id, 
+                                    "provider": metadata.get("provider", "unknown")
+                                }
+                            )
 
-                return {"success": True, "ai_message_id": full_db_record["id"]}
+                            # 3. Write immutable record to the Ledger
+                            await self.credit_service.log_usage(usage_payload)
+
+                            # 4. Enforce the limit against the Subscription
+                            if credits_to_deduct > 0:
+                                sub_service = get_subscription_service()
+                                await sub_service.increment_usage(chat["organization_id"], credits_to_deduct)
+
+                    except Exception as bill_err:
+                        logger.error(f"🚨 BILLING FAILURE for {chat_id}: {bill_err}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"❌ Manager V2 Critical Failure: {e}", exc_info=True)

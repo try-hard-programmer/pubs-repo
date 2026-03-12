@@ -1158,3 +1158,44 @@ async def organization_health():
             "service": "organizations",
             "error": str(e)
         }
+
+@router.delete("/{org_id}/members/{target_user_id}", status_code=204)
+async def remove_organization_member(
+    org_id: str,
+    target_user_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Remove a member from the organization (Offboarding Orchestration).
+    Requires Admin or Super Admin privileges.
+    """
+    try:
+        # 1. Guard: Prevent self-deletion
+        if target_user_id == current_user.user_id:
+            raise HTTPException(status_code=400, detail="You cannot remove yourself. Use the leave organization feature.")
+
+        # 2. Guard: Verify Caller has Admin/Owner permissions
+        role_service = get_role_service()
+        can_manage = await role_service.can_manage_roles(current_user.user_id, org_id)
+        if not can_manage:
+            raise HTTPException(status_code=403, detail="Only Admins or the Owner can remove members.")
+
+        # 3. Execute Offboarding Orchestration (Clean Interface)
+        org_service = get_organization_service()
+        await org_service.remove_member_from_organization(
+            org_id=org_id, 
+            target_user_id=target_user_id
+        )
+
+        logger.info(f"User {target_user_id} successfully offboarded from org {org_id} by {current_user.user_id}")
+        return None
+
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        logger.error(f"Failed to remove member: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Critical error removing member: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during member offboarding.")
+    

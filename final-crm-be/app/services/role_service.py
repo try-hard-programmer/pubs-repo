@@ -244,14 +244,11 @@ class RoleService:
         organization_id: str
     ) -> List[OrganizationMemberWithRole]:
         """
-        Get all members of organization with their roles.
-        
-        Fixed: 
-        1. Performs manual join between organization_members and user_roles.
-        2. Fetches emails from 'profiles' table to populate user details.
+        WORKER: Fetches members and uses the Supabase Auth Admin API 
+        to resolve emails without requiring SQL schema changes.
         """
         try:
-            # 1. Fetch all members first
+            # 1. Fetch all members from the standard table
             members_response = self.client.table("organization_members") \
                 .select("user_id, joined_at, is_owner") \
                 .eq("organization_id", organization_id) \
@@ -261,33 +258,34 @@ class RoleService:
                 return []
             
             members_data = members_response.data
-            
-            # Extract user IDs for batch querying
             user_ids = [m["user_id"] for m in members_data]
 
-            # 2. Fetch all custom roles for this organization
+            # 2. Fetch custom roles
             roles_response = self.client.table("user_roles") \
                 .select("user_id, role, assigned_by") \
                 .eq("organization_id", organization_id) \
                 .execute()
             
-            # 3. Fetch user profiles (emails)
-            # We use the 'profiles' table which should be synced with auth.users
-            profiles_response = self.client.table("profiles") \
-                .select("id, email, full_name") \
-                .in_("id", user_ids) \
-                .execute()
-
-            # Create lookup dictionaries
             roles_map = {r["user_id"]: r for r in roles_response.data}
-            profiles_map = {p["id"]: p for p in profiles_response.data}
 
+            # 3. [NEW] API-Level Email Lookup (Bypasses SQL entirely)
+            auth_emails = {}
+            try:
+                # Uses the Admin SDK to pull users directly from the auth system
+                all_users = self.client.auth.admin.list_users()
+                for u in all_users:
+                    if u.id in user_ids:
+                        auth_emails[u.id] = u.email
+            except Exception as auth_err:
+                logger.warning(f"Could not fetch auth users via Admin API: {auth_err}")
+
+            # 4. Assemble the final list
             members = []
             for member_data in members_data:
                 user_id = member_data["user_id"]
                 
                 # Default role values
-                role = AppRole.USER
+                role = AppRole.SUPER_ADMIN if member_data.get("is_owner") else AppRole.USER
                 assigned_by = None
 
                 # Look up role
@@ -299,17 +297,15 @@ class RoleService:
                     except ValueError:
                         pass
                 
-                # Look up email/profile
-                email = None
-                if user_id in profiles_map:
-                    email = profiles_map[user_id].get("email")
+                # Safely pull the email from our memory map
+                email = auth_emails.get(user_id)
 
                 members.append(OrganizationMemberWithRole(
                     user_id=user_id,
-                    email=email,  # Populated from profiles
+                    email=email,  # <--- Successfully populated
                     role=role,
-                    is_owner=member_data["is_owner"],
-                    joined_at=member_data["joined_at"],
+                    is_owner=member_data.get("is_owner", False),
+                    joined_at=member_data.get("joined_at"),
                     assigned_by=assigned_by
                 ))
 
@@ -319,7 +315,8 @@ class RoleService:
         except Exception as e:
             logger.error(f"Error fetching organization members with roles: {e}")
             return []
-            
+        
+                    
     async def get_role_details(
         self,
         user_id: str,

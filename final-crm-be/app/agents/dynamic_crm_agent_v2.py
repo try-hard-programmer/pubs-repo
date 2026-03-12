@@ -352,7 +352,7 @@ class DynamicCRMAgentV2:
                     payload["tools"] = external_tools
                     payload["tool_choice"] = "auto"
 
-                # logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
+                logger.info(f"🚀 AI Payload (Turn {current_turn}):\n{json.dumps(payload, indent=2, default=str)}")
                 
                 # === 5. CALL PROXY ===
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -419,11 +419,12 @@ class DynamicCRMAgentV2:
                                     try:
                                         parsed = json.loads(tool_output)
                                         count = parsed.get("count", 0)
+                                        total_count = parsed.get("total_count", count)  # real DB total, not page count
                                         data = parsed.get("data", [])
-                                        # Keep first 50 rows only
-                                        truncated = {"resource": parsed.get("resource"), "count": count, "data": data[:50], "_truncated": True, "_total_available": count}
+                                        # Keep first 50 rows only, preserve total_count so LLM knows real total
+                                        truncated = {"resource": parsed.get("resource"), "count": count, "total_count": total_count, "data": data[:50], "_truncated": True, "_total_available": total_count}
                                         tool_output = json.dumps(truncated)
-                                        logger.info(f"✂️ [AGENT] Tool output truncated: {count} rows → kept first 50 to avoid context overflow")
+                                        logger.info(f"✂️ [AGENT] Tool output truncated: total={total_count}, page={count} → kept first 50 rows")
                                     except Exception:
                                         tool_output = tool_output[:MAX_TOOL_OUTPUT_CHARS] + "...[TRUNCATED]"
                                 

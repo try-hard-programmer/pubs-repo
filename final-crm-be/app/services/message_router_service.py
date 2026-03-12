@@ -382,16 +382,22 @@ class MessageRouterService:
                     handled_by = "ai"
 
                 if existing_message:
-                    # [THE FIX] MERGE INSTEAD OF INSERT
+                    # [THE FIX] SAFE MERGE INSTEAD OF OVERWRITE
                     message_id = existing_message["id"]
                     is_merged_event = True
                     
                     current_meta = existing_message.get("metadata") or {}
-                    merged_meta = {**current_meta, **meta}
+                    
+                    # 🛡️ THE FIX: Ignore None values so we don't wipe the media_url
+                    merged_meta = current_meta.copy()
+                    for k, v in meta.items():
+                        if v is not None and v != "":
+                            merged_meta[k] = v
+                            
                     if group_id_context: merged_meta["target_group_id"] = group_id_context
                     
                     update_data = {"metadata": merged_meta}
-                    # Only update content if it was previously empty (e.g. image arrived before caption)
+                    # Only update content if it was previously empty
                     if message_content and not existing_message.get("content"):
                         update_data["content"] = message_content
                         

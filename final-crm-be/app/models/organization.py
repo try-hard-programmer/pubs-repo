@@ -91,13 +91,15 @@ class Organization(BaseModel):
     updated_at: datetime = Field(..., description="Last update timestamp")
     is_active: bool = Field(True, description="Active status")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
-
+    member_count: Optional[int] = Field(default=0, description="Total number of members in the organization")
+    
     class Config:
         from_attributes = True
         json_schema_extra = {
             "example": {
                 "id": "org-uuid-123",
                 "name": "Acme Corporation",
+                "member_count": 5,
                 "legal_name": "Acme Corporation Inc.",
                 "category": "technology",
                 "description": "Leading technology solutions provider",

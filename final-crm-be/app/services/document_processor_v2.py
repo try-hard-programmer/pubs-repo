@@ -117,22 +117,22 @@ class DocumentProcessorV2:
 
     @staticmethod
     def validate_knowledge_file(filename: str, content: bytes) -> str:
+        # 1. Check for empty files
+        if not content or len(content) == 0:
+            raise ValueError("File kosong atau rusak. Mendukung PDF, DOCX, TXT, CSV (Max 10MB per file).")
+
+        # 2. Check extension
         if not filename or "." not in filename:
-            raise ValueError(f"Invalid filename: '{filename}'. Must have an extension.")
+            raise ValueError("Mendukung PDF, DOCX, TXT, CSV (Max 10MB per file).")
 
         ext = filename.rsplit(".", 1)[-1].lower()
-
         if ext not in ALLOWED_KNOWLEDGE_EXTENSIONS:
-            raise ValueError(
-                f"Unsupported file type: '.{ext}'. "
-                f"Allowed: {', '.join(f'.{e}' for e in sorted(ALLOWED_KNOWLEDGE_EXTENSIONS))}"
-            )
+            raise ValueError("Format tidak didukung. Mendukung PDF, DOCX, TXT, CSV (Max 10MB per file).")
 
+        # 3. Check file size (Max 10MB)
         size_mb = len(content) / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
-            raise ValueError(
-                f"File '{filename}' is {size_mb:.1f}MB. Maximum allowed: {MAX_FILE_SIZE_MB}MB."
-            )
+            raise ValueError("Ukuran file terlalu besar. Mendukung PDF, DOCX, TXT, CSV (Max 10MB per file).")
 
         return ext
 
@@ -1135,24 +1135,45 @@ class DocumentProcessorV2:
             if result.get("success"):
                 try:
                     usage = result.get("usage", {})
-                    cost = 0.0
+                    # Calculate raw tokens from the proxy response
+                    total_tokens = int(usage.get("total_tokens", 0))
+                    
+                    if total_tokens > 0 and organization_id:
+                        import math
+                        from app.models.credit import CreditUsageCreate, QueryType, QueryStatus
+                        from app.services.subscription_service import get_subscription_service
+                        
+                        # 1. APPLY THE EXCHANGE RATE: 1 Subscription Credit = 250 Tokens
+                        credits_to_deduct = math.ceil(total_tokens / 250)
+                        
+                        # Internal cost tracking
+                        cost = float(usage.get("cost_usd", total_tokens * 0.0000002))
 
-                    if "cost_usd" in usage:
-                        cost = float(usage["cost_usd"])
-                    elif "total_tokens" in usage:
-                        cost = usage["total_tokens"] * 0.0000002
-
-                    if cost > 0 and organization_id:
-                        self.logger.info(f"💸 Deducting ${cost:.6f} for embedding {len(chunks)} chunks...")
-                        await self.credit_service.add_transaction(CreditTransactionCreate(
+                        self.logger.info(f"💸 Deducting {credits_to_deduct} credits for embedding {len(chunks)} chunks...")
+                        
+                        # 2. Construct the strict Pydantic payload for File Uploads
+                        usage_payload = CreditUsageCreate(
                             organization_id=organization_id,
-                            amount=-cost,
-                            description=f"Knowledge Embedding ({len(chunks)} chunks)",
-                            transaction_type=TransactionType.USAGE,
-                            metadata={"agent_id": agent_id, "file": filename}
-                        ))
+                            query_type=QueryType.UPLOAD_FILE,
+                            query_text=f"Knowledge Embedding ({len(chunks)} chunks)",
+                            credits_used=credits_to_deduct,
+                            status=QueryStatus.COMPLETED,
+                            input_tokens=total_tokens,
+                            output_tokens=0,
+                            cost=cost,
+                            metadata={"agent_id": agent_id, "file": filename, "chunk_count": len(chunks)}
+                        )
+
+                        # 3. Write immutable record to the Ledger
+                        await self.credit_service.log_usage(usage_payload)
+                        
+                        # 4. Enforce the limit against the Subscription
+                        if credits_to_deduct > 0:
+                            sub_service = get_subscription_service()
+                            await sub_service.increment_usage(organization_id, credits_to_deduct)
+
                     else:
-                        self.logger.info("🆓 Embedding cost was $0.00.")
+                        self.logger.info("🆓 Embedding cost was 0 tokens.")
 
                 except Exception as bill_err:
                     self.logger.error(f"🚨 BILLING FAILURE for {organization_id}: {bill_err}")
