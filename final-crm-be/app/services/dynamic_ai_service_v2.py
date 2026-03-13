@@ -2,16 +2,19 @@ import logging
 import asyncio
 import json
 import time
+import math
 
 from typing import Dict, Any, Optional, List
 from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
 from app.agents.dynamic_crm_agent_v2 import get_dynamic_crm_agent_v2
 from app.services.webhook_callback_service import get_webhook_callback_service
 from app.services.websocket_service import get_connection_manager
-from app.services.credit_service import get_credit_service, CreditTransactionCreate, TransactionType
 from app.services.redis_service import acquire_lock
 from app.services.mcp_service import get_mcp_service
 
+from app.services.credit_service import get_credit_service
+from app.services.subscription_service import get_subscription_service
+from app.models.credit import CreditUsageCreate, QueryType, QueryStatus
 
 logger = logging.getLogger(__name__)
 
@@ -324,9 +327,6 @@ class DynamicAIServiceV2:
                 # ---------------------------------------------------------
                 if usage and chat.get("organization_id") and not metadata.get("is_error", False):
                     try:
-                        import math
-                        from app.models.credit import CreditUsageCreate, QueryType, QueryStatus
-                        from app.services.subscription_service import get_subscription_service
                         
                         total_tokens = usage.get("total_tokens", 0)
                         input_tokens = usage.get("prompt_tokens", 0)

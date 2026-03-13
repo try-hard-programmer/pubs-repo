@@ -37,7 +37,7 @@ from app.utils.chunkingv2 import split_into_chunks
 from app.utils.text_processing import elements_to_clean_text
 from app.config import settings
 from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
-from app.services.credit_service import get_credit_service, CreditTransactionCreate, TransactionType
+from app.services.credit_service import get_credit_service
 
 if TYPE_CHECKING:
     from app.services.storage_service import StorageService
@@ -352,10 +352,10 @@ class DocumentProcessorV2:
                 metrics.token_count = metrics.word_count
             metrics.content_hash = self.generate_content_hash(normalized_text)
 
-            self.logger.info(
-                f"✅ Extracted '{filename}': {metrics.word_count} words, "
-                f"{metrics.token_count} tokens, method={metrics.extraction_method}"
-            )
+            # self.logger.info(
+            #     f"✅ Extracted '{filename}': {metrics.word_count} words, "
+            #     f"{metrics.token_count} tokens, method={metrics.extraction_method}"
+            # )
 
             return normalized_text, metrics
 

@@ -286,7 +286,14 @@ class WebhookCallbackService:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(endpoint_url, json=payload, headers=headers)
                 response.raise_for_status()
-                return {"success": True, "channel": "whatsapp", "response": response.json()}
+                
+                try:
+                    response_data = response.json()
+                except Exception as json_err:
+                    logger.warning(f"⚠️ WhatsApp API returned non-JSON body: {response.text}. Error: {json_err}")
+                    response_data = {"raw_text": response.text}
+                
+                return {"success": True, "channel": "whatsapp", "response": response_data}
 
         except Exception as e:
             logger.error(f"❌ WhatsApp message send failed: {e}")

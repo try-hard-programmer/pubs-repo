@@ -192,14 +192,15 @@ class MCPService:
 
         logger.info(f"🔧 [MCP] Execute: {target_server_name} → {resource_name}")
 
-        # Pass arguments as-is — no transformation, no injection
+        filters = arguments.get("filters", {})
+
         payload: Dict[str, Any] = {
             "resource": resource_name,
             "fields":   arguments.get("fields", []),
             "limit":    arguments.get("limit", 100),
         }
-        if arguments.get("filters"):
-            payload["filters"] = arguments["filters"]
+        if filters:
+            payload["filters"] = filters
         if arguments.get("order_by"):
             payload["order_by"] = arguments["order_by"]
 
@@ -211,9 +212,31 @@ class MCPService:
             api_key=server["api_key"],
         )
 
-        if response.get("success"):
-            return {"status": "success", "output": json.dumps(response["data"])}
-        return {"status": "error", "output": response.get("error", "Unknown error")}
+        if not response.get("success"):
+            return {"status": "error", "output": response.get("error", "Unknown error")}
+
+        data = response["data"]
+
+        # Smart retry: if result is empty and there are threshold filters (op > or >= with numeric value),
+        # retry once without them — the record may exist but is excluded by quality filters (e.g. hargajual1 > 0)
+        is_empty = data.get("count", 0) == 0 and len(data.get("data", [])) == 0
+        threshold_keys = [k for k, v in filters.items() if v.get("op") in (">", ">=") and isinstance(v.get("value"), (int, float))]
+
+        if is_empty and threshold_keys:
+            relaxed_filters = {k: v for k, v in filters.items() if k not in threshold_keys}
+            retry_payload = {**payload, "filters": relaxed_filters}
+            retry_response = await self._rest_request(
+                method="POST",
+                base_url=server["url"],
+                endpoint="/mcp/execute",
+                payload=retry_payload,
+                api_key=server["api_key"],
+            )
+            if retry_response.get("success") and retry_response["data"].get("count", 0) > 0:
+                logger.info(f"🔁 [MCP] Retry without threshold filters {threshold_keys} → found {retry_response['data']['count']} rows")
+                return {"status": "success", "output": json.dumps(retry_response["data"])}
+
+        return {"status": "success", "output": json.dumps(data)}
 
     # =========================================================
     # 5. CONNECTION TEST

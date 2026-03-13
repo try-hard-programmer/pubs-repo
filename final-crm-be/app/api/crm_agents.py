@@ -1027,97 +1027,112 @@ async def get_agent_integrations(
 
 
 @router.put(
-	"/{agent_id}/integrations/{channel}",
-	response_model=AgentIntegration,
-	summary="Update agent integration",
-	description="""
+    "/{agent_id}/integrations/{channel}",
+    response_model=AgentIntegration,
+    summary="Update agent integration",
+    description="""
     Update integration configuration for a specific channel.
     """
 )
 async def update_agent_integration(
-		agent_id: str,
-		channel: str,
-		integration_update: AgentIntegrationUpdate,
-		current_user: User = Depends(get_current_user)
+        agent_id: str,
+        channel: str,
+        integration_update: AgentIntegrationUpdate,
+        current_user: User = Depends(get_current_user)
 ):
-	"""
-	Update integration for a specific channel.
+    """
+    Update integration for a specific channel.
 
-	Automatically extracts and updates the status field if config.status is provided.
-	"""
-	try:
-		organization_id = await get_user_organization_id(current_user)
-		supabase = get_supabase_client()
+    Automatically extracts and updates the status field if config.status is provided.
+    """
+    try:
+        organization_id = await get_user_organization_id(current_user)
+        supabase = get_supabase_client()
 
-		# Verify agent belongs to organization
-		agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
-		                                                                          organization_id).execute()
+        # Verify agent belongs to organization
+        agent_check = supabase.table("agents").select("id").eq("id", agent_id).eq("organization_id",
+                                                                                  organization_id).execute()
 
-		if not agent_check.data:
-			raise HTTPException(
-				status_code=status.HTTP_404_NOT_FOUND,
-				detail=f"Agent with ID {agent_id} not found"
-			)
+        if not agent_check.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Agent with ID {agent_id} not found"
+            )
 
-		# Prepare update data
-		update_data = integration_update.model_dump(exclude_unset=True)
+        # Prepare update data
+        update_data = integration_update.model_dump(exclude_unset=True)
 
-		# Convert enum to value if status is being updated
-		if "status" in update_data and update_data["status"]:
-			update_data["status"] = update_data["status"].value
+        # Convert enum to value if status is being updated
+        if "status" in update_data and update_data["status"]:
+            update_data["status"] = update_data["status"].value
 
-		# Extract status from config if config is provided
-		if "config" in update_data and update_data["config"]:
-			config = update_data["config"]
+        # Extract status from config if config is provided
+        if "config" in update_data and update_data["config"]:
+            config = update_data["config"]
 
-			# If config has status field, update the status field in database
-			if isinstance(config, dict) and "status" in config:
-				config_status = config["status"]
+            # If config has status field, update the status field in database
+            if isinstance(config, dict) and "status" in config:
+                config_status = config["status"]
 
-				# Validate and set status from config
-				valid_statuses = ["connected", "disconnected", "connecting", "error"]
-				if config_status in valid_statuses:
-					update_data["status"] = config_status
-					logger.info(
-						f"Updating status to '{config_status}' from config.status for agent {agent_id}/{channel}")
+                # Validate and set status from config
+                valid_statuses = ["connected", "disconnected", "connecting", "error"]
+                if config_status in valid_statuses:
+                    update_data["status"] = config_status
+                    logger.info(
+                        f"Updating status to '{config_status}' from config.status for agent {agent_id}/{channel}")
 
-		# Update or insert integration
-		existing = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel",
-		                                                                                        channel).execute()
+        # Update or insert integration
+        existing = supabase.table("agent_integrations").select("*").eq("agent_id", agent_id).eq("channel",
+                                                                                                channel).execute()
 
-		if existing.data:
-			logger.info(f"UPDATE DATA: {update_data}")
-			# Update existing
-			response = supabase.table("agent_integrations").update(update_data).eq("agent_id", agent_id).eq("channel",
-			                                                                                                channel).execute()
-		else:
-			# Insert new
-			insert_data = {
-				"agent_id": agent_id,
-				"channel": channel,
-				**update_data
-			}
-			response = supabase.table("agent_integrations").insert(insert_data).execute()
+        if existing.data:
+            logger.info(f"UPDATE DATA: {update_data}")
+            # Update existing
+            response = supabase.table("agent_integrations").update(update_data).eq("agent_id", agent_id).eq("channel",
+                                                                                                            channel).execute()
+        else:
+            # Insert new
+            insert_data = {
+                "agent_id": agent_id,
+                "channel": channel,
+                **update_data
+            }
+            response = supabase.table("agent_integrations").insert(insert_data).execute()
 
-		if not response.data:
-			raise HTTPException(
-				status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-				detail="Failed to update agent integration"
-			)
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update agent integration"
+            )
 
-		logger.info(f"Agent integration updated: {agent_id}/{channel} by user {current_user.user_id}")
+        # =========================================================
+        # 🧹 MCP REGISTRY CLEANUP LOGIC
+        # =========================================================
+        if channel == "mcp":
+            # Check if frontend is sending a disconnect or disable command
+            is_disconnected = update_data.get("status") == "disconnected"
+            is_disabled = update_data.get("enabled") is False
+            
+            if is_disconnected or is_disabled:
+                try:
+                    logger.info(f"🧹 MCP disconnected via PUT. Wiping tool registry for agent {agent_id}...")
+                    supabase.table("mcp_tool_registry").delete().eq("agent_id", agent_id).execute()
+                    logger.info("✅ Tool registry wiped successfully.")
+                except Exception as cleanup_err:
+                    logger.error(f"⚠️ Failed to wipe tool registry: {cleanup_err}")
 
-		return AgentIntegration(**response.data[0])
+        logger.info(f"Agent integration updated: {agent_id}/{channel} by user {current_user.user_id}")
 
-	except HTTPException:
-		raise
-	except Exception as e:
-		logger.error(f"Error updating integration for agent {agent_id}/{channel}: {e}")
-		raise HTTPException(
-			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-			detail="Failed to update agent integration"
-		)
+        return AgentIntegration(**response.data[0])
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating integration for agent {agent_id}/{channel}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update agent integration"
+        )
 
 # ============================================
 # MCP INTEGRATIONS ENDPOINTS

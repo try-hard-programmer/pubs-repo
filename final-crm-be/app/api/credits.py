@@ -12,7 +12,7 @@ from app.auth.dependencies import get_current_user
 from app.models.user import User
 
 # Models & Service
-from app.models.credit import CreditTransaction
+from app.models.credit import CreditUsage
 from app.models.subscription import Subscription
 from app.services.credit_service import get_credit_service
 from app.services.subscription_service import get_subscription_service
@@ -69,7 +69,7 @@ async def get_active_subscription(
         raise HTTPException(status_code=500, detail=str(e))
 
 # 3. Changed from GET to POST to accept the JSON body
-@router.post("/transactions", response_model=List[CreditTransaction])
+@router.post("/transactions", response_model=List[CreditUsage])
 async def list_transactions(
     request: BillingRequest,
     limit: int = Query(50, ge=1, le=100, description="Items per page"),
@@ -80,7 +80,8 @@ async def list_transactions(
         org_id = get_org_id(current_user, request.organization_id)
         service = get_credit_service()
         
-        transactions = await service.get_transactions(
+        # Change 'get_transactions' to 'get_usage_history'
+        transactions = await service.get_usage_history(
             organization_id=org_id,
             limit=limit,
             offset=offset

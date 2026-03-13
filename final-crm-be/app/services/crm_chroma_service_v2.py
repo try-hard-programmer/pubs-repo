@@ -5,11 +5,16 @@ import torch
 import os
 import warnings
 
+import math
+from app.services.credit_service import get_credit_service
+from app.services.subscription_service import get_subscription_service
+from app.models.credit import CreditUsageCreate, QueryType, QueryStatus
+
 from chromadb import Settings
 from typing import List, Any, Dict, Tuple
 from app.config import settings
-from app.services.credit_service import get_credit_service, CreditTransactionCreate, TransactionType
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
 
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
@@ -212,23 +217,44 @@ class CRMChromaServiceV2:
             if organization_id:
                 try:
                     cost = 0.0
-                    if "cost_usd" in usage: cost = float(usage["cost_usd"])
-                    elif "total_tokens" in usage: cost = usage["total_tokens"] * 0.0000002
+                    total_tokens = usage.get("total_tokens", 0)
                     
-                    if cost > 0:
-                        logger.info(f"💸 Calculated Cost: ${cost:.6f}. Attempting deduction for Org {organization_id}...")
+                    if "cost_usd" in usage: 
+                        cost = float(usage["cost_usd"])
+                    elif total_tokens > 0: 
+                        cost = total_tokens * 0.0000002
+                    
+                    # Failsafe: If proxy only returned cost but no token count
+                    if total_tokens == 0 and cost > 0:
+                        total_tokens = int(cost / 0.0000002)
+
+                    if total_tokens > 0:
+                        # APPLY THE EXCHANGE RATE (Note: Review if embeddings should use the same rate as chat)
+                        credits_to_deduct = math.ceil(total_tokens / 250)
                         
-                        tx_result = await self.credit_service.add_transaction(CreditTransactionCreate(
+                        logger.info(f"💸 Cost: ${cost:.6f} | Tokens: {total_tokens} | Deducting {credits_to_deduct} credits for Org {organization_id}...")
+                        
+                        # 1. Write immutable record to the Ledger
+                        tx_result = await self.credit_service.log_usage(CreditUsageCreate(
                             organization_id=organization_id,
-                            amount=-cost, 
-                            description=f"Knowledge Embedding ({len(texts)} chunks)",
-                            transaction_type=TransactionType.USAGE,
+                            query_type=QueryType.UPLOAD_FILE,
+                            query_text=f"Knowledge Embedding ({len(texts)} chunks)",
+                            credits_used=credits_to_deduct,
+                            status=QueryStatus.COMPLETED,
+                            input_tokens=total_tokens,
+                            output_tokens=0, # Embeddings are purely input
+                            cost=cost,
                             metadata={"agent_id": agent_id if agent_id != "file_manager" else None, "provider": "openai"}
                         ))
                         
-                        logger.info(f"💰 Deduction successful. Transaction Object: {tx_result}")
+                        # 2. Enforce the limit against the Subscription
+                        if credits_to_deduct > 0:
+                            sub_service = get_subscription_service()
+                            await sub_service.increment_usage(organization_id, credits_to_deduct)
+                        
+                        logger.info(f"💰 Deduction successful. Recorded {credits_to_deduct} credits.")
                     else:
-                        logger.info("🆓 Cost was $0.00. No deduction made.")
+                        logger.info("🆓 Cost/Tokens were 0. No deduction made.")
                         
                 except Exception as billing_err:
                     logger.error(f"🚨 BILLING CRASHED (Money saved, but logic failed): {billing_err}")
@@ -236,7 +262,7 @@ class CRMChromaServiceV2:
             # 💾 STORAGE LOGIC
             collection = self.get_or_create_collection(f"org_{organization_id}" if agent_id == "file_manager" else agent_id)
             ids = [f"{m.get('doc_id')}_{i}" for i, m in enumerate(metadatas)]
-            print("COLLECTION ",collection)
+        
             if agent_id == "file_manager":
                 filename = metadatas[0].get("filename", "unknown.docx")
                 # Buat prefixed texts

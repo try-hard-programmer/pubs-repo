@@ -79,7 +79,22 @@ class CreditService:
             if not response.data:
                 return []
             
-            transactions = [CreditUsage(**row) for row in response.data]
+            transactions = []
+            for row in response.data:
+                # Handle legacy database records
+                qt = row.get("query_type")
+                if qt not in ["text_query", "upload_file"]:
+                    row["query_type"] = "text_query" # Default fallback for old data
+                    
+                # Handle legacy status if needed
+                if "status" not in row or row["status"] not in ["pending", "completed", "failed"]:
+                    row["status"] = "completed"
+                    
+                try:
+                    transactions.append(CreditUsage(**row))
+                except Exception as e:
+                    logger.warning(f"Skipping corrupt ledger record {row.get('id')}: {e}")
+                    
             logger.info(f"📜 Retrieved {len(transactions)} usage logs for org {organization_id}")
             return transactions
             

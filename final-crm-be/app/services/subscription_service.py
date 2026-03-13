@@ -105,14 +105,19 @@ class SubscriptionService:
             logger.warning(f"⚠️ No active subscription for {organization_id}.")
             return False
             
-        if sub.status != "active":
+        # FIX: Dictionary access using .get()
+        if sub.get("status") != "active":
             logger.warning(f"⚠️ Subscription is not active for {organization_id}.")
             return False
 
-        if sub.used_credits + requested_credits > sub.total_credits:
+        # FIX: Dictionary access using .get()
+        current_used = sub.get("used_credits", 0)
+        total_credits = sub.get("total_credits", 0)
+
+        if current_used + requested_credits > total_credits:
             logger.warning(
                 f"⚠️ Credit limit reached for {organization_id}. "
-                f"Used: {sub.used_credits}, Total: {sub.total_credits}, Requested: {requested_credits}"
+                f"Used: {current_used}, Total: {total_credits}, Requested: {requested_credits}"
             )
             return False
             
@@ -121,15 +126,19 @@ class SubscriptionService:
     async def increment_usage(self, organization_id: str, credits_used: int) -> Optional[Subscription]:
         """Increment the used_credits counter."""
         try:
-            # 1. Fetch current usage (or rely on an RPC function if high concurrency is expected)
+            # 1. Fetch current usage
             sub = await self.get_subscription(organization_id)
             if not sub:
                 raise ValueError("Subscription not found")
 
-            new_used = sub.used_credits + credits_used
+            # FIX: Dictionary access using .get()
+            current_used = sub.get("used_credits", 0)
+            total_credits = sub.get("total_credits", 0)
+
+            new_used = current_used + credits_used
             
             # Pre-validate to avoid the SQL constraint crash
-            if new_used > sub.total_credits:
+            if new_used > total_credits:
                 raise ValueError("Cannot exceed total_credits limit")
 
             # 2. Update the record
@@ -149,7 +158,7 @@ class SubscriptionService:
         except Exception as e:
             logger.error(f"❌ Failed to increment usage for org {organization_id}: {e}")
             raise
-
+        
 
 # ==========================================
 # SINGLETON INSTANCE
