@@ -257,7 +257,7 @@ class DocumentProcessingWorker:
             if not file_content:
                 raise RuntimeError("Downloaded file is empty")
             
-            logger.info(f"📥 Downloaded {filename}")
+            logger.info(f"📥 Downloaded File")
             
             # =============================================
             # STEP 1: COMMON PROCESSING (extract + quality)

@@ -251,8 +251,6 @@ class CRMChromaServiceV2:
                         if credits_to_deduct > 0:
                             sub_service = get_subscription_service()
                             await sub_service.increment_usage(organization_id, credits_to_deduct)
-                        
-                        logger.info(f"💰 Deduction successful. Recorded {credits_to_deduct} credits.")
                     else:
                         logger.info("🆓 Cost/Tokens were 0. No deduction made.")
                         
@@ -269,10 +267,7 @@ class CRMChromaServiceV2:
                 prefixed_texts = [f"[File: {filename}]\n\n{text}" for text in texts]
                 # Overwrite texts
                 texts = prefixed_texts
-            print("TEXTS CLEANS ", texts)
-            print("METAS ", metadatas)
             collection.add(embeddings=embeddings, documents=texts, metadatas=metadatas, ids=ids)
-            logger.info(f"✅ Successfully stored {len(texts)} chunks.")
             return True
 
         except Exception as e:
