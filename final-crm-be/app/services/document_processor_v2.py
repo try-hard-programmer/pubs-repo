@@ -750,10 +750,6 @@ class DocumentProcessorV2:
 
             result = "\n\n".join(text_blocks)
 
-            self.logger.info(
-                f"📄 pdfplumber improved: {metrics.page_count} pages, "
-                f"{len(extracted_images)} images extracted as base64"
-            )
             return result, metrics
 
         except Exception as e:
@@ -1025,7 +1021,6 @@ class DocumentProcessorV2:
     # ============================================
 
     def _partition_by_type(self, content: bytes, filename: str, ext: str) -> List[Element]:
-        self.logger.info(f"📄 Processing {filename} via unstructured")
         fobj = io.BytesIO(content)
 
         try:

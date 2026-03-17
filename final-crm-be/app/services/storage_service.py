@@ -259,10 +259,10 @@ class StorageService:
             bucket_name = self._get_bucket_name(organization_id)
             storage_path = self._get_storage_path(file_id, folder_path)
 
-            # Download file
-            response = self.client.storage.from_(bucket_name).download(folder_path)
+            # FIX: Download the storage_path, NOT the folder_path
+            response = self.client.storage.from_(bucket_name).download(storage_path)
 
-            logger.info(f"✅ Downloaded file from storage: {bucket_name}/{folder_path}")
+            logger.info(f"✅ Downloaded file from storage: {bucket_name}/{storage_path}")
 
             return response
 
