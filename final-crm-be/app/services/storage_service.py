@@ -95,7 +95,14 @@ class StorageService:
         try:
             # Try to get bucket
             buckets = self.client.storage.list_buckets()
-            bucket_exists = any(b.name == bucket_name for b in buckets)
+            
+            # FIX: Handle both object (b.name) and dict (b['name']) responses safely
+            bucket_exists = False
+            for b in buckets:
+                b_name = b.name if hasattr(b, 'name') else b.get('name')
+                if b_name == bucket_name:
+                    bucket_exists = True
+                    break
 
             if not bucket_exists:
                 # Create bucket
@@ -103,7 +110,6 @@ class StorageService:
                     bucket_name,
                     options={
                         "public": False,  # Private bucket
-                        # "file_size_limit": 52428800,  # 50MB limit
                         "allowed_mime_types": None  # Allow all types
                     }
                 )

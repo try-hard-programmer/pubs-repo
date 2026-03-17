@@ -256,9 +256,7 @@ class DocumentProcessingWorker:
             file_content = supabase.storage.from_(bucket_name).download(file_id)
             if not file_content:
                 raise RuntimeError("Downloaded file is empty")
-            
-            logger.info(f"📥 Downloaded File")
-            
+                        
             # =============================================
             # STEP 1: COMMON PROCESSING (extract + quality)
             # =============================================

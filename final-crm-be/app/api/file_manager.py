@@ -697,11 +697,9 @@ async def upload_file(
         # STEP 2: SYNCHRONOUS STORAGE UPLOAD (Backup raw file)
         # =========================================================
         target_bucket = f"org_{organization_id}"
-        
         try:
             buckets = supabase.storage.list_buckets()
-            
-            # Handle both object (b.name) and dict (b['name']) responses
+            # Safely handle both object and dict responses from the Supabase client
             bucket_exists = False
             for b in buckets:
                 b_name = b.name if hasattr(b, 'name') else b.get('name')
@@ -710,21 +708,16 @@ async def upload_file(
                     break
                     
             if not bucket_exists:
-                logger.info(f"Bucket {target_bucket} not found. Attempting to create...")
                 supabase.storage.create_bucket(target_bucket, options={"public": False})
-                logger.info(f"Successfully created bucket: {target_bucket}")
-                
         except Exception as bucket_error:
-            # Halt the upload process immediately if the bucket cannot be created
-            error_msg = f"Failed to verify or create bucket '{target_bucket}': {str(bucket_error)}"
-            logger.error(error_msg)
-            raise HTTPException(status_code=500, detail=error_msg)
-        
+            logger.error(f"Bucket verification failed: {bucket_error}")
+            raise HTTPException(status_code=500, detail="Storage initialization failed.")
+
         # =========================================================
         # STEP 3: CREATE "PENDING" DB RECORD & RETURN TO FRONTEND
         # =========================================================
         parent_path = get_parent_path(parent_folder_id) if parent_folder_id else "/"
-        # Safely compute the exact storage path for rollbacks
+        # Calculate exactly where the file will be to ensure rollbacks target the correct path
         expected_storage_path = f"{parent_path.strip('/')}/{file_id}" if parent_path and parent_path != "/" else file_id
 
         doc_data = {
@@ -734,7 +727,7 @@ async def upload_file(
             "file_size_kb": len(file_content),
             "metadata": {
                 "file_id": file_id,
-                "bucket": f"org_{organization_id}",
+                "bucket": target_bucket,
                 "status": "pending", 
                 "chunks": 0
             }
@@ -745,7 +738,7 @@ async def upload_file(
                 organization_id=organization_id,
                 file_id=file_id,
                 file_content=file_content,
-                filename=file.filename,
+                filename=filename,
                 folder_path=parent_path,
                 mime_type=file.content_type or "application/octet-stream"
             )
@@ -753,9 +746,12 @@ async def upload_file(
             storage_path = db_responses["storage_path"]
             file_size = db_responses["size"]
         except Exception as storage_error:
-            # FIX: Use expected_storage_path instead of file_id
-            supabase.storage.from_(f"org_{organization_id}").remove([expected_storage_path])
-            raise HTTPException(500, detail="Storage upload failed")
+            # Isolated rollback using the calculated expected path
+            try:
+                supabase.storage.from_(target_bucket).remove([expected_storage_path])
+            except Exception:
+                pass 
+            raise HTTPException(500, detail=f"Storage upload failed: {str(storage_error)}")
 
         file_data = {
             "id": file_id,
@@ -764,7 +760,7 @@ async def upload_file(
             "name": filename,
             "type": file.content_type or "application/octet-stream",
             "mime_type": file.content_type or "application/octet-stream",
-            "extension": filename.rsplit(".", 1)[-1].lower() if "." in filename else "",
+            "extension": ext,
             "size": file_size,
             "storage_path": storage_path,
             "is_folder": False,
@@ -780,9 +776,13 @@ async def upload_file(
         }
         
         db_response = supabase.table("files").insert(file_data).execute()
+        
         if not db_response.data:
-            # FIX: Use storage_path instead of file_id
-            supabase.storage.from_(f"org_{organization_id}").remove([storage_path])
+            # Isolated rollback using the confirmed storage path
+            try:
+                supabase.storage.from_(target_bucket).remove([storage_path])
+            except Exception:
+                pass
             raise HTTPException(500, detail="Database insert failed")
         
         # =========================================================
