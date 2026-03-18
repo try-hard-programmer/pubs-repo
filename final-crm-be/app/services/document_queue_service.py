@@ -341,6 +341,31 @@ class DocumentProcessingWorker:
             # =============================================
             # STEP 6: NOTIFICATION (table-specific type)
             # =============================================
+            
+            # 1. FAIL-SAFE URL GENERATION (Strictly isolated from CRM)
+            file_url = None
+            if not is_knowledge_doc:  # <--- Protects CRM: Only runs for File Manager
+                try:
+                    from app.services.storage_service import get_storage_service
+                    storage = get_storage_service(supabase)
+                    
+                    # Fetch safely
+                    file_record = supabase.table("files").select("storage_path").eq("id", doc_id).execute()
+                    if file_record.data:
+                        storage_path = file_record.data[0].get("storage_path", "")
+                        folder_path = "/" + storage_path.rsplit("/", 1)[0] + "/" if "/" in storage_path else "/"
+                        
+                        file_url = storage.get_file_url(
+                            organization_id=organization_id,
+                            file_id=file_id,
+                            folder_path=folder_path,
+                            expires_in=3600
+                        )
+                except Exception as url_err:
+                    # If URL generation fails, catch it and DO NOT crash the worker
+                    logger.error(f"⚠️ [Safe URL Gen] Failed to generate URL, continuing: {url_err}")
+
+            # 2. Build the standard notification payload
             notification_type = (
                 "document_upload_completed" if is_knowledge_doc 
                 else "file_upload_completed"
@@ -354,6 +379,11 @@ class DocumentProcessingWorker:
                 "status": "completed",
                 "table": table_name
             }
+            
+            # 3. Only inject the URL if we successfully generated it
+            if file_url:
+                notification["url"] = file_url
+
             channel = f"ws_org_{organization_id}"
             self.client.publish(channel, json.dumps(notification))
             logger.info(f"📢 Published {notification_type} to {channel}")

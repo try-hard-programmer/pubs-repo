@@ -18,7 +18,7 @@ from app.config import settings
 from app.services.llm_queue_service import get_llm_queue
 
 # Import API routers
-from app.api import documents, agents, chat, jobs_scheduler, organizations, file_manager, crm_agents, crm_chats, whatsapp, webhook, websocket as ws_router, telegram
+from app.api import documents, agents, chat, jobs_scheduler, organizations, file_manager, crm_agents, crm_chats, whatsapp, webhook, websocket as ws_router, telegram, credits
 
 # Import services
 from app.services import get_agent_service
@@ -207,6 +207,7 @@ app.include_router(webhook.router)  # Webhook endpoints for external services (/
 app.include_router(ws_router.router)  # WebSocket endpoint for real-time notifications (/ws/*)
 app.include_router(telegram.router)   # Telegram Integration endpoints (/telegram/*)
 app.include_router(jobs_scheduler.router)       # Job Integration endpoints (/jobs/*)
+app.include_router(credits.router)      # Job Integration endpoints (/billing/*)
 
 # Custom OpenAPI schema with enhanced documentation
 def custom_openapi():
@@ -291,7 +292,11 @@ def custom_openapi():
         {
             "name": "Jobs",
             "description": "⚙️ **Automated Background Jobs** - Internal endpoints meant to be triggered by schedulers like Cronicle."
-        }
+        },
+        {
+            "name": "billing-and-credits",
+            "description": "💳 **Billing & Credits** - Organization subscription limits, plan details, and AI usage ledger history."
+        },
     ]
 
     # Add examples to common schemas

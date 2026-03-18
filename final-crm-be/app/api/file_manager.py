@@ -196,8 +196,6 @@ async def get_storage_use(
         logger.error(f"Failed to get storage use: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
 # =====================================================
 # FOLDER ENDPOINTS
 # =====================================================
@@ -795,16 +793,21 @@ async def upload_file(
             file_bytes=len(file_content), 
             operation="add"  
         )
-        # Add signed URL
-        file_data_with_url = _add_file_url(db_response.data[0])
-        created_doc = FileResponse(**file_data_with_url)
+        # # Add signed URL
+        # file_data_with_url = _add_file_url(db_response.data[0])
+        # created_doc = FileResponse(**file_data_with_url)
+
+        file_data_no_url = db_response.data[0].copy()
+        file_data_no_url["url"] = None 
+        
+        created_doc = FileResponse(**file_data_no_url)
 
         # =========================================================
         # STEP 5: PUSH TO REDIS QUEUE (instead of BackgroundTasks)
         # =========================================================
         queue = get_document_queue_service()
         queued = queue.enqueue(
-            doc_id=file_data_with_url["id"],
+            doc_id=file_data_no_url["id"],
             agent_id="file_manager",              
             agent_name="File Manager", 
             organization_id=organization_id,
@@ -818,8 +821,8 @@ async def upload_file(
             error_meta = {**doc_data["metadata"], "status": "queue_failed"}
             supabase.table("files") \
                 .update({"metadata": error_meta}) \
-                .eq("id", file_data_with_url["id"]).execute()
-
+                .eq("id", file_data_no_url["id"]).execute()
+            
         logger.info(f"🚀 Queued background processing for {filename}. Unblocking UI.")
         # response.status_code = status.HTTP_202_ACCEPTED
         return created_doc
