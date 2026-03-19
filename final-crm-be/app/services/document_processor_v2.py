@@ -56,6 +56,24 @@ MIN_TEXT_LENGTH = 50
 MIN_WORD_COUNT = 20
 MIN_ALPHA_RATIO = 0.3
 
+# Extensions the processor can actually extract text from and embed.
+# Everything else is stored in file manager (like Google Drive) but skipped for embedding.
+EMBEDDABLE_EXTENSIONS = {
+    # Documents
+    "pdf", "docx", "doc", "txt", "csv", "md",
+    "xlsx", "xls", "pptx", "ppt", "html", "htm", "log",
+    # Images (via OCR proxy)
+    "jpg", "jpeg", "png", "webp",
+    # Audio / Video (via transcription proxy)
+    "mp3", "wav", "m4a", "ogg", "flac",
+    "mp4", "avi", "mov", "mkv", "webm",
+}
+
+
+class EmbeddingNotSupportedError(ValueError):
+    """Raised when a file type is valid for storage but cannot be embedded."""
+    pass
+
 
 # ============================================
 # QUALITY METRICS
@@ -159,6 +177,63 @@ class DocumentProcessorV2:
             self.logger.warning(f"⚠️ {msg}")
             raise ValueError(msg)
 
+    # Magic bytes for binary formats.
+    # Text-based formats (csv, txt, html, htm, md, log) are excluded —
+    # they have no fixed signature and can start with any character.
+    _MAGIC_BYTES: dict = {
+        # Documents
+        "pdf":  [b"%PDF"],
+        "docx": [b"PK"],
+        "xlsx": [b"PK"],
+        "pptx": [b"PK"],
+        "xls":  [b"\xd0\xcf"],
+        "ppt":  [b"\xd0\xcf"],
+        "doc":  [b"\xd0\xcf"],
+        # Images
+        "png":  [b"\x89PNG"],
+        "jpg":  [b"\xff\xd8\xff"],
+        "jpeg": [b"\xff\xd8\xff"],
+        "webp": [b"RIFF"],
+        "gif":  [b"GIF8"],
+        "bmp":  [b"BM"],
+        "tiff": [b"II*\x00", b"MM\x00*"],
+        # Audio / Video
+        "mp3":  [b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"],
+        "mp4":  [b"\x00\x00\x00\x18ftyp", b"\x00\x00\x00\x1cftyp"],
+        "wav":  [b"RIFF"],
+        # Archives
+        "zip":  [b"PK"],
+        "gz":   [b"\x1f\x8b"],
+        "7z":   [b"7z\xbc\xaf"],
+        "rar":  [b"Rar!"],
+        # Executables / binaries — validated so a renamed HTML as .exe is caught,
+        # but these will still fail at the embedding step (no parser for them).
+        "exe":  [b"MZ"],
+        "dll":  [b"MZ"],
+        # Disk images
+        "iso":  [b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3"],  # MPEG / ISO start markers
+    }
+
+    @staticmethod
+    def validate_file_magic(content: bytes, filename: str) -> None:
+        """
+        Reject files whose content doesn't match their declared extension.
+        Raises ValueError with a clear message so the worker marks it as
+        failed without deleting the file from storage.
+        """
+        if not filename or "." not in filename:
+            return
+        ext = filename.rsplit(".", 1)[-1].lower()
+        expected = DocumentProcessorV2._MAGIC_BYTES.get(ext)
+        if expected is None:
+            return  # text-based or unknown — skip check
+        if not any(content[:len(sig)] == sig for sig in expected):
+            raise ValueError(
+                f"File '{filename}' content does not match its .{ext} extension. "
+                f"It may be a renamed file. "
+                f"Please re-export as a proper {ext.upper()} file and re-upload."
+            )
+
     def generate_content_hash(self, text: str) -> str:
         normalized = re.sub(r'\s+', ' ', text.lower().strip())
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
@@ -214,6 +289,17 @@ class DocumentProcessorV2:
 
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         metrics = DocumentQualityMetrics()
+
+        # Reject files whose bytes don't match their declared extension
+        self.validate_file_magic(content, filename)
+
+        # File types not in EMBEDDABLE_EXTENSIONS are stored (Google Drive style)
+        # but skipped for embedding — raise so the worker marks them gracefully.
+        if ext and ext not in EMBEDDABLE_EXTENSIONS:
+            raise EmbeddingNotSupportedError(
+                f"'.{ext}' files are stored but not supported for embedding. "
+                f"The file is safely kept in storage."
+            )
 
         if ext in ("mp3", "wav", "m4a", "ogg", "flac", "jpg", "jpeg", "png", "webp","mp4", "avi", "mov", "mkv", "webm"):
             if ext in ("jpg","jpeg","png","webp"):
@@ -1044,6 +1130,8 @@ class DocumentProcessorV2:
             if ext == "csv":
                 return partition_csv(file=fobj)
             elif ext in ("xlsx", "xls"):
+                # Magic bytes already validated in process_document before we get here.
+                # .xlsx → PK (ZIP), .xls → D0CF (OLE2 legacy)
                 return partition_xlsx(file=fobj)
             elif ext == "pdf":
                 return partition_pdf(

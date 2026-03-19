@@ -217,7 +217,7 @@ class DocumentProcessingWorker:
         but now runs in a dedicated thread with its own event loop.
         redis_client is the per-thread Redis connection owned by the calling worker.
         """
-        from app.services.document_processor_v2 import DocumentProcessorV2
+        from app.services.document_processor_v2 import DocumentProcessorV2, EmbeddingNotSupportedError
         from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
         from app.utils.chunkingv2 import split_into_chunks_with_metadata
         from supabase import create_client
@@ -398,10 +398,40 @@ class DocumentProcessingWorker:
             redis_client.publish(channel, json.dumps(notification))
             logger.info(f"📢 Published {notification_type} to {channel}")
             
+        except EmbeddingNotSupportedError as e:
+            # File type is valid for storage but not embeddable (e.g. .zip, .exe, .iso).
+            # Mark as "not_supported" — file stays in storage, no error shown to user.
+            _elapsed = round((time.monotonic() - _t0) * 1000)
+            logger.info(f"ℹ️ [worker] {table_name}/{filename} skipped embedding in {_elapsed}ms — {e}")
+            try:
+                if is_knowledge_doc:
+                    supabase.table("knowledge_documents").update({
+                        "metadata": {"status": "not_supported", "reason": str(e)}
+                    }).eq("id", doc_id).execute()
+                else:
+                    supabase.table("files").update({
+                        "embedding_status": "not_supported",
+                        "embedding_error": str(e)[:500],
+                    }).eq("id", doc_id).execute()
+            except Exception:
+                pass
+            try:
+                redis_client.publish(f"ws_org_{organization_id}", json.dumps({
+                    "type": "file_upload_warning" if not is_knowledge_doc else "document_upload_warning",
+                    "organization_id": organization_id,
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "status": "not_supported",
+                    "message": str(e),
+                    "table": table_name,
+                }))
+            except Exception as pub_err:
+                logger.error(f"⚠️ Publish failed: {pub_err}")
+
         except Exception as e:
             _elapsed = round((time.monotonic() - _t0) * 1000)
             logger.error(f"❌ [worker] {table_name}/{filename} failed in {_elapsed}ms — {e}")
-            
+
             # Error metadata
             error_meta = {
                 "file_id": file_id,
@@ -409,7 +439,7 @@ class DocumentProcessingWorker:
                 "status": "failed",
                 "error_detail": str(e)[:500],
             }
-            
+
             try:
                 if is_knowledge_doc:
                     supabase.table("knowledge_documents").update({
@@ -423,7 +453,7 @@ class DocumentProcessingWorker:
                     }).eq("id", doc_id).execute()
             except Exception:
                 pass
-            
+
             # Error notification
             notification = {
                 "type": "document_upload_failed" if is_knowledge_doc else "file_upload_failed",
