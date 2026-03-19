@@ -9,6 +9,7 @@ import mimetypes
 import asyncio
 import re
 import hashlib
+import concurrent.futures
 
 from typing import Tuple, List, Optional, Dict, Any, TYPE_CHECKING
 
@@ -403,18 +404,34 @@ class DocumentProcessorV2:
         try:
             self.logger.info("📄 PDF: Using hi_res strategy (layout + tables + images)")
 
-            # 1. OPEN THE SANDBOX
-            with tempfile.TemporaryDirectory() as tmpdir:
-                elements = partition_pdf(
+            timeout_secs = getattr(settings, "PDF_EXTRACTION_TIMEOUT", 60)
+
+            # Run partition_pdf in a thread so we can enforce a wall-clock timeout.
+            # A corrupted or adversarial PDF can otherwise stall the worker indefinitely.
+            def _run_partition(tmpdir: str):
+                return partition_pdf(
                     file=io.BytesIO(content),
                     strategy="hi_res",
-                    infer_table_structure=False, 
+                    infer_table_structure=False,
                     extract_images_in_pdf=True,
                     extract_image_block_types=["Image"],
-                    extract_image_block_output_dir=tmpdir, 
+                    extract_image_block_output_dir=tmpdir,
                     languages=["ind", "eng"],
                     max_partition=None,
                 )
+
+            # 1. OPEN THE SANDBOX
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_run_partition, tmpdir)
+                    try:
+                        elements = future.result(timeout=timeout_secs)
+                    except concurrent.futures.TimeoutError:
+                        self.logger.warning(
+                            f"⚠️ PDF hi_res extraction timed out after {timeout_secs}s, "
+                            f"falling back to pdfplumber"
+                        )
+                        return self._extract_pdf_pdfplumber(content)
 
                 if not elements:
                     return self._extract_pdf_pdfplumber(content)

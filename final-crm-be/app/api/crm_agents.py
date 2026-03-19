@@ -9,6 +9,8 @@ from fastapi import APIRouter, File, HTTPException, Query, Depends, status, Uplo
 from typing import List, Optional, Dict, Any, Tuple
 import logging
 import re
+import asyncio
+import os
 from datetime import datetime, timezone
 import mimetypes
 
@@ -731,8 +733,11 @@ async def create_knowledge_document(
     current_user: User = Depends(get_current_user),
 ):
     from uuid import uuid4
+    import time as _time
     from app.services.document_processor_v2 import DocumentProcessorV2
     from app.services.document_queue_service import get_document_queue_service
+
+    _t0 = _time.monotonic()
 
     try:
         organization_id = await get_user_organization_id(current_user)
@@ -751,14 +756,15 @@ async def create_knowledge_document(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        # Verify agent ownership
-        agent_check = supabase.table("agents").select("id, name").eq("id", agent_id).eq("organization_id", organization_id).execute()
+        # Verify agent ownership + duplicate name check — run in parallel
+        agent_check, existing_doc = await asyncio.gather(
+            asyncio.to_thread(lambda: supabase.table("agents").select("id, name").eq("id", agent_id).eq("organization_id", organization_id).execute()),
+            asyncio.to_thread(lambda: supabase.table("knowledge_documents").select("id").eq("agent_id", agent_id).eq("name", filename).execute()),
+        )
         if not agent_check.data:
             raise HTTPException(status_code=404, detail="Agent not found")
         agent_name = agent_check.data[0]["name"]
-        
-        # [NEW] Check for duplicate document names
-        existing_doc = supabase.table("knowledge_documents").select("id").eq("agent_id", agent_id).eq("name", filename).execute()
+
         if existing_doc.data:
             raise HTTPException(status_code=409, detail=f"Dokumen dengan nama '{filename}' sudah ada.")
 
@@ -774,7 +780,7 @@ async def create_knowledge_document(
             buckets = supabase.storage.list_buckets()
             if not any(b.name == agent_bucket_name for b in buckets):
                 supabase.storage.create_bucket(agent_bucket_name, options={"public": False})
-                
+
             supabase.storage.from_(agent_bucket_name).upload(
                 path=file_id,
                 file=file_content,
@@ -783,6 +789,17 @@ async def create_knowledge_document(
         except Exception as e:
             logger.error(f"❌ Storage upload failed: {e}")
             raise HTTPException(status_code=500, detail="Gagal mengunggah file ke penyimpanan.")
+
+        # Write file bytes to a local temp path so the worker can skip the
+        # redundant Supabase Storage download.  Falls back to storage download
+        # automatically if the temp file is gone by the time the worker runs.
+        temp_file_path = f"/tmp/doc_upload_{file_id}"
+        try:
+            with open(temp_file_path, "wb") as tmp_f:
+                tmp_f.write(file_content)
+        except Exception as tmp_err:
+            logger.warning(f"⚠️ Could not write temp file (non-fatal): {tmp_err}")
+            temp_file_path = None
 
         # =========================================================
         # STEP 3: DATABASE INSERT
@@ -821,6 +838,7 @@ async def create_knowledge_document(
             file_id=file_id,
             filename=filename,
             bucket_name=agent_bucket_name,
+            temp_file_path=temp_file_path,
         )
 
         if not queued:
@@ -830,14 +848,18 @@ async def create_knowledge_document(
             supabase.table("knowledge_documents").delete().eq("id", created_doc.id).execute()
             raise HTTPException(status_code=500, detail="Sistem sedang sibuk. Gagal memproses dokumen.")
 
-        logger.info(f"🚀 Queued background processing for {filename}.")
+        _elapsed = round((_time.monotonic() - _t0) * 1000)
+        logger.info(f"✅ [knowledge-upload] {filename} queued in {_elapsed}ms")
         response.status_code = status.HTTP_202_ACCEPTED
         return created_doc
 
-    except HTTPException:
+    except HTTPException as e:
+        _elapsed = round((_time.monotonic() - _t0) * 1000)
+        logger.warning(f"⚠️ [knowledge-upload] {file.filename} failed in {_elapsed}ms — HTTP {e.status_code}: {e.detail}")
         raise
     except Exception as e:
-        logger.error(f"❌ Upload initialization failed: {e}", exc_info=True)
+        _elapsed = round((_time.monotonic() - _t0) * 1000)
+        logger.error(f"❌ [knowledge-upload] {file.filename} error in {_elapsed}ms — {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Terjadi kesalahan sistem.")
 
 @router.delete(

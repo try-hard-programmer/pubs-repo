@@ -59,6 +59,10 @@ class Settings:
     # Collection name
     CHROMADB_COLLECTION_NAME: str = os.getenv("CHROMADB_COLLECTION_NAME", "docs_openai")
 
+    # Document Worker Configuration
+    WORKER_CONCURRENCY: int = int(os.getenv("WORKER_CONCURRENCY", "3"))
+    PDF_EXTRACTION_TIMEOUT: int = int(os.getenv("PDF_EXTRACTION_TIMEOUT", "60"))
+
     # File Processing Configuration
     IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "tiff", "bmp"}
     MUSIC_EXTENSIONS = {"mp3", "wav", "mp4", "webm", "ogg", "flac"}

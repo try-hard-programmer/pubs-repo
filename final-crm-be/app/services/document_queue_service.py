@@ -24,8 +24,9 @@ import logging
 import asyncio
 import threading
 import time
+import os
+from typing import Optional, List
 import redis
-from typing import Optional
 from datetime import datetime, timezone
 
 from app.config import settings
@@ -79,13 +80,14 @@ class DocumentQueueService:
         file_id: str,
         filename: str,
         bucket_name: str,
+        temp_file_path: Optional[str] = None,
     ) -> bool:
         """
         Push a processing job to Redis. Returns True if queued successfully.
-        
-        NOTE: We do NOT pass file_content through Redis.
-        The worker downloads the file from Supabase Storage using bucket_name + file_id.
-        This keeps Redis lightweight (just job descriptors, not file bytes).
+
+        temp_file_path: if provided, the worker reads from this local path instead
+        of re-downloading from Supabase Storage, eliminating the redundant round-trip.
+        Falls back to storage download automatically if the path no longer exists.
         """
         try:
             job = {
@@ -96,6 +98,7 @@ class DocumentQueueService:
                 "file_id": file_id,
                 "filename": filename,
                 "bucket_name": bucket_name,
+                "temp_file_path": temp_file_path,
                 "queued_at": datetime.now(timezone.utc).isoformat(),
             }
             
@@ -126,103 +129,93 @@ class DocumentQueueService:
 
 class DocumentProcessingWorker:
     """
-    Pulls jobs from Redis and processes them in its own thread.
+    Pulls jobs from Redis and processes them in a pool of worker threads.
     Never touches the FastAPI/uvicorn event loop.
+    Each worker thread owns its own Redis client to avoid connection contention.
     """
-    
+
     QUEUE_KEY = DocumentQueueService.QUEUE_KEY
     PROCESSING_KEY = DocumentQueueService.PROCESSING_KEY
     POLL_INTERVAL = 2  # seconds between Redis polls when queue is empty
-    
+
     def __init__(self):
-        self._redis: Optional[redis.Redis] = None
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-    
-    @property
-    def client(self) -> redis.Redis:
-        if self._redis is None:
-            self._redis = _get_redis_client()
-        return self._redis
+        self._threads: List[threading.Thread] = []
 
     def start_in_thread(self):
-        """Start the worker loop in a daemon thread (called from FastAPI lifespan)."""
-        if self._thread and self._thread.is_alive():
-            logger.warning("⚠️ Document worker thread already running")
+        """Start N worker threads (configured by WORKER_CONCURRENCY env var)."""
+        if self._threads and any(t.is_alive() for t in self._threads):
+            logger.warning("⚠️ Document worker threads already running")
             return
-        
+
         self._running = True
-        self._thread = threading.Thread(
-            target=self._worker_loop,
-            name="doc-processing-worker",
-            daemon=True,  # Dies when main process exits
-        )
-        self._thread.start()
-        logger.info("🚀 Document processing worker started (background thread)")
-    
+        concurrency = getattr(settings, "WORKER_CONCURRENCY", 3)
+
+        for i in range(concurrency):
+            t = threading.Thread(
+                target=self._worker_loop,
+                name=f"doc-processing-worker-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        logger.info(f"🚀 Document processing worker pool started ({concurrency} threads)")
+
     def stop(self):
-        """Graceful shutdown."""
+        """Graceful shutdown — signal all threads to stop and wait."""
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=30)
-            logger.info("🛑 Document processing worker stopped")
-    
+        for t in self._threads:
+            t.join(timeout=30)
+        logger.info("🛑 Document processing worker pool stopped")
+
     def _worker_loop(self):
         """
-        Main worker loop. Runs in a separate thread.
+        Main worker loop. Each thread runs this independently with its own Redis client.
         Uses BRPOP for efficient blocking wait (no busy-polling).
         """
-        logger.info("👷 Document worker loop started, waiting for jobs...")
-        
+        worker_name = threading.current_thread().name
+        local_client = _get_redis_client()
+        logger.info(f"👷 [{worker_name}] Worker started, waiting for jobs...")
+
         while self._running:
             try:
-                # BRPOP blocks for up to POLL_INTERVAL seconds, then returns None
-                result = self.client.brpop(self.QUEUE_KEY, timeout=self.POLL_INTERVAL)
-                
+                result = local_client.brpop(self.QUEUE_KEY, timeout=self.POLL_INTERVAL)
+
                 if result is None:
-                    continue  # Timeout, no jobs — loop back
-                
+                    continue
+
                 _, job_json = result
                 job = json.loads(job_json)
-                
-                logger.info(f"⚙️ [DocWorker] Picked up job: {job['filename']} (doc_id={job['doc_id']})")
-                
-                # Track active job for monitoring
-                self.client.set(
-                    self.PROCESSING_KEY, 
-                    json.dumps({**job, "started_at": datetime.now(timezone.utc).isoformat()}),
-                    ex=3600  # Auto-expire after 1 hour (safety net)
-                )
-                
-                # Process the document (heavy work — in THIS thread, not event loop)
-                self._process_job(job)
-                
-                # Clear active tracking
-                self.client.delete(self.PROCESSING_KEY)
-                
+
+                logger.info(f"⚙️ [{worker_name}] Picked up job: {job['filename']} (doc_id={job['doc_id']})")
+
+                self._process_job(job, local_client)
+
             except Exception as e:
-                logger.error(f"❌ [DocWorker] Unexpected error in loop: {e}", exc_info=True)
-                time.sleep(5)  # Back off on errors
-    
-    def _process_job(self, job: dict):
+                logger.error(f"❌ [{worker_name}] Unexpected error in loop: {e}", exc_info=True)
+                time.sleep(5)
+
+    def _process_job(self, job: dict, redis_client: redis.Redis):
         """
-        Process a single document job. Creates its own event loop 
+        Process a single document job. Creates its own event loop
         since we're in a worker thread (not the uvicorn thread).
         """
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
         try:
-            loop.run_until_complete(self._process_job_async(job))
+            loop.run_until_complete(self._process_job_async(job, redis_client))
         except Exception as e:
             logger.error(f"❌ [DocWorker] Job failed for {job.get('filename')}: {e}", exc_info=True)
         finally:
             loop.close()
     
-    async def _process_job_async(self, job: dict):
+    async def _process_job_async(self, job: dict, redis_client: redis.Redis):
         """
         Async processing logic — same steps as the old process_document_background,
         but now runs in a dedicated thread with its own event loop.
+        redis_client is the per-thread Redis connection owned by the calling worker.
         """
         from app.services.document_processor_v2 import DocumentProcessorV2
         from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
@@ -243,19 +236,36 @@ class DocumentProcessingWorker:
         is_knowledge_doc = table_name == "knowledge_documents"
         
         logger.info(f"⚙️ [DocWorker] Processing {table_name}: {filename} (doc_id={doc_id})")
-        
+
         # Fresh clients
         key = settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_KEY
         supabase = create_client(settings.SUPABASE_URL, key)
         doc_processor = DocumentProcessorV2()
-        
+
+        _t0 = time.monotonic()
+
         try:
             # =============================================
-            # STEP 0: DOWNLOAD FILE
+            # STEP 0: READ FILE (temp path first, storage fallback)
             # =============================================
-            file_content = supabase.storage.from_(bucket_name).download(file_id)
+            temp_file_path = job.get("temp_file_path")
+            file_content = None
+
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    with open(temp_file_path, "rb") as tmp_f:
+                        file_content = tmp_f.read()
+                    os.unlink(temp_file_path)
+                    logger.debug(f"📂 [{filename}] Read from temp file (skipped storage download)")
+                except Exception as tmp_err:
+                    logger.warning(f"⚠️ Temp file read failed, falling back to storage: {tmp_err}")
+                    file_content = None
+
             if not file_content:
-                raise RuntimeError("Downloaded file is empty")
+                file_content = supabase.storage.from_(bucket_name).download(file_id)
+
+            if not file_content:
+                raise RuntimeError("File is empty (temp and storage both failed)")
                         
             # =============================================
             # STEP 1: COMMON PROCESSING (extract + quality)
@@ -263,8 +273,6 @@ class DocumentProcessingWorker:
             clean_text, metrics = doc_processor.process_document(
                 file_content, filename, bucket_name, organization_id, file_id
             )
-            print("TEXT ", clean_text)
-            print("METRICS ", metrics)
 
             if not clean_text :
                raise ValueError("No text extracted")
@@ -303,8 +311,9 @@ class DocumentProcessingWorker:
             chroma_service = get_crm_chroma_service_v2()
             success = await chroma_service.add_documents(
                 agent_id=agent_id,  # None OK untuk files?
-                texts=chunks, metadatas=chunk_metas, 
-                organization_id=organization_id
+                texts=chunks, metadatas=chunk_metas,
+                organization_id=organization_id,
+                filename=filename
             )
             if not success and agent_id != "file_manager":
                 raise Exception("ChromaDB failed")
@@ -336,8 +345,9 @@ class DocumentProcessingWorker:
                     "metadata": updated_meta if chunks and agent_id == "file_manager" else {}
                 }).eq("id", doc_id).execute()
             
-            logger.info(f"✅ [{table_name}] {filename} → {len(chunks)} chunks")
-            
+            _elapsed = round((time.monotonic() - _t0) * 1000)
+            logger.info(f"✅ [worker] {table_name}/{filename} done in {_elapsed}ms — {len(chunks)} chunks")
+
             # =============================================
             # STEP 6: NOTIFICATION (table-specific type)
             # =============================================
@@ -385,11 +395,12 @@ class DocumentProcessingWorker:
                 notification["url"] = file_url
 
             channel = f"ws_org_{organization_id}"
-            self.client.publish(channel, json.dumps(notification))
+            redis_client.publish(channel, json.dumps(notification))
             logger.info(f"📢 Published {notification_type} to {channel}")
             
         except Exception as e:
-            logger.error(f"❌ [{table_name}] {filename}: {e}")
+            _elapsed = round((time.monotonic() - _t0) * 1000)
+            logger.error(f"❌ [worker] {table_name}/{filename} failed in {_elapsed}ms — {e}")
             
             # Error metadata
             error_meta = {
@@ -425,15 +436,28 @@ class DocumentProcessingWorker:
                 "table": table_name
             }
             try:
-                self.client.publish(f"ws_org_{organization_id}", json.dumps(notification))
+                redis_client.publish(f"ws_org_{organization_id}", json.dumps(notification))
             except Exception as pub_err:
                 logger.error(f"⚠️ Publish failed: {pub_err}")
             
-            # Cleanup storage
-            try:
-                supabase.storage.from_(bucket_name).remove([file_id])
-            except Exception:
-                pass
+            # Cleanup temp file if still present
+            temp_file_path = job.get("temp_file_path")
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
+
+            # Cleanup storage — knowledge documents only.
+            # File manager files must NOT be deleted on embedding failure:
+            # the file is the user's asset and must remain accessible even
+            # if background processing fails.  Embedding status is already
+            # marked "failed" in the DB above; the file stays in storage.
+            if is_knowledge_doc:
+                try:
+                    supabase.storage.from_(bucket_name).remove([file_id])
+                except Exception:
+                    pass
 
 
 # ============================================

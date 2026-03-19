@@ -159,10 +159,6 @@ class StorageService:
             storage_path = self._get_storage_path(file_id, folder_path)
 
             # Upload file
-            print("UPLOAD FILE")
-            print(bucket_name)
-            print(storage_path)
-            print(file_id)
             response = self.client.storage.from_(bucket_name).upload(
                 path=storage_path,
                 file=file_content,
@@ -523,15 +519,11 @@ _storage_service: Optional[StorageService] = None
 
 def get_storage_service(client: Optional[Client] = None) -> StorageService:
     """
-    Get or create StorageService singleton
-
-    Args:
-        client: Optional Supabase client
-
-    Returns:
-        StorageService instance
+    Get or create StorageService singleton.
+    Always uses SERVICE_ROLE_KEY via _get_supabase_client() to access private buckets.
+    The client parameter is intentionally ignored to prevent anon-key poisoning.
     """
     global _storage_service
     if _storage_service is None:
-        _storage_service = StorageService(client)
+        _storage_service = StorageService()  # always uses _get_supabase_client() → SERVICE_KEY
     return _storage_service

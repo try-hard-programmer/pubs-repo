@@ -568,7 +568,9 @@ async def upload_file(
     - 413: File too large
     - 500: Server error
     """
-    logger.info(f"Upload file '{file.filename}' from {current_user.email}")
+    import time as _time
+    _t0 = _time.monotonic()
+    logger.info(f"⏱️ [filemanager-upload] START '{file.filename}' from {current_user.email}")
 
     try:
         # Get user's organization
@@ -704,9 +706,21 @@ async def upload_file(
                 if b_name == target_bucket:
                     bucket_exists = True
                     break
-                    
+
             if not bucket_exists:
-                supabase.storage.create_bucket(target_bucket, options={"public": False})
+                try:
+                    supabase.storage.create_bucket(target_bucket, options={"public": False})
+                except Exception as create_err:
+                    # Another concurrent request may have created the bucket between
+                    # our list_buckets() check and this create call — that is safe
+                    # to ignore.  Re-raise only if the bucket still doesn't exist.
+                    buckets_retry = supabase.storage.list_buckets()
+                    still_missing = not any(
+                        (b.name if hasattr(b, 'name') else b.get('name')) == target_bucket
+                        for b in buckets_retry
+                    )
+                    if still_missing:
+                        raise create_err
         except Exception as bucket_error:
             logger.error(f"Bucket verification failed: {bucket_error}")
             raise HTTPException(status_code=500, detail="Storage initialization failed.")
@@ -823,14 +837,18 @@ async def upload_file(
                 .update({"metadata": error_meta}) \
                 .eq("id", file_data_no_url["id"]).execute()
             
-        logger.info(f"🚀 Queued background processing for {filename}. Unblocking UI.")
+        _elapsed = round((_time.monotonic() - _t0) * 1000)
+        logger.info(f"✅ [filemanager-upload] {filename} queued in {_elapsed}ms")
         # response.status_code = status.HTTP_202_ACCEPTED
         return created_doc
 
-    except HTTPException:
+    except HTTPException as e:
+        _elapsed = round((_time.monotonic() - _t0) * 1000)
+        logger.warning(f"⚠️ [filemanager-upload] {file.filename} failed in {_elapsed}ms — HTTP {e.status_code}: {e.detail}")
         raise
     except Exception as e:
-        logger.error(f"Failed to upload file: {e}")
+        _elapsed = round((_time.monotonic() - _t0) * 1000)
+        logger.error(f"❌ [filemanager-upload] {file.filename} error in {_elapsed}ms — {e}")
         raise HTTPException(status_code=500, detail=str("Internal server error"))
 
 
@@ -935,9 +953,9 @@ async def download_file(
 
         file_data = response.data[0]
 
-        # Download from storage
+        # Download from storage — get_storage_service always uses SERVICE_KEY internally
         from app.services.storage_service import get_storage_service
-        storage_service = get_storage_service(client)
+        storage_service = get_storage_service()
 
         file_content = storage_service.download_file(
             organization_id=file_data["organization_id"],

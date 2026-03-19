@@ -123,8 +123,8 @@ class SubscriptionService:
             
         return True
 
-    async def increment_usage(self, organization_id: str, credits_used: int) -> Optional[Subscription]:
-        """Increment the used_credits counter."""
+    async def increment_usage(self, organization_id: str, credits_used: int, cost: float = 0.0) -> Optional[Subscription]:
+        """Increment the used_credits counter and accumulate total_cost (IDR)."""
         try:
             # 1. Fetch current usage
             sub = await self.get_subscription(organization_id)
@@ -134,9 +134,11 @@ class SubscriptionService:
             # FIX: Dictionary access using .get()
             current_used = sub.get("used_credits", 0)
             total_credits = sub.get("total_credits", 0)
+            current_cost = float(sub.get("total_cost", 0) or 0)
 
             new_used = current_used + credits_used
-            
+            new_cost = current_cost + cost
+
             # Pre-validate to avoid the SQL constraint crash
             if new_used > total_credits:
                 raise ValueError("Cannot exceed total_credits limit")
@@ -145,6 +147,7 @@ class SubscriptionService:
             response = self.client.table("subscriptions")\
                 .update({
                     "used_credits": new_used,
+                    "total_cost": new_cost,
                     "updated_at": datetime.utcnow().isoformat()
                 })\
                 .eq("organization_id", organization_id)\

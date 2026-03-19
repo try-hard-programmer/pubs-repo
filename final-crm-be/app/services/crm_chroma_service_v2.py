@@ -48,6 +48,8 @@ class LocalProxyEmbeddingFunction(chromadb.EmbeddingFunction):
             
             if "cost_usd" in metadata:
                 usage["cost_usd"] = metadata["cost_usd"]
+            if "cost_idr" in metadata:
+                usage["cost_idr"] = metadata["cost_idr"]
 
             embeddings = []
             if isinstance(data, dict) and "data" in data:
@@ -205,7 +207,7 @@ class CRMChromaServiceV2:
             embedding_function=self.embedding_fn
         )
 
-    async def add_documents(self, agent_id: str, texts: List[str], metadatas: List[Dict], organization_id: str = None):
+    async def add_documents(self, agent_id: str, texts: List[str], metadatas: List[Dict], organization_id: str = None, filename: str = ""):
         try:
             if not texts: return False
 
@@ -216,41 +218,45 @@ class CRMChromaServiceV2:
             # 💰 BILLING LOGIC
             if organization_id:
                 try:
-                    cost = 0.0
+                    cost_idr = 0.0
                     total_tokens = usage.get("total_tokens", 0)
-                    
-                    if "cost_usd" in usage: 
-                        cost = float(usage["cost_usd"])
-                    elif total_tokens > 0: 
-                        cost = total_tokens * 0.0000002
-                    
+
+                    if "cost_idr" in usage:
+                        # Proxy returns real cost in IDR based on actual model + live rate
+                        cost_idr = float(usage["cost_idr"])
+                    elif "cost_usd" in usage:
+                        # Fallback: proxy returned USD only, convert with default rate
+                        cost_idr = float(usage["cost_usd"]) * 16900
+                    elif total_tokens > 0:
+                        # Fallback: no cost from proxy, estimate (text-embedding-3-small rate)
+                        cost_idr = total_tokens * 0.0000002 * 16900
+
                     # Failsafe: If proxy only returned cost but no token count
-                    if total_tokens == 0 and cost > 0:
-                        total_tokens = int(cost / 0.0000002)
+                    if total_tokens == 0 and cost_idr > 0:
+                        total_tokens = int((cost_idr / 16900) / 0.0000002)
 
                     if total_tokens > 0:
-                        # APPLY THE EXCHANGE RATE (Note: Review if embeddings should use the same rate as chat)
                         credits_to_deduct = math.ceil(total_tokens / 250)
-                        
-                        logger.info(f"💸 Cost: ${cost:.6f} | Tokens: {total_tokens} | Deducting {credits_to_deduct} credits for Org {organization_id}...")
-                        
+
+                        logger.info(f"💸 Cost: Rp{cost_idr:.2f} | Tokens: {total_tokens} | Deducting {credits_to_deduct} credits for Org {organization_id}...")
+
                         # 1. Write immutable record to the Ledger
                         tx_result = await self.credit_service.log_usage(CreditUsageCreate(
                             organization_id=organization_id,
                             query_type=QueryType.UPLOAD_FILE,
-                            query_text=f"Knowledge Embedding ({len(texts)} chunks)",
+                            query_text=f"training file {filename} with {len(texts)} total chunk",
                             credits_used=credits_to_deduct,
                             status=QueryStatus.COMPLETED,
                             input_tokens=total_tokens,
                             output_tokens=0, # Embeddings are purely input
-                            cost=cost,
-                            metadata={"agent_id": agent_id if agent_id != "file_manager" else None, "provider": "openai"}
+                            cost=cost_idr,
+                            metadata={"agent_id": agent_id if agent_id != "file_manager" else None}
                         ))
                         
                         # 2. Enforce the limit against the Subscription
                         if credits_to_deduct > 0:
                             sub_service = get_subscription_service()
-                            await sub_service.increment_usage(organization_id, credits_to_deduct)
+                            await sub_service.increment_usage(organization_id, credits_to_deduct, cost=cost_idr)
                     else:
                         logger.info("🆓 Cost/Tokens were 0. No deduction made.")
                         
