@@ -1,8 +1,12 @@
+import math
 import aiohttp
 from google.adk.agents import LlmAgent
 from app.agents.tools.tools_rag import rerank_with_proxy, retrieve_chromadb_documents
 from app.config import settings
 from app.services.chat_service import get_chat_service
+from app.services.credit_service import get_credit_service
+from app.services.subscription_service import get_subscription_service
+from app.models.credit import CreditUsageCreate, QueryType, QueryStatus
 from .base_agent import BaseAgent
 
 class RAGAgent(BaseAgent):
@@ -193,8 +197,42 @@ class RAGAgent(BaseAgent):
                   .get("content", "")
         ) or result.get("reply") or result.get("content") or "Maaf, tidak ada respons."
 
-        # 5) Session_id: karena bukan ADK session, kamu bisa:
+        # 5) Credit deduction
         final_session_id = session_id or "proxy-session"
+        usage = result.get("usage") or {}
+        input_tokens  = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+        total_tokens  = usage.get("total_tokens", 0) or (input_tokens + output_tokens)
+
+        if total_tokens > 0 and organization_id:
+            try:
+                proxy_meta = result.get("metadata") or {}
+                if "cost_idr" in proxy_meta:
+                    cost_idr = float(proxy_meta["cost_idr"])
+                elif "cost_usd" in proxy_meta:
+                    cost_idr = float(proxy_meta["cost_usd"]) * 16900
+                else:
+                    cost_idr = ((input_tokens * 0.00000015) + (output_tokens * 0.0000006)) * 16900
+
+                credits_to_deduct = math.ceil(total_tokens / 250)
+
+                await get_credit_service().log_usage(CreditUsageCreate(
+                    organization_id=organization_id,
+                    query_type=QueryType.TEXT_QUERY,
+                    query_text=f"File Manager Chat: {query[:150]}" if query else "File Manager Chat",
+                    credits_used=credits_to_deduct,
+                    status=QueryStatus.COMPLETED,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost=cost_idr,
+                    metadata={"source": "file_manager_rag", "session_id": final_session_id},
+                ))
+
+                if credits_to_deduct > 0:
+                    await get_subscription_service().increment_usage(organization_id, credits_to_deduct, cost=cost_idr)
+            except Exception as bill_err:
+                import logging
+                logging.getLogger(__name__).error(f"🚨 Billing failure (rag_agent): {bill_err}", exc_info=True)
 
         return {
             "answer": answer,

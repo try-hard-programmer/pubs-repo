@@ -344,7 +344,7 @@ class DynamicAIServiceV2:
                             usage_payload = CreditUsageCreate(
                                 organization_id=chat["organization_id"],
                                 query_type=QueryType.TEXT_QUERY,
-                                query_text=f"AI Chat Response",
+                                query_text=f"{chat.get('channel', 'web').title()} Chat: {full_user_prompt_text[:150]}",
                                 credits_used=credits_to_deduct,
                                 status=QueryStatus.COMPLETED,
                                 input_tokens=input_tokens,
