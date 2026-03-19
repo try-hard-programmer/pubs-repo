@@ -141,6 +141,67 @@ class CreditService:
             logger.error(f"❌ Failed to get usage stats: {e}", exc_info=True)
             return {"total_spent": 0.0, "total_transactions": 0, "by_type": {}, "by_provider": {}}
 
+    async def get_usage_history_filtered(
+        self,
+        organization_id: str,
+        start_date=None,
+        end_date=None,
+        year: int = None,
+        month: int = None,
+        limit: int = 5000,
+    ) -> List[dict]:
+        """Get raw usage rows with optional date / year / month filters."""
+        try:
+            import calendar
+            from datetime import date as date_type, timedelta
+
+            query = (
+                self.client.table("credit_usage")
+                .select("*")
+                .eq("organization_id", organization_id)
+            )
+
+            if start_date:
+                query = query.gte("created_at", start_date.isoformat())
+            if end_date:
+                from datetime import timedelta
+                query = query.lt("created_at", (end_date + timedelta(days=1)).isoformat())
+
+            if year and month:
+                last_day = calendar.monthrange(year, month)[1]
+                query = (
+                    query
+                    .gte("created_at", date_type(year, month, 1).isoformat())
+                    .lte("created_at", f"{date_type(year, month, last_day).isoformat()}T23:59:59")
+                )
+            elif year:
+                query = (
+                    query
+                    .gte("created_at", date_type(year, 1, 1).isoformat())
+                    .lte("created_at", f"{date_type(year, 12, 31).isoformat()}T23:59:59")
+                )
+
+            response = query.order("created_at", desc=True).limit(limit).execute()
+            return response.data or []
+        except Exception as e:
+            logger.error(f"❌ Failed to get filtered usage history: {e}", exc_info=True)
+            return []
+
+    async def get_transaction_by_id(self, organization_id: str, transaction_id: str) -> Optional[dict]:
+        """Get a single credit_usage row scoped to an organization."""
+        try:
+            response = (
+                self.client.table("credit_usage")
+                .select("*")
+                .eq("organization_id", organization_id)
+                .eq("id", transaction_id)
+                .execute()
+            )
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"❌ Failed to get transaction {transaction_id}: {e}", exc_info=True)
+            return None
+
 # ==========================================
 # SINGLETON INSTANCE
 # ==========================================
