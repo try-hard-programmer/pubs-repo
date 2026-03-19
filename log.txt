@@ -1,0 +1,598 @@
+python main.py
+INFO:app.services.document_processor:📦 Using local document processing with Unstructured library
+INFO:     Started server process [105871]
+INFO:     Waiting for application startup.
+INFO:__main__:Starting File Manager API...
+INFO:app.services.agent_service:Starting agent initialization...
+INFO:app.agents.agent_registry:Registered agent class: rag_agent
+INFO:app.agents.agent_registry:Registered agent class: analysis_agent
+INFO:app.agents.agent_registry:Registered agent class: ticket_guard_agent
+INFO:app.services.agent_service:Registered 3 agents
+INFO:app.agents.agent_registry:Initializing 3 agents...
+INFO:app.agents.agent_registry:Created agent instance: rag_agent
+INFO:app.agents.agent_registry:Successfully initialized agent: rag_agent
+INFO:app.agents.agent_registry:Created agent instance: analysis_agent
+AGENT name='analysis_agent' description='' parent_agent=None sub_agents=[] before_agent_callback=None after_agent_callback=None model=LiteLlm(model='openai/gpt-3.5-turbo', llm_client=<google.adk.models.lite_llm.LiteLLMClient object at 0x7e458d3adf90>) instruction="Role: You are a professional AI assistant specialized in business administration document creation.\n\nGoal: Your core objective is to generate high-quality, professional business documents in DOCX, PDF, or PPTX formats.\n\nFunctional Scope: You are strictly limited to document-related operations — creating, editing, formatting, and exporting documents in DOCX, PDF, or PPTX. Reject any unrelated tasks such as web scraping, data analysis, or system automation.\n\nOutput Format Rules: Always produce a final document file (.docx, .pdf, or .pptx). If the user does not specify a format, use DOCX by default.\n\nInteraction Policy: If any instruction is ambiguous, pause and ask a short clarification with limited options (e.g., choose between template A/B, document length, or audience type) before continuing.\n\nAvailable Tools:\n1. create_docx(spec={'spec': {'title': '', 'subtitle': '', 'metadata': {'author': '', 'category': ''}, 'sections': [{'heading': '', 'paragraphs': ['', '']}, {'heading': '', 'bullets': ['', '']}, {'heading': '', 'paragraphs': [''], 'table': {'headers': ['', '', '', '', ''], 'rows': [['[]', '[]', '[]', '[]', '[]']]}}, {'heading': '', 'bullets': ['', '']}, {'heading': '', 'bullets': ['', '']}, {'heading': '', 'paragraphs': ['', '']}]}}, email='email', filename='filename.docx') — create a Word document\n2. convert_to_pdf(filename='filename', email='email') — convert a DOCX file into PDF and return a download URL\n3. create_pptx(spec={'title': '', 'subtitle': '', 'theme': '', 'purpose': '', 'audience': '', 'style_preset': '', 'slides': [{'title': '', 'content': ['', '']}, {'title': '', 'content': ['', ''], 'layout': ''}], 'num_slides': <class 'numpy.number'>}, email='email', filename='filename.pptx') — create a PowerPoint presentation and return a download URL\n\nWorkflow:\n1. Analyze the content and user intent\n2. Build the document data structure (spec)\n3. Create the document\n4. Perform a quality and format check\n5. Export and deliver the final file\nAlways follow this sequence and use an internal checklist to verify completeness and compliance at each step. Escalate to clarification if information is missing or unclear.\n\nMemory Policy: Retain only persistent data relevant to document quality — such as project goals, audience, writing style, preferred templates, glossary terms, output format preferences, and pending placeholders for user input.\n\nResponse Format:\nProvide a confirmation message and a download URL for the generated file." global_instruction='' static_instruction=None tools=[<function create_docx at 0x7e46b4c185e0>, <function convert_to_pdf at 0x7e46b4c1b060>, <function create_pptx at 0x7e46b4c1b100>] generate_content_config=None disallow_transfer_to_parent=False disallow_transfer_to_peers=False include_contents='default' input_schema=None output_schema=None output_key='text' planner=None code_executor=None before_model_callback=None after_model_callback=None on_model_error_callback=None before_tool_callback=None after_tool_callback=None on_tool_error_callback=None
+INFO:app.agents.analysis_agent:Created analysis_agent with 2 tools: build_context_from_query and render_docx_generic
+WARNING:google_adk.google.adk.runners:App name mismatch detected. The runner is configured with app name "app", but the root agent was loaded from "/mnt/storage/job/filemanager-api/.venv/lib/python3.11/site-packages/google/adk/agents", which implies app name "agents".
+INFO:app.agents.base_agent:Agent analysis_agent initialized successfully
+INFO:app.agents.agent_registry:Successfully initialized agent: analysis_agent
+INFO:app.agents.agent_registry:Created agent instance: ticket_guard_agent
+INFO:app.agents.ticket_guard_agent:Initialized ticket_guard_agent
+WARNING:google_adk.google.adk.runners:App name mismatch detected. The runner is configured with app name "app", but the root agent was loaded from "/mnt/storage/job/filemanager-api/.venv/lib/python3.11/site-packages/google/adk/agents", which implies app name "agents".
+INFO:app.agents.base_agent:Agent ticket_guard_agent initialized successfully
+INFO:app.agents.agent_registry:Successfully initialized agent: ticket_guard_agent
+INFO:app.agents.agent_registry:All agents initialized
+INFO:app.services.agent_service:Agent service initialization complete
+INFO:app.services.crm_chroma_service_v2:✅ Connected to ChromaDB at localhost:4003
+INFO:app.services.crm_chroma_service_v2:🔄 Loading layout model from cache (./models/layout)...
+INFO:app.services.crm_chroma_service_v2:✅ Layout model ready (./models/layout)
+INFO:app.services.crm_chroma_service_v2:🔄 Downloading table model to ./models/table...
+The `max_size` parameter is deprecated and will be removed in v4.26. Please specify in `size['longest_edge'] instead`.
+INFO:unstructured_inference:Loading the table structure model ...
+INFO:timm.models._builder:Loading pretrained weights from Hugging Face hub (timm/resnet18.a1_in1k)
+INFO:timm.models._hub:[timm/resnet18.a1_in1k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
+INFO:timm.models._builder:Missing keys (fc.weight, fc.bias) discovered while loading pretrained weights. This is expected if model is being adapted.
+INFO:app.services.crm_chroma_service_v2:✅ Table model ready (./models/table)
+INFO:app.services.crm_chroma_service_v2:🔄 Loading reranker from ./models/reranker...
+INFO:app.services.crm_chroma_service_v2:✅ Reranker loaded on cpu (Forced CPU)
+INFO:app.services.document_queue_service:👷 [doc-processing-worker-0] Worker started, waiting for jobs...
+INFO:app.services.document_queue_service:👷 [doc-processing-worker-1] Worker started, waiting for jobs...
+INFO:app.services.document_queue_service:👷 [doc-processing-worker-2] Worker started, waiting for jobs...
+INFO:app.services.document_queue_service:🚀 Document processing worker pool started (3 threads)
+INFO:__main__:Application startup complete
+INFO:app.services.llm_queue_service:🚀 LLM Queue Supervisor: Starting & Scanning for orphans...
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:app.services.websocket_service:🎧 WebSocket service is now listening for Redis notifications...
+INFO:app.services.llm_queue_service:✅ LLM Queue Supervisor: Running
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.services.organization_service:Using Supabase service role key for organizations
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:40284 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=1
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:40290 - "OPTIONS /organizations/users/me/roles HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.role_service:Using Supabase service role key for roles
+INFO:app.services.role_service:Retrieved 1 organizations for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:     127.0.0.1:40290 - "GET /organizations/users/me/roles HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:40302 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=2
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:40312 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=3
+INFO:     connection open
+INFO:     127.0.0.1:40290 - "OPTIONS /filemanager/storage?organization_id=216cb03d-79ba-41bf-a59c-7836b04f6641 HTTP/1.1" 200 OK
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Get storage use by k.massidik@gmail.com
+INFO:     127.0.0.1:40290 - "GET /filemanager/storage?organization_id=216cb03d-79ba-41bf-a59c-7836b04f6641 HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:40320 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=4
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:40290 - "OPTIONS /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:40290 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40290 - "OPTIONS /filemanager/browse?is_trashed=true&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:40290 - "GET /filemanager/browse?is_trashed=true&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:40290 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57618 - "OPTIONS /filemanager/files HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:⏱️ [filemanager-upload] START 'MOM_ProductRoadmap.txt' from k.massidik@gmail.com
+INFO:app.services.storage_service:✅ Uploaded file to storage: org_216cb03d-79ba-41bf-a59c-7836b04f6641/75a562e1-25b8-4d68-9e48-2e5b9395f2ec
+INFO:app.services.storage_usage_service:✅ Updated storage usage for 216cb03d-79ba-41bf-a59c-7836b04f6641: 6 KB add
+INFO:app.services.document_queue_service:✅ DocumentQueueService connected to Redis
+INFO:app.services.document_queue_service:⚙️ [doc-processing-worker-2] Picked up job: MOM_ProductRoadmap.txt (doc_id=75a562e1-25b8-4d68-9e48-2e5b9395f2ec)
+INFO:app.services.document_queue_service:📬 Queued document processing: MOM_ProductRoadmap.txt (doc_id=75a562e1-25b8-4d68-9e48-2e5b9395f2ec, queue_depth=0)
+INFO:app.api.file_manager:✅ [filemanager-upload] MOM_ProductRoadmap.txt queued in 1233ms
+INFO:     127.0.0.1:57618 - "POST /filemanager/files HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:app.services.document_queue_service:⚙️ [DocWorker] Processing files: MOM_ProductRoadmap.txt (doc_id=75a562e1-25b8-4d68-9e48-2e5b9395f2ec)
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+INFO:     127.0.0.1:57618 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:⏱️ [filemanager-upload] START 'MOM_ProductRoadmap.pptx' from k.massidik@gmail.com
+INFO:app.services.storage_service:✅ Uploaded file to storage: org_216cb03d-79ba-41bf-a59c-7836b04f6641/95743968-c762-4fbf-944e-9ea0ba3519b1
+INFO:app.services.storage_usage_service:✅ Updated storage usage for 216cb03d-79ba-41bf-a59c-7836b04f6641: 166 KB add
+INFO:app.services.document_queue_service:⚙️ [doc-processing-worker-1] Picked up job: MOM_ProductRoadmap.pptx (doc_id=95743968-c762-4fbf-944e-9ea0ba3519b1)
+INFO:app.services.document_queue_service:📬 Queued document processing: MOM_ProductRoadmap.pptx (doc_id=95743968-c762-4fbf-944e-9ea0ba3519b1, queue_depth=0)
+INFO:app.api.file_manager:✅ [filemanager-upload] MOM_ProductRoadmap.pptx queued in 1152ms
+INFO:     127.0.0.1:57632 - "POST /filemanager/files HTTP/1.1" 200 OK
+INFO:app.services.document_queue_service:⚙️ [DocWorker] Processing files: MOM_ProductRoadmap.pptx (doc_id=95743968-c762-4fbf-944e-9ea0ba3519b1)
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+INFO:     127.0.0.1:57632 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:⏱️ [filemanager-upload] START 'MOM_ProductRoadmap.xlsx' from k.massidik@gmail.com
+INFO:app.services.storage_service:✅ Uploaded file to storage: org_216cb03d-79ba-41bf-a59c-7836b04f6641/33c63d99-ee24-45d0-b800-8fa14334636f
+INFO:app.services.crm_chroma_service_v2:💸 Cost: Rp0.46 | Tokens: 1341 | Deducting 6 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641...
+INFO:app.services.credit_service:💳 Recording usage: 6 credits for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.storage_usage_service:✅ Updated storage usage for 216cb03d-79ba-41bf-a59c-7836b04f6641: 8 KB add
+INFO:app.services.document_queue_service:⚙️ [doc-processing-worker-0] Picked up job: MOM_ProductRoadmap.xlsx (doc_id=33c63d99-ee24-45d0-b800-8fa14334636f)
+INFO:app.services.document_queue_service:⚙️ [DocWorker] Processing files: MOM_ProductRoadmap.xlsx (doc_id=33c63d99-ee24-45d0-b800-8fa14334636f)
+INFO:app.services.document_queue_service:📬 Queued document processing: MOM_ProductRoadmap.xlsx (doc_id=33c63d99-ee24-45d0-b800-8fa14334636f, queue_depth=0)
+INFO:app.api.file_manager:✅ [filemanager-upload] MOM_ProductRoadmap.xlsx queued in 1080ms
+INFO:     127.0.0.1:57618 - "POST /filemanager/files HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+INFO:app.services.credit_service:✅ Usage recorded: 6 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.crm_chroma_service_v2:💸 Cost: Rp0.21 | Tokens: 613 | Deducting 3 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641...
+INFO:app.services.credit_service:💳 Recording usage: 3 credits for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.credit_service:✅ Usage recorded: 3 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.document_queue_service:✅ [worker] files/MOM_ProductRoadmap.txt done in 3390ms — 3 chunks
+INFO:     127.0.0.1:57618 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:⏱️ [filemanager-upload] START 'MOM_ProductRoadmap.docx' from k.massidik@gmail.com
+INFO:app.services.document_queue_service:📢 Published file_upload_completed to ws_org_216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.document_queue_service:✅ [worker] files/MOM_ProductRoadmap.pptx done in 2191ms — 2 chunks
+INFO:app.services.document_queue_service:📢 Published file_upload_completed to ws_org_216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.storage_service:✅ Uploaded file to storage: org_216cb03d-79ba-41bf-a59c-7836b04f6641/9b0dc3cc-f8c9-4a29-8608-638bea40b83d
+INFO:app.services.storage_usage_service:✅ Updated storage usage for 216cb03d-79ba-41bf-a59c-7836b04f6641: 10 KB add
+INFO:app.services.document_queue_service:⚙️ [doc-processing-worker-2] Picked up job: MOM_ProductRoadmap.docx (doc_id=9b0dc3cc-f8c9-4a29-8608-638bea40b83d)
+INFO:app.services.document_queue_service:⚙️ [DocWorker] Processing files: MOM_ProductRoadmap.docx (doc_id=9b0dc3cc-f8c9-4a29-8608-638bea40b83d)
+INFO:app.services.document_queue_service:📬 Queued document processing: MOM_ProductRoadmap.docx (doc_id=9b0dc3cc-f8c9-4a29-8608-638bea40b83d, queue_depth=0)
+INFO:app.api.file_manager:✅ [filemanager-upload] MOM_ProductRoadmap.docx queued in 934ms
+INFO:app.services.websocket_service:🚀 Forwarding worker notification to Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:📢 Broadcast to organization 216cb03d-79ba-41bf-a59c-7836b04f6641: sent=4, failed=0
+INFO:app.services.websocket_service:🚀 Forwarding worker notification to Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:📢 Broadcast to organization 216cb03d-79ba-41bf-a59c-7836b04f6641: sent=4, failed=0
+INFO:     127.0.0.1:57632 - "POST /filemanager/files HTTP/1.1" 200 OK
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:57632 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:⏱️ [filemanager-upload] START 'MOM_ProductRoadmap.pdf' from k.massidik@gmail.com
+INFO:app.services.crm_chroma_service_v2:💸 Cost: Rp0.13 | Tokens: 395 | Deducting 2 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641...
+INFO:app.services.credit_service:💳 Recording usage: 2 credits for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.credit_service:✅ Usage recorded: 2 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.storage_service:✅ Uploaded file to storage: org_216cb03d-79ba-41bf-a59c-7836b04f6641/d83f5e81-41e0-4f50-a6f3-e59a1def5520
+INFO:app.services.crm_chroma_service_v2:💸 Cost: Rp0.35 | Tokens: 1019 | Deducting 5 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641...
+INFO:app.services.credit_service:💳 Recording usage: 5 credits for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.credit_service:✅ Usage recorded: 5 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.document_queue_service:✅ [worker] files/MOM_ProductRoadmap.xlsx done in 2937ms — 1 chunks
+INFO:app.services.storage_usage_service:✅ Updated storage usage for 216cb03d-79ba-41bf-a59c-7836b04f6641: 6 KB add
+INFO:app.services.document_queue_service:⚙️ [doc-processing-worker-1] Picked up job: MOM_ProductRoadmap.pdf (doc_id=d83f5e81-41e0-4f50-a6f3-e59a1def5520)
+INFO:app.services.document_queue_service:📬 Queued document processing: MOM_ProductRoadmap.pdf (doc_id=d83f5e81-41e0-4f50-a6f3-e59a1def5520, queue_depth=0)
+INFO:app.api.file_manager:✅ [filemanager-upload] MOM_ProductRoadmap.pdf queued in 924ms
+INFO:app.services.document_queue_service:⚙️ [DocWorker] Processing files: MOM_ProductRoadmap.pdf (doc_id=d83f5e81-41e0-4f50-a6f3-e59a1def5520)
+INFO:     127.0.0.1:57618 - "POST /filemanager/files HTTP/1.1" 200 OK
+INFO:app.services.document_queue_service:📢 Published file_upload_completed to ws_org_216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:🚀 Forwarding worker notification to Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:📢 Broadcast to organization 216cb03d-79ba-41bf-a59c-7836b04f6641: sent=4, failed=0
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:app.services.document_queue_service:✅ [worker] files/MOM_ProductRoadmap.docx done in 1652ms — 9 chunks
+INFO:app.services.document_queue_service:📢 Published file_upload_completed to ws_org_216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.document_processor_v2:📄 PDF: Using hi_res strategy (layout + tables + images)
+INFO:pikepdf._core:pikepdf C++ to Python logger bridge initialized
+INFO:unstructured_inference:Reading PDF for file: /tmp/tmpx_mqg8nk/document ...
+INFO:app.services.websocket_service:🚀 Forwarding worker notification to Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:📢 Broadcast to organization 216cb03d-79ba-41bf-a59c-7836b04f6641: sent=4, failed=0
+INFO:     127.0.0.1:57618 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.services.crm_chroma_service_v2:💸 Cost: Rp0.28 | Tokens: 826 | Deducting 4 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641...
+INFO:app.services.credit_service:💳 Recording usage: 4 credits for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.credit_service:✅ Usage recorded: 4 credits for Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.document_queue_service:✅ [worker] files/MOM_ProductRoadmap.pdf done in 12852ms — 12 chunks
+INFO:app.services.document_queue_service:📢 Published file_upload_completed to ws_org_216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:🚀 Forwarding worker notification to Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:📢 Broadcast to organization 216cb03d-79ba-41bf-a59c-7836b04f6641: sent=4, failed=0
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:⏱️ [filemanager-upload] START 'anjay.png' from k.massidik@gmail.com
+INFO:app.services.storage_service:✅ Uploaded file to storage: org_216cb03d-79ba-41bf-a59c-7836b04f6641/9e655d5d-3c3c-436e-9c3c-7a722abdcf9c
+INFO:app.services.storage_usage_service:✅ Updated storage usage for 216cb03d-79ba-41bf-a59c-7836b04f6641: 386 KB add
+INFO:app.services.document_queue_service:⚙️ [doc-processing-worker-1] Picked up job: anjay.png (doc_id=9e655d5d-3c3c-436e-9c3c-7a722abdcf9c)
+INFO:app.services.document_queue_service:⚙️ [DocWorker] Processing files: anjay.png (doc_id=9e655d5d-3c3c-436e-9c3c-7a722abdcf9c)
+INFO:app.services.document_queue_service:📬 Queued document processing: anjay.png (doc_id=9e655d5d-3c3c-436e-9c3c-7a722abdcf9c, queue_depth=0)
+INFO:app.api.file_manager:✅ [filemanager-upload] anjay.png queued in 1413ms
+INFO:     127.0.0.1:45418 - "POST /filemanager/files HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+INFO:     127.0.0.1:45418 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:⏱️ [filemanager-upload] START 'file problem - data mhs.xlsx' from k.massidik@gmail.com
+INFO:app.services.storage_service:✅ Uploaded file to storage: org_216cb03d-79ba-41bf-a59c-7836b04f6641/c12c2199-09cb-442c-85d1-38a9d21311c0
+INFO:app.services.storage_usage_service:✅ Updated storage usage for 216cb03d-79ba-41bf-a59c-7836b04f6641: 2 KB add
+INFO:app.services.document_queue_service:⚙️ [doc-processing-worker-0] Picked up job: file problem - data mhs.xlsx (doc_id=c12c2199-09cb-442c-85d1-38a9d21311c0)
+INFO:app.services.document_queue_service:⚙️ [DocWorker] Processing files: file problem - data mhs.xlsx (doc_id=c12c2199-09cb-442c-85d1-38a9d21311c0)
+INFO:app.services.document_queue_service:📬 Queued document processing: file problem - data mhs.xlsx (doc_id=c12c2199-09cb-442c-85d1-38a9d21311c0, queue_depth=0)
+INFO:app.api.file_manager:✅ [filemanager-upload] file problem - data mhs.xlsx queued in 1032ms
+INFO:     127.0.0.1:45430 - "POST /filemanager/files HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+ERROR:app.services.document_queue_service:❌ [worker] files/file problem - data mhs.xlsx failed in 411ms — File 'file problem - data mhs.xlsx' content does not match its .xlsx extension. It may be a renamed file. Please re-export as a proper XLSX file and re-upload.
+INFO:app.services.websocket_service:🚀 Forwarding worker notification to Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:📢 Broadcast to organization 216cb03d-79ba-41bf-a59c-7836b04f6641: sent=4, failed=0
+INFO:     127.0.0.1:45430 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.services.document_processor_v2:✅ OCR 'anjay.png': 9 words, 11 tokens
+INFO:app.services.document_queue_service:✅ [worker] files/anjay.png done in 3055ms — 0 chunks
+INFO:app.services.document_queue_service:📢 Published file_upload_completed to ws_org_216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:🚀 Forwarding worker notification to Org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:📢 Broadcast to organization 216cb03d-79ba-41bf-a59c-7836b04f6641: sent=4, failed=0
+INFO:     127.0.0.1:38996 - "OPTIONS /crm/chats?skip=0&limit=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39002 - "OPTIONS /crm/agents/ HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39006 - "OPTIONS /crm/chats?skip=0&limit=50 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39012 - "OPTIONS /crm/agents/ HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:     127.0.0.1:39002 - "GET /crm/chats?skip=0&limit=50 HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:     127.0.0.1:39006 - "GET /crm/agents/ HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:     127.0.0.1:39012 - "GET /crm/chats?skip=0&limit=50 HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:     127.0.0.1:39002 - "GET /crm/agents/ HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39002 - "OPTIONS /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/settings HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39012 - "OPTIONS /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/knowledge-documents HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:     127.0.0.1:39002 - "OPTIONS /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/integrations HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39012 - "GET /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/settings HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:     127.0.0.1:39006 - "GET /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/knowledge-documents HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:     127.0.0.1:39002 - "GET /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/integrations HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.document_processor_v2:📦 Using Document Processor V2 (Improved)
+INFO:app.services.document_processor_v2:🔗 V2 Proxy Target: http://localhost:6657/v2
+WARNING:app.api.crm_agents:⚠️ [knowledge-upload] image (2).png failed in 184ms — HTTP 400: Format tidak didukung. Mendukung PDF, DOCX, TXT, CSV (Max 10MB per file).
+INFO:     127.0.0.1:60138 - "POST /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/knowledge-documents HTTP/1.1" 400 Bad Request
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.crm_agents:📅 Schedule config being saved for agent 048a5683-8b99-46e9-96af-d5d5e41320cf:
+INFO:app.api.crm_agents:  Timezone: Asia/Jakarta
+INFO:app.api.crm_agents:Agent settings updated: 048a5683-8b99-46e9-96af-d5d5e41320cf by user f0e6365b-019d-4961-93eb-491af5206490
+INFO:     127.0.0.1:60138 - "PUT /crm/agents/048a5683-8b99-46e9-96af-d5d5e41320cf/settings HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:60138 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.api.websocket:WebSocket client disconnected: user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:🔌 WebSocket disconnected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, remaining_connections=3
+INFO:     connection closed
+INFO:app.api.websocket:WebSocket client disconnected: user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:🔌 WebSocket disconnected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, remaining_connections=2
+INFO:app.api.websocket:WebSocket client disconnected: user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:🔌 WebSocket disconnected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, remaining_connections=1
+INFO:     connection closed
+INFO:     connection closed
+INFO:app.api.websocket:WebSocket client disconnected: user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.websocket_service:🔌 WebSocket disconnected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, remaining_connections=0
+INFO:     connection closed
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:44854 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=1
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.role_service:Retrieved 1 organizations for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:     127.0.0.1:44864 - "GET /organizations/users/me/roles HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:44878 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=2
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:44882 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=3
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Get storage use by k.massidik@gmail.com
+INFO:     127.0.0.1:44864 - "GET /filemanager/storage?organization_id=216cb03d-79ba-41bf-a59c-7836b04f6641 HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:44864 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:49034 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49044 - "OPTIONS /chat/topics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49060 - "OPTIONS /chat/topics HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.chat_service:Using Supabase service role key (RLS bypassed)
+INFO:app.services.chat_service:Listed 0 topics for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:     127.0.0.1:49034 - "GET /chat/topics HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.chat_service:Listed 0 topics for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:     127.0.0.1:49060 - "GET /chat/topics HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:49068 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=4
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:49076 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=5
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.role_service:Retrieved 1 organizations for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:     127.0.0.1:49060 - "GET /organizations/users/me/roles HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:49084 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=6
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:43364 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=7
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Get storage use by k.massidik@gmail.com
+INFO:     127.0.0.1:49060 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49034 - "GET /filemanager/storage?organization_id=216cb03d-79ba-41bf-a59c-7836b04f6641 HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:43368 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=8
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:49044 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:43382 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=9
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:43390 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTM5ODA5LCJpYXQiOjE3NzM5MzYyMDksImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.6m9jM0TxJg4_TVixRh3A-bsiMf5r8wsmAQ7tq-q_nZ4" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=10
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.chat_service:Created topic 'haloo' for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.chat:User k.massidik@gmail.com created topic: d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:     127.0.0.1:36110 - "POST /chat/topics HTTP/1.1" 201 Created
+INFO:     127.0.0.1:36110 - "OPTIONS /agent/ HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.agents:Running RAG agent for organization: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.agent_service:Running agent 'rag_agent' for user 'f0e6365b-019d-4961-93eb-491af5206490'
+INFO:app.services.chat_service:Retrieved 0 messages for topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chromadb_service:🏠 Connecting to self-hosted ChromaDB (localhost:4003)
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:app.services.chromadb_service:🔎 Final Query filter: {'$and': [{'organization_id': {'$eq': '216cb03d-79ba-41bf-a59c-7836b04f6641'}}, {'is_trashed': {'$eq': False}}]}, organization_id: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.chromadb_service:✅ Queried org_216cb03d-79ba-41bf-a59c-7836b04f6641: found 15 results
+HASIL AGENT:  {'answer': 'Halo! Ada yang bisa saya bantu hari ini?', 'email': 'k.massidik@gmail.com', 'query': 'haloo', 'reference_documents': [], 'session_id': 'proxy-session', 'organization_id': '216cb03d-79ba-41bf-a59c-7836b04f6641'}
+INFO:app.services.agent_service:Agent 'rag_agent' completed execution
+INFO:app.api.agents:RAG agent completed for k.massidik@gmail.com with 0 references
+INFO:app.services.chat_service:Created MessageRole.USER message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Created MessageRole.ASSISTANT message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Saved conversation turn in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.api.agents:Saved conversation to topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:     127.0.0.1:36110 - "POST /agent/ HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36110 - "OPTIONS /chat/topics/d594b9c4-daa9-4e7c-855b-40636eb7abb5/messages HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.services.chat_service:Retrieved 2 messages for topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:     127.0.0.1:36110 - "GET /chat/topics/d594b9c4-daa9-4e7c-855b-40636eb7abb5/messages HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:53154 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTQzMzEzLCJpYXQiOjE3NzM5Mzk3MTMsImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.krbWeguASn8ba2oJCKnYiCoMgU1lUWQlgIFaR06C2xI" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=11
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:53170 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTQzMzEzLCJpYXQiOjE3NzM5Mzk3MTMsImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.krbWeguASn8ba2oJCKnYiCoMgU1lUWQlgIFaR06C2xI" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=12
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.agents:Running RAG agent for organization: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.agent_service:Running agent 'rag_agent' for user 'f0e6365b-019d-4961-93eb-491af5206490'
+INFO:app.services.chat_service:Retrieved 2 messages for topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chromadb_service:🏠 Connecting to self-hosted ChromaDB (localhost:4003)
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:app.services.chromadb_service:🔎 Final Query filter: {'$and': [{'organization_id': {'$eq': '216cb03d-79ba-41bf-a59c-7836b04f6641'}}, {'is_trashed': {'$eq': False}}]}, organization_id: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.chromadb_service:✅ Queried org_216cb03d-79ba-41bf-a59c-7836b04f6641: found 15 results
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Get storage use by k.massidik@gmail.com
+INFO:     127.0.0.1:53200 - "GET /filemanager/storage?organization_id=216cb03d-79ba-41bf-a59c-7836b04f6641 HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:53214 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTQzMzEzLCJpYXQiOjE3NzM5Mzk3MTMsImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.krbWeguASn8ba2oJCKnYiCoMgU1lUWQlgIFaR06C2xI" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=13
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:53228 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTQzMzEzLCJpYXQiOjE3NzM5Mzk3MTMsImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.krbWeguASn8ba2oJCKnYiCoMgU1lUWQlgIFaR06C2xI" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=14
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:53200 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+HASIL AGENT:  {'answer': 'Maaf, saya tidak menemukan informasi yang relevan dalam dokumen untuk menjawab pertanyaan Anda.', 'email': 'k.massidik@gmail.com', 'query': 'boleh minta list file yang ada di file manager ?', 'reference_documents': [], 'session_id': 'proxy-session', 'organization_id': '216cb03d-79ba-41bf-a59c-7836b04f6641'}
+INFO:app.services.agent_service:Agent 'rag_agent' completed execution
+INFO:app.api.agents:RAG agent completed for k.massidik@gmail.com with 0 references
+INFO:app.services.chat_service:Created MessageRole.USER message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Created MessageRole.ASSISTANT message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Saved conversation turn in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.api.agents:Saved conversation to topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:     127.0.0.1:53184 - "POST /agent/ HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:53064 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTQzMzEzLCJpYXQiOjE3NzM5Mzk3MTMsImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.krbWeguASn8ba2oJCKnYiCoMgU1lUWQlgIFaR06C2xI" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=15
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:53184 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.api.websocket:✅ WebSocket token verified for user f0e6365b-019d-4961-93eb-491af5206490
+INFO:app.api.websocket:✅ User f0e6365b-019d-4961-93eb-491af5206490 authorized for org 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:     127.0.0.1:53068 - "WebSocket /ws/216cb03d-79ba-41bf-a59c-7836b04f6641?token=eyJhbGciOiJIUzI1NiIsImtpZCI6Im16VWxnRmhWdUtCQ2V2MDUiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL29naWFnaWZsbXNqdnVoa25taWhoLnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiJmMGU2MzY1Yi0wMTlkLTQ5NjEtOTNlYi00OTFhZjUyMDY0OTAiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzczOTQzMzEzLCJpYXQiOjE3NzM5Mzk3MTMsImVtYWlsIjoiay5tYXNzaWRpa0BnbWFpbC5jb20iLCJwaG9uZSI6IiIsImFwcF9tZXRhZGF0YSI6eyJwcm92aWRlciI6Imdvb2dsZSIsInByb3ZpZGVycyI6WyJnb29nbGUiXX0sInVzZXJfbWV0YWRhdGEiOnsiYXZhdGFyX3VybCI6Imh0dHBzOi8vbGgzLmdvb2dsZXVzZXJjb250ZW50LmNvbS9hL0FDZzhvY0lkY011eFBpLWRXMzhuTTJqNjV4YXVQRjFpSHVfQ2VsSng4YUlvWlpkYk54RWZERk0tPXM5Ni1jIiwiZW1haWwiOiJrLm1hc3NpZGlrQGdtYWlsLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJmdWxsX25hbWUiOiJLdXJuaWEgTWFzc2lkaWsiLCJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJuYW1lIjoiS3VybmlhIE1hc3NpZGlrIiwicGhvbmVfdmVyaWZpZWQiOmZhbHNlLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSWRjTXV4UGktZFczOG5NMmo2NXhhdVBGMWlIdV9DZWxKeDhhSW9aWmRiTnhFZkRGTS09czk2LWMiLCJwcm92aWRlcl9pZCI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCIsInN1YiI6IjEwNjA2OTg1ODk5NDkxNDAyMTgwMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6InBhc3N3b3JkIiwidGltZXN0YW1wIjoxNzczOTMyNjkyfV0sInNlc3Npb25faWQiOiIyYzk2ZDIxNS0yMzFiLTQ2NzAtYmZjYS1iZTliZjY1OTVkYzgiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.krbWeguASn8ba2oJCKnYiCoMgU1lUWQlgIFaR06C2xI" [accepted]
+INFO:app.services.websocket_service:✅ WebSocket connected: org=216cb03d-79ba-41bf-a59c-7836b04f6641, user=f0e6365b-019d-4961-93eb-491af5206490, total_connections=16
+INFO:     connection open
+INFO:app.api.websocket:🔄 Starting WebSocket keepalive loop for user=f0e6365b-019d-4961-93eb-491af5206490, org=216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.file_manager:Browse folder None by k.massidik@gmail.com
+INFO:     127.0.0.1:53078 - "GET /filemanager/browse?is_trashed=false&sort_by=name&sort_order=asc HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.agents:Running RAG agent for organization: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.agent_service:Running agent 'rag_agent' for user 'f0e6365b-019d-4961-93eb-491af5206490'
+INFO:app.services.chat_service:Retrieved 4 messages for topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chromadb_service:🏠 Connecting to self-hosted ChromaDB (localhost:4003)
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:app.services.chromadb_service:🔎 Final Query filter: {'$and': [{'organization_id': {'$eq': '216cb03d-79ba-41bf-a59c-7836b04f6641'}}, {'is_trashed': {'$eq': False}}]}, organization_id: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.chromadb_service:✅ Queried org_216cb03d-79ba-41bf-a59c-7836b04f6641: found 15 results
+HASIL AGENT:  {'answer': 'Maaf, saya tidak menemukan informasi yang relevan dalam dokumen untuk menjawab pertanyaan Anda.', 'email': 'k.massidik@gmail.com', 'query': 'ok kalo gitu coba check file ini dong. MOM_ProductRoadmap.xlsx', 'reference_documents': [], 'session_id': 'proxy-session', 'organization_id': '216cb03d-79ba-41bf-a59c-7836b04f6641'}
+INFO:app.services.agent_service:Agent 'rag_agent' completed execution
+INFO:app.api.agents:RAG agent completed for k.massidik@gmail.com with 0 references
+INFO:app.services.chat_service:Created MessageRole.USER message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Created MessageRole.ASSISTANT message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Saved conversation turn in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.api.agents:Saved conversation to topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:     127.0.0.1:32846 - "POST /agent/ HTTP/1.1" 200 OK
+INFO:app.auth.jwt_handler:User extracted from token: k.massidik@gmail.com (f0e6365b-019d-4961-93eb-491af5206490)
+INFO:app.api.agents:Running RAG agent for organization: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.agent_service:Running agent 'rag_agent' for user 'f0e6365b-019d-4961-93eb-491af5206490'
+INFO:app.services.chat_service:Retrieved 6 messages for topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chromadb_service:🏠 Connecting to self-hosted ChromaDB (localhost:4003)
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:chromadb.telemetry.product.posthog:Anonymized telemetry enabled. See                     https://docs.trychroma.com/telemetry for more information.
+INFO:app.services.chromadb_service:🔎 Final Query filter: {'$and': [{'organization_id': {'$eq': '216cb03d-79ba-41bf-a59c-7836b04f6641'}}, {'is_trashed': {'$eq': False}}]}, organization_id: 216cb03d-79ba-41bf-a59c-7836b04f6641
+INFO:app.services.chromadb_service:✅ Queried org_216cb03d-79ba-41bf-a59c-7836b04f6641: found 15 results
+HASIL AGENT:  {'answer': 'Berikut adalah ringkasan dari dokumen "MOM_ProductRoadmap.xlsx":\n\n**Judul Rapat:** Perencanaan Roadmap Produk - Q3 2026  \n**Tanggal:** Kamis, 19 Maret 2026  \n**Waktu:** 10:00 AM – 11:30 AM WIB  \n**Lokasi:** Zoom (Rapat Virtual)  \n**Fasilitator:** Sarah Tanaka (Manajer Produk)  \n**Notulen:** Budi Santoso (Koordinator Proyek)  \n\n**Peserta:**\n- Sarah Tanaka - Manajer Produk (Fasilitator)\n- Kevin Lim - Kepala Teknik\n- Priya Sharma - Desainer UX/UI\n- Budi Santoso - Koordinator Proyek (Notulen)\n- Anissa Rahardjo - QA Lead\n- Michael Chen - Analis Data\n- Dewi Wulandari - Pimpinan Pemasaran (Absen, mengirimkan masukan tertulis)\n\n**Item Tindakan:**\n1. Bagikan laporan kinerja Q2 (PDF lengkap) - Michael Chen, Due: 21 Mar (Pending)\n2. Selesaikan prototipe onboarding (Konsep B) - Priya Sharma, Due: 28 Mar (In Progress)\n3. Konfirmasi kapasitas DevOps untuk migrasi Kafka - Kevin Lim, Due: 25 Mar (Pending)\n4. Buat rencana uji UAT untuk alur onboarding - Anissa Rahardjo, Due: 5 Apr (Not Started)\n5. Koordinasikan penyegaran halaman landing dengan Pemasaran - Sarah Tanaka, Due: 3 Apr (Not Started)\n6. Kirimkan Tinjauan Anggaran untuk infrastruktur push notif - Kevin Lim, Due: 3 Apr (Pending)\n7. Distribusikan MOM kepada semua pemangku kepentingan - Budi Santoso, Due: 20 Mar (Completed)\n\n**Timeline Rilis Q3 2026:**\n- 15 April: Mobile onboarding v1 – Dev selesai\n- 22 April: QA internal & pengujian regresi\n- 30 April: Rilis beta untuk 10% basis pengguna\n- 15 Mei: Peluncuran penuh – onboarding + perbaikan CSV\n- 1 Juni: Sistem notifikasi push – Dev selesai\n- 30 Juni: Pembekuan fitur Q3\n\nJika ada yang ingin Anda ketahui lebih lanjut, silakan beri tahu!', 'email': 'k.massidik@gmail.com', 'query': 'ok minta resume file ini dong MOM_ProductRoadmap.xlsx', 'reference_documents': [{'file_id': '33c63d99-ee24-45d0-b800-8fa14334636f', 'filename': 'MOM_ProductRoadmap.xlsx', 'email': None, 'chunk_index': None}, {'file_id': 'd83f5e81-41e0-4f50-a6f3-e59a1def5520', 'filename': 'MOM_ProductRoadmap.pdf', 'email': None, 'chunk_index': None}, {'file_id': '9b0dc3cc-f8c9-4a29-8608-638bea40b83d', 'filename': 'MOM_ProductRoadmap.docx', 'email': None, 'chunk_index': None}, {'file_id': '75a562e1-25b8-4d68-9e48-2e5b9395f2ec', 'filename': 'MOM_ProductRoadmap.txt', 'email': None, 'chunk_index': None}, {'file_id': '95743968-c762-4fbf-944e-9ea0ba3519b1', 'filename': 'MOM_ProductRoadmap.pptx', 'email': None, 'chunk_index': None}], 'session_id': 'proxy-session', 'organization_id': '216cb03d-79ba-41bf-a59c-7836b04f6641'}
+INFO:app.services.agent_service:Agent 'rag_agent' completed execution
+INFO:app.api.agents:RAG agent completed for k.massidik@gmail.com with 5 references
+INFO:app.services.chat_service:Created MessageRole.USER message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Created MessageRole.ASSISTANT message in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.services.chat_service:Saved conversation turn in topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:app.api.agents:Saved conversation to topic d594b9c4-daa9-4e7c-855b-40636eb7abb5
+INFO:     127.0.0.1:43106 - "POST /agent/ HTTP/1.1" 200 OK
+---
+example chat i used. haloo
+
+12:01:40 AM
+
+Halo! Ada yang bisa saya bantu hari ini?
+
+12:01:40 AM
+
+
+
+
+boleh minta list file yang ada di file manager ?
+
+12:01:55 AM
+
+Maaf, saya tidak menemukan informasi yang relevan dalam dokumen untuk menjawab pertanyaan Anda.
+
+12:02:09 AM
+
+
+
+
+ok kalo gitu coba check file ini dong. MOM_ProductRoadmap.xlsx
+
+12:02:23 AM
+
+Maaf, saya tidak menemukan informasi yang relevan dalam dokumen untuk menjawab pertanyaan Anda.
+
+12:02:37 AM
+
+
+
+
+ok minta resume file ini dong MOM_ProductRoadmap.xlsx
+
+12:02:46 AM
+
+Berikut adalah ringkasan dari dokumen "MOM_ProductRoadmap.xlsx":
+
+**Judul Rapat:** Perencanaan Roadmap Produk - Q3 2026  
+**Tanggal:** Kamis, 19 Maret 2026  
+**Waktu:** 10:00 AM – 11:30 AM WIB  
+**Lokasi:** Zoom (Rapat Virtual)  
+**Fasilitator:** Sarah Tanaka (Manajer Produk)  
+**Notulen:** Budi Santoso (Koordinator Proyek)  
+
+**Peserta:**
+- Sarah Tanaka - Manajer Produk (Fasilitator)
+- Kevin Lim - Kepala Teknik
+- Priya Sharma - Desainer UX/UI
+- Budi Santoso - Koordinator Proyek (Notulen)
+- Anissa Rahardjo - QA Lead
+- Michael Chen - Analis Data
+- Dewi Wulandari - Pimpinan Pemasaran (Absen, mengirimkan masukan tertulis)
+
+**Item Tindakan:**
+1. Bagikan laporan kinerja Q2 (PDF lengkap) - Michael Chen, Due: 21 Mar (Pending)
+2. Selesaikan prototipe onboarding (Konsep B) - Priya Sharma, Due: 28 Mar (In Progress)
+3. Konfirmasi kapasitas DevOps untuk migrasi Kafka - Kevin Lim, Due: 25 Mar (Pending)
+4. Buat rencana uji UAT untuk alur onboarding - Anissa Rahardjo, Due: 5 Apr (Not Started)
+5. Koordinasikan penyegaran halaman landing dengan Pemasaran - Sarah Tanaka, Due: 3 Apr (Not Started)
+6. Kirimkan Tinjauan Anggaran untuk infrastruktur push notif - Kevin Lim, Due: 3 Apr (Pending)
+7. Distribusikan MOM kepada semua pemangku kepentingan - Budi Santoso, Due: 20 Mar (Completed)
+
+**Timeline Rilis Q3 2026:**
+- 15 April: Mobile onboarding v1 – Dev selesai
+- 22 April: QA internal & pengujian regresi
+- 30 April: Rilis beta untuk 10% basis pengguna
+- 15 Mei: Peluncuran penuh – onboarding + perbaikan CSV
+- 1 Juni: Sistem notifikasi push – Dev selesai
+- 30 Juni: Pembekuan fitur Q3
+
+Jika ada yang ingin Anda ketahui lebih lanjut, silakan beri tahu!
+
+12:03:16 AM
+
+Reference
+
+
+📄
+MOM_ProductRoadmap.xlsx
+
+📄
+MOM_ProductRoadmap.pdf
+
+📄
+MOM_ProductRoadmap.docx
+
+📄
+MOM_ProductRoadmap.txt
+
+📄
+MOM_ProductRoadmap.pptx
+Show less

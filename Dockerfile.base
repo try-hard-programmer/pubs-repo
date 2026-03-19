@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+# Install system deps + uv
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 \
+    ffmpeg \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-osd \
+    curl \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    poppler-utils \
+    gcc \
+    g++ \
+    libreoffice-core \
+    libreoffice-impress \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /app
+
+# Install Python deps
+COPY requirements.txt .
+RUN uv pip install --system --no-cache -r requirements.txt
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app
