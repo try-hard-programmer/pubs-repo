@@ -105,10 +105,7 @@ class DocumentQueueService:
             self.client.lpush(self.QUEUE_KEY, json.dumps(job))
             queue_len = self.client.llen(self.QUEUE_KEY)
             
-            logger.info(
-                f"📬 Queued document processing: {filename} "
-                f"(doc_id={doc_id}, queue_depth={queue_len})"
-            )
+            logger.debug(f"queued: {filename} (depth={queue_len})")
             return True
             
         except Exception as e:
@@ -179,7 +176,7 @@ class DocumentProcessingWorker:
         local_client = _get_redis_client()
         key = settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_KEY
         local_supabase = create_client(settings.SUPABASE_URL, key)
-        logger.info(f"👷 [{worker_name}] Worker started, waiting for jobs...")
+        logger.debug(f"[{worker_name}] started")
 
         while self._running:
             try:
@@ -191,7 +188,7 @@ class DocumentProcessingWorker:
                 _, job_json = result
                 job = json.loads(job_json)
 
-                logger.info(f"⚙️ [{worker_name}] Picked up job: {job['filename']} (doc_id={job['doc_id']})")
+                logger.info(f"[{worker_name}] → {job['filename']}")
 
                 self._process_job(job, local_client, local_supabase)
 
@@ -237,7 +234,7 @@ class DocumentProcessingWorker:
         table_name = "knowledge_documents" if (agent_id and agent_id != "file_manager") else "files"
         is_knowledge_doc = table_name == "knowledge_documents"
         
-        logger.info(f"⚙️ [DocWorker] Processing {table_name}: {filename} (doc_id={doc_id})")
+        logger.debug(f"[{threading.current_thread().name}] processing {filename}")
 
         supabase = supabase_client
         doc_processor = get_document_processor()
@@ -260,6 +257,11 @@ class DocumentProcessingWorker:
                 except Exception as tmp_err:
                     logger.warning(f"⚠️ Temp file read failed, falling back to storage: {tmp_err}")
                     file_content = None
+                    # Ensure temp file is cleaned up even if read failed mid-way
+                    try:
+                        os.unlink(temp_file_path)
+                    except Exception:
+                        pass
 
             if not file_content:
                 file_content = supabase.storage.from_(bucket_name).download(file_id)
@@ -349,7 +351,7 @@ class DocumentProcessingWorker:
                 }).eq("id", doc_id).execute()
             
             _elapsed = round((time.monotonic() - _t0) * 1000)
-            logger.info(f"✅ [worker] {table_name}/{filename} done in {_elapsed}ms — {len(chunks)} chunks")
+            logger.info(f"[worker] ✅ {filename} — {len(chunks)} chunks in {_elapsed}ms")
 
             # =============================================
             # STEP 6: NOTIFICATION (table-specific type)
@@ -399,13 +401,19 @@ class DocumentProcessingWorker:
 
             channel = f"ws_org_{organization_id}"
             redis_client.publish(channel, json.dumps(notification))
-            logger.info(f"📢 Published {notification_type} to {channel}")
+            logger.debug(f"published {notification_type} → {channel}")
             
         except EmbeddingNotSupportedError as e:
             # File type is valid for storage but not embeddable (e.g. .zip, .exe, .iso).
             # Mark as "not_supported" — file stays in storage, no error shown to user.
             _elapsed = round((time.monotonic() - _t0) * 1000)
-            logger.info(f"ℹ️ [worker] {table_name}/{filename} skipped embedding in {_elapsed}ms — {e}")
+            logger.info(f"[worker] ⏭ {filename} — skipped in {_elapsed}ms")
+            temp_file_path = job.get("temp_file_path")
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
             try:
                 if is_knowledge_doc:
                     supabase.table("knowledge_documents").update({
@@ -433,7 +441,7 @@ class DocumentProcessingWorker:
 
         except Exception as e:
             _elapsed = round((time.monotonic() - _t0) * 1000)
-            logger.error(f"❌ [worker] {table_name}/{filename} failed in {_elapsed}ms — {e}")
+            logger.error(f"[worker] ❌ {filename} — failed in {_elapsed}ms: {e}")
 
             # Error metadata
             error_meta = {

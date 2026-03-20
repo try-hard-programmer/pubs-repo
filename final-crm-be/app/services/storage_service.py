@@ -95,7 +95,7 @@ class StorageService:
         try:
             # Try to get bucket
             buckets = self.client.storage.list_buckets()
-            
+
             # FIX: Handle both object (b.name) and dict (b['name']) responses safely
             bucket_exists = False
             for b in buckets:
@@ -169,7 +169,7 @@ class StorageService:
                 }
             )
 
-            logger.info(f"✅ Uploaded file to storage: {bucket_name}/{storage_path}")
+            logger.debug(f"✅ Uploaded file to storage: {bucket_name}/{storage_path}")
 
             # Get public URL (signed URL for private buckets)
             public_url = self.get_file_url(organization_id, file_id, folder_path)
@@ -225,7 +225,7 @@ class StorageService:
                 }
             )
 
-            logger.info(f"✅ Created folder in storage: {bucket_name}/{storage_path}")
+            logger.debug(f"✅ Created folder in storage: {bucket_name}/{storage_path}")
 
             return {
                 "bucket_name": bucket_name,
@@ -264,7 +264,7 @@ class StorageService:
             # FIX: Download the storage_path, NOT the folder_path
             response = self.client.storage.from_(bucket_name).download(storage_path)
 
-            logger.info(f"✅ Downloaded file from storage: {bucket_name}/{storage_path}")
+            logger.debug(f"✅ Downloaded file from storage: {bucket_name}/{storage_path}")
 
             return response
 
@@ -299,7 +299,7 @@ class StorageService:
             # Delete file
             self.client.storage.from_(bucket_name).remove([storage_path])
 
-            logger.info(f"✅ Deleted file from storage: {bucket_name}/{storage_path}")
+            logger.debug(f"✅ Deleted file from storage: {bucket_name}/{storage_path}")
 
             return {
                 "bucket_name": bucket_name,
@@ -409,7 +409,7 @@ class StorageService:
 
             self.client.storage.from_(bucket_name).move(old_path, new_path);
 
-            logger.info(f"✅ Moved file in storage: {old_path} → {new_path}")
+            logger.debug(f"✅ Moved file in storage: {old_path} → {new_path}")
 
             return {
                 "bucket_name": bucket_name,

@@ -570,7 +570,7 @@ async def upload_file(
     """
     import time as _time
     _t0 = _time.monotonic()
-    logger.info(f"⏱️ [filemanager-upload] START '{file.filename}' from {current_user.email}")
+    logger.info(f"[filemanager] upload '{file.filename}'")
 
     try:
         # Get user's organization
@@ -819,15 +819,27 @@ async def upload_file(
         # =========================================================
         # STEP 5: PUSH TO REDIS QUEUE (instead of BackgroundTasks)
         # =========================================================
+        # Write file bytes to a local temp path so the worker can skip the
+        # redundant Supabase Storage download (same optimization as knowledge docs).
+        # Eliminates the intermittent "Bucket not found" errors under concurrent load.
+        temp_file_path = f"/tmp/doc_upload_{file_id}"
+        try:
+            with open(temp_file_path, "wb") as tmp_f:
+                tmp_f.write(file_content)
+        except Exception as tmp_err:
+            logger.warning(f"⚠️ Could not write temp file for {filename} (non-fatal): {tmp_err}")
+            temp_file_path = None
+
         queue = get_document_queue_service()
         queued = queue.enqueue(
             doc_id=file_data_no_url["id"],
-            agent_id="file_manager",              
-            agent_name="File Manager", 
+            agent_id="file_manager",
+            agent_name="File Manager",
             organization_id=organization_id,
             file_id=file_id,
             filename=filename,
             bucket_name=f"org_{organization_id}",
+            temp_file_path=temp_file_path,
         )
 
         if not queued:
@@ -838,17 +850,17 @@ async def upload_file(
                 .eq("id", file_data_no_url["id"]).execute()
             
         _elapsed = round((_time.monotonic() - _t0) * 1000)
-        logger.info(f"✅ [filemanager-upload] {filename} queued in {_elapsed}ms")
+        logger.info(f"[filemanager] '{filename}' ✅ queued in {_elapsed}ms")
         # response.status_code = status.HTTP_202_ACCEPTED
         return created_doc
 
     except HTTPException as e:
         _elapsed = round((_time.monotonic() - _t0) * 1000)
-        logger.warning(f"⚠️ [filemanager-upload] {file.filename} failed in {_elapsed}ms — HTTP {e.status_code}: {e.detail}")
+        logger.warning(f"[filemanager] '{file.filename}' ❌ failed in {_elapsed}ms — {e.status_code}: {e.detail}")
         raise
     except Exception as e:
         _elapsed = round((_time.monotonic() - _t0) * 1000)
-        logger.error(f"❌ [filemanager-upload] {file.filename} error in {_elapsed}ms — {e}")
+        logger.error(f"[filemanager] '{file.filename}' ❌ error in {_elapsed}ms — {e}")
         raise HTTPException(status_code=500, detail=str("Internal server error"))
 
 
@@ -1561,7 +1573,7 @@ async def browse_folder(
     **Sort Order:**
     - asc, desc
     """
-    logger.info(f"Browse folder {folder_id} by {current_user.email}")
+    logger.debug(f"Browse folder {folder_id} by {current_user.email}")
     try:
         # Get organization
         from app.services.organization_service import get_organization_service

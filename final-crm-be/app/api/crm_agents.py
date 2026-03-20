@@ -778,13 +778,33 @@ async def create_knowledge_document(
         # =========================================================
         try:
             buckets = supabase.storage.list_buckets()
-            if not any(b.name == agent_bucket_name for b in buckets):
-                supabase.storage.create_bucket(agent_bucket_name, options={"public": False})
+            # FIX: Handle both object (b.name) and dict (b['name']) responses safely
+            bucket_exists = any(
+                (b.name if hasattr(b, 'name') else b.get('name')) == agent_bucket_name
+                for b in buckets
+            )
+            if not bucket_exists:
+                try:
+                    supabase.storage.create_bucket(agent_bucket_name, options={"public": False})
+                except Exception as create_err:
+                    # Race condition: another concurrent request may have created the bucket
+                    # between our list_buckets() check and this create call — safe to ignore.
+                    buckets_retry = supabase.storage.list_buckets()
+                    still_missing = not any(
+                        (b.name if hasattr(b, 'name') else b.get('name')) == agent_bucket_name
+                        for b in buckets_retry
+                    )
+                    if still_missing:
+                        raise create_err
 
-            supabase.storage.from_(agent_bucket_name).upload(
-                path=file_id,
-                file=file_content,
-                file_options={"content-type": file.content_type, "upsert": "false"}
+            # FIX: Run blocking storage upload in a thread to avoid stalling the event loop
+            # for large files (>2MB this was causing very long wait times on the frontend).
+            await asyncio.to_thread(
+                lambda: supabase.storage.from_(agent_bucket_name).upload(
+                    path=file_id,
+                    file=file_content,
+                    file_options={"content-type": file.content_type, "upsert": "false"}
+                )
             )
         except Exception as e:
             logger.error(f"❌ Storage upload failed: {e}")
