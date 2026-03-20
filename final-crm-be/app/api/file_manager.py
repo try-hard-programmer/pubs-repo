@@ -840,6 +840,7 @@ async def upload_file(
             filename=filename,
             bucket_name=f"org_{organization_id}",
             temp_file_path=temp_file_path,
+            storage_path=storage_path,
         )
 
         if not queued:

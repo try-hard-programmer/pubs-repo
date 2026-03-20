@@ -81,6 +81,7 @@ class DocumentQueueService:
         filename: str,
         bucket_name: str,
         temp_file_path: Optional[str] = None,
+        storage_path: Optional[str] = None,
     ) -> bool:
         """
         Push a processing job to Redis. Returns True if queued successfully.
@@ -88,6 +89,10 @@ class DocumentQueueService:
         temp_file_path: if provided, the worker reads from this local path instead
         of re-downloading from Supabase Storage, eliminating the redundant round-trip.
         Falls back to storage download automatically if the path no longer exists.
+
+        storage_path: full path within the bucket (e.g. "folder_name/file_uuid").
+        Used by the fallback download so files in sub-folders are fetched correctly.
+        Defaults to file_id (root-level path) when not provided.
         """
         try:
             job = {
@@ -99,6 +104,7 @@ class DocumentQueueService:
                 "filename": filename,
                 "bucket_name": bucket_name,
                 "temp_file_path": temp_file_path,
+                "storage_path": storage_path or file_id,
                 "queued_at": datetime.now(timezone.utc).isoformat(),
             }
             
@@ -262,9 +268,17 @@ class DocumentProcessingWorker:
                         os.unlink(temp_file_path)
                     except Exception:
                         pass
+            elif not file_content:
+                # Log why we're falling back so we can diagnose staging issues
+                reason = "path=None" if not temp_file_path else f"not found on disk ({temp_file_path})"
+                logger.warning(f"⚠️ [{filename}] temp file {reason} — falling back to storage download")
 
             if not file_content:
-                file_content = supabase.storage.from_(bucket_name).download(file_id)
+                # Use storage_path (full path including any folder prefix) so files
+                # inside sub-folders are fetched from the correct location.
+                # Falling back to file_id alone would fail for non-root uploads.
+                dl_path = job.get("storage_path") or file_id
+                file_content = supabase.storage.from_(bucket_name).download(dl_path)
 
             if not file_content:
                 raise RuntimeError("File is empty (temp and storage both failed)")
