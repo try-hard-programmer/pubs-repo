@@ -454,10 +454,24 @@ class StorageService:
                 expires_in
             )
 
-            return response["signedURL"]
+            # Supabase SDK key changed across versions:
+            #   older: response["signedURL"]
+            #   newer: response["signedUrl"]  (lowercase 'l')
+            # Handle both so a KeyError doesn't silently fall back to the
+            # auth-protected download endpoint (which <img> tags can't use).
+            if isinstance(response, dict):
+                signed_url = response.get("signedURL") or response.get("signedUrl")
+            else:
+                # SDK 2.x+ returns an object
+                signed_url = getattr(response, "signed_url", None) or getattr(response, "signedURL", None)
+
+            if not signed_url:
+                raise ValueError(f"create_signed_url returned unexpected format: {response}")
+
+            return signed_url
 
         except Exception as e:
-            logger.error(f"Failed to get file URL: {e}")
+            logger.error(f"Failed to get file URL for {file_id} (bucket={self._get_bucket_name(organization_id)}, path={self._get_storage_path(file_id, folder_path)}): {e}")
             # Return fallback URL
             return f"/api/files/{file_id}/download"
 
