@@ -278,7 +278,16 @@ class DocumentProcessingWorker:
                 # inside sub-folders are fetched from the correct location.
                 # Falling back to file_id alone would fail for non-root uploads.
                 dl_path = job.get("storage_path") or file_id
-                file_content = supabase.storage.from_(bucket_name).download(dl_path)
+                # Always use the storage_service singleton (guaranteed SERVICE_ROLE_KEY)
+                # instead of local_supabase whose auth state may be stale or wrong.
+                # This is the same client that successfully generates signed URLs.
+                from app.services.storage_service import get_storage_service as _get_storage_svc
+                try:
+                    file_content = _get_storage_svc().client.storage.from_(bucket_name).download(dl_path)
+                except Exception as dl_err:
+                    raise RuntimeError(
+                        f"Storage fallback failed (bucket={bucket_name}, path={dl_path}): {dl_err}"
+                    ) from dl_err
 
             if not file_content:
                 raise RuntimeError("File is empty (temp and storage both failed)")
