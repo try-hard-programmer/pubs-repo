@@ -80,6 +80,11 @@ async def lifespan(app: FastAPI):
     doc_worker = get_document_worker()
     doc_worker.start_in_thread()
 
+    # Re-queue any files that were left at embedding_status='pending' from before
+    # this server start (e.g. after a restart, Redis flush, or worker crash).
+    from app.services.document_queue_service import get_document_queue_service
+    doc_worker.recover_stale_jobs(get_document_queue_service())
+
     # TURN ON THE REDIS LISTENER
     redis_listener_task = asyncio.create_task(start_redis_pubsub_listener(connection_manager))
 

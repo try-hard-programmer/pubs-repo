@@ -172,6 +172,65 @@ class DocumentProcessingWorker:
             t.join(timeout=30)
         logger.info("🛑 Document processing worker pool stopped")
 
+    def recover_stale_jobs(self, queue_service: "DocumentQueueService") -> int:
+        """
+        On startup, find files that are stuck at embedding_status='pending' for
+        more than 10 minutes (left over from a previous server restart or failed
+        worker) and re-push them into the Redis queue.
+
+        Returns the number of files re-queued.
+        """
+        from supabase import create_client
+        from datetime import timedelta
+
+        try:
+            key = settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_KEY
+            supabase = create_client(settings.SUPABASE_URL, key)
+
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+            response = supabase.table("files").select(
+                "id, name, organization_id, storage_path, metadata"
+            ).eq("embedding_status", "pending").eq("is_trashed", False).lt(
+                "created_at", cutoff
+            ).execute()
+
+            if not response.data:
+                return 0
+
+            logger.info(f"🔄 Recovery: {len(response.data)} stale pending file(s) found — re-queuing")
+
+            count = 0
+            for file in response.data:
+                file_id   = file["id"]
+                org_id    = file["organization_id"]
+                storage_path = file.get("storage_path") or file_id
+                metadata  = file.get("metadata") or {}
+                bucket_name = metadata.get("bucket") or f"org_{org_id}"
+
+                queued = queue_service.enqueue(
+                    doc_id=file_id,
+                    agent_id="file_manager",
+                    agent_name="File Manager",
+                    organization_id=org_id,
+                    file_id=file_id,
+                    filename=file["name"],
+                    bucket_name=bucket_name,
+                    storage_path=storage_path,
+                    # No temp_file_path — worker will use storage fallback
+                )
+                if queued:
+                    count += 1
+                    logger.info(f"🔄 Re-queued: {file['name']}")
+                else:
+                    logger.warning(f"⚠️ Re-queue failed: {file['name']}")
+
+            return count
+
+        except Exception as e:
+            logger.error(f"❌ Startup recovery scan failed: {e}")
+            return 0
+
     def _worker_loop(self):
         """
         Main worker loop. Each thread runs this independently with its own Redis client.
