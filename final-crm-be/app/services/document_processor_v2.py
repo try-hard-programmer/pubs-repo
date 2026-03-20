@@ -621,7 +621,6 @@ class DocumentProcessorV2:
         text_blocks = []
         current_section = ""        # Track section headers across pages
         prev_table_headers = []     # For cross-page table continuation
-        extracted_images = []       # Collect base64 images
 
         try:
             with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -800,35 +799,15 @@ class DocumentProcessorV2:
                                     min(page.width, x1 + 5),
                                     min(page.height, bottom_coord + 5),
                                 )
-                                cropped = page.crop(bbox)
-                                rendered = cropped.to_image(resolution=200)
-
-                                buf = io.BytesIO()
-                                rendered.save(buf, format="PNG")
-                                buf.seek(0)
-                                img_bytes = buf.read()
-                                b64_str = base64.b64encode(img_bytes).decode("ascii")
-
-                                extracted_images.append({
-                                    "page": page_idx + 1,
-                                    "index": img_idx,
-                                    "width": int(width),
-                                    "height": int(height),
-                                    "mime_type": "image/png",
-                                    "base64": b64_str,
-                                })
-
                                 page_parts.append(
                                     f"\n[Image on page {page_idx + 1}: "
                                     f"diagram/figure {img_idx + 1}, "
-                                    f"{int(width)}x{int(height)}px — "
-                                    f"base64 image stored in metadata]\n"
+                                    f"{int(width)}x{int(height)}px]\n"
                                 )
 
                                 self.logger.info(
-                                    f"📸 Extracted image p{page_idx + 1}: "
-                                    f"{int(width)}x{int(height)}px, "
-                                    f"{len(b64_str)} b64 chars"
+                                    f"📸 Found image p{page_idx + 1}: "
+                                    f"{int(width)}x{int(height)}px"
                                 )
 
                             except Exception as img_err:
@@ -846,10 +825,6 @@ class DocumentProcessorV2:
 
                     if page_parts:
                         text_blocks.append("\n".join(page_parts))
-
-            # Store images in metrics for downstream use (e.g., OCR, embedding)
-            if extracted_images:
-                metrics.extracted_images = extracted_images  # type: ignore[attr-defined]
 
             result = "\n\n".join(text_blocks)
 
@@ -1312,3 +1287,17 @@ class DocumentProcessorV2:
             )
             result.append(element_dict)
         return result
+
+
+# ============================================
+# SINGLETON FACTORY
+# ============================================
+
+_document_processor_instance: Optional["DocumentProcessorV2"] = None
+
+def get_document_processor() -> "DocumentProcessorV2":
+    """Return the shared DocumentProcessorV2 instance (created once per process)."""
+    global _document_processor_instance
+    if _document_processor_instance is None:
+        _document_processor_instance = DocumentProcessorV2()
+    return _document_processor_instance

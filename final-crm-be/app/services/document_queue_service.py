@@ -174,8 +174,11 @@ class DocumentProcessingWorker:
         Main worker loop. Each thread runs this independently with its own Redis client.
         Uses BRPOP for efficient blocking wait (no busy-polling).
         """
+        from supabase import create_client
         worker_name = threading.current_thread().name
         local_client = _get_redis_client()
+        key = settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_KEY
+        local_supabase = create_client(settings.SUPABASE_URL, key)
         logger.info(f"👷 [{worker_name}] Worker started, waiting for jobs...")
 
         while self._running:
@@ -190,13 +193,13 @@ class DocumentProcessingWorker:
 
                 logger.info(f"⚙️ [{worker_name}] Picked up job: {job['filename']} (doc_id={job['doc_id']})")
 
-                self._process_job(job, local_client)
+                self._process_job(job, local_client, local_supabase)
 
             except Exception as e:
                 logger.error(f"❌ [{worker_name}] Unexpected error in loop: {e}", exc_info=True)
                 time.sleep(5)
 
-    def _process_job(self, job: dict, redis_client: redis.Redis):
+    def _process_job(self, job: dict, redis_client: redis.Redis, supabase_client):
         """
         Process a single document job. Creates its own event loop
         since we're in a worker thread (not the uvicorn thread).
@@ -205,22 +208,21 @@ class DocumentProcessingWorker:
         asyncio.set_event_loop(loop)
 
         try:
-            loop.run_until_complete(self._process_job_async(job, redis_client))
+            loop.run_until_complete(self._process_job_async(job, redis_client, supabase_client))
         except Exception as e:
             logger.error(f"❌ [DocWorker] Job failed for {job.get('filename')}: {e}", exc_info=True)
         finally:
             loop.close()
     
-    async def _process_job_async(self, job: dict, redis_client: redis.Redis):
+    async def _process_job_async(self, job: dict, redis_client: redis.Redis, supabase_client):
         """
         Async processing logic — same steps as the old process_document_background,
         but now runs in a dedicated thread with its own event loop.
-        redis_client is the per-thread Redis connection owned by the calling worker.
+        redis_client and supabase_client are per-thread connections owned by the calling worker.
         """
-        from app.services.document_processor_v2 import DocumentProcessorV2, EmbeddingNotSupportedError
+        from app.services.document_processor_v2 import get_document_processor, EmbeddingNotSupportedError
         from app.services.crm_chroma_service_v2 import get_crm_chroma_service_v2
         from app.utils.chunkingv2 import split_into_chunks_with_metadata
-        from supabase import create_client
         from app.services.file_manager_service import get_file_manager_service  # ← BARU!
         
         # Extract job data
@@ -237,10 +239,8 @@ class DocumentProcessingWorker:
         
         logger.info(f"⚙️ [DocWorker] Processing {table_name}: {filename} (doc_id={doc_id})")
 
-        # Fresh clients
-        key = settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_KEY
-        supabase = create_client(settings.SUPABASE_URL, key)
-        doc_processor = DocumentProcessorV2()
+        supabase = supabase_client
+        doc_processor = get_document_processor()
 
         _t0 = time.monotonic()
 
@@ -266,13 +266,15 @@ class DocumentProcessingWorker:
 
             if not file_content:
                 raise RuntimeError("File is empty (temp and storage both failed)")
-                        
+
+
             # =============================================
             # STEP 1: COMMON PROCESSING (extract + quality)
             # =============================================
             clean_text, metrics = doc_processor.process_document(
                 file_content, filename, bucket_name, organization_id, file_id
             )
+            del file_content
 
             if not clean_text :
                raise ValueError("No text extracted")
@@ -298,10 +300,11 @@ class DocumentProcessingWorker:
             agent_name = job.get("agent_name", "File Manager")
             chunks, chunk_metas = split_into_chunks_with_metadata(
                 text=clean_text, filename=filename, file_id=file_id,
-                agent_id=agent_id, agent_name=agent_name, 
+                agent_id=agent_id, agent_name=agent_name,
                 organization_id=organization_id,
                 size=512, overlap=100
             )
+            del clean_text
             if not chunks and agent_id != "file_manager":
                 raise ValueError("No chunks generated")
             
